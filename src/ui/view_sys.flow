@@ -399,7 +399,10 @@ export function view_control_draw(c: ptr<Canvas>, u: ptr<Ui>, s: ptr<Sim>,
     # This is the measured height of the control stack. It leaves a small
     # tail below the last row and produces a useful scrollbar at every window
     # size, including fullscreen.
-    let content_h: i32 = 540
+    # Leave room for the full control stack and a comfortable scroll gesture;
+    # the visible body is usually about 470 px tall, so this gives roughly
+    # two hundred pixels of travel instead of a barely noticeable nudge.
+    let content_h: i32 = 680
     let mut max_scroll: i32 = content_h - body_h
     if max_scroll < 0 { max_scroll = 0 }
     if ui_hit(u, lay.ctl_x, lay.ctl_y, lay.ctl_w, lay.ctl_h) and u.wheel != 0 {

@@ -22,7 +22,7 @@ record obstacles 25
 record large-field 27
 
 for name in t-maze obstacles large-field; do
-  ffmpeg -y -loglevel error -framerate 30 -i "$out/$name/%06d.ppm" \
+  ffmpeg -y -loglevel error -framerate 30 -i "$out/$name/frame_%05d.ppm" \
     -c:v libx264 -pix_fmt yuv420p -crf 18 "$out/$name.mp4"
 done
 
@@ -47,5 +47,14 @@ plan = {
 }
 Path(sys.argv[2]).write_text(json.dumps(plan, indent=2))
 PY
-python3 "/Users/abhishekshivakumar/.codex/skills/moviepy-video-editor/scripts/run_moviepy_edit.py" --plan-file "$plan"
+if python3 -c 'import moviepy' >/dev/null 2>&1; then
+  python3 "/Users/abhishekshivakumar/.codex/skills/moviepy-video-editor/scripts/run_moviepy_edit.py" --plan-file "$plan"
+else
+  # Minimal dependency fallback for machines without MoviePy. Preserve the
+  # native aspect ratio with letterboxing and concatenate the three clips.
+  ffmpeg -y -loglevel error \
+    -i "$out/t-maze.mp4" -i "$out/obstacles.mp4" -i "$out/large-field.mp4" \
+    -filter_complex "[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black[v0];[1:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black[v1];[2:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black[v2];[v0][v1][v2]concat=n=3:v=1:a=0,fps=30,format=yuv420p[outv]" \
+    -map "[outv]" -c:v libx264 -crf 18 -preset medium -movflags +faststart "$out/flowrat-showcase.mp4"
+fi
 echo "showcase: $out/flowrat-showcase.mp4"

@@ -128,6 +128,15 @@ pre#out:empty { display:none; } .err { color:#f7768e; }
   function emit(name,data) {(listeners[name]||[]).forEach(fn=>fn(data));}
   function log(text,err) { const line=document.createElement('span'); if(err) line.className='err'; line.textContent=text+'\n'; out.appendChild(line); out.scrollTop=out.scrollHeight; }
   function key(k) { window.dispatchEvent(new KeyboardEvent('keydown',{key:k,bubbles:true})); window.dispatchEvent(new KeyboardEvent('keyup',{key:k,bubbles:true})); }
+  // Capture before the generated runtime listener. Some browsers let the
+  // page's scroll handling win over the canvas listener; forwarding directly
+  // to Flow's cumulative mouse counter keeps the in-canvas control scroll
+  // reliable in both the local page and GitHub Pages.
+  canvas.addEventListener('wheel', function (ev) {
+    var flow = window.flowGfx;
+    if (flow && flow.mouse) { flow.mouse.wheel += ev.deltaY > 0 ? 1 : -1; }
+    ev.preventDefault(); ev.stopImmediatePropagation();
+  }, {capture:true, passive:false});
   function boot() { if(started)return; started=true; overlay.classList.add('hidden'); start.disabled=true; status.textContent='loading module…'; window.focus();
     createFlowModule({print:t=>log(t,false),printErr:t=>log(t,true),canvas}).then(mod=>{ module=mod; run.disabled=step.disabled=reset.disabled=false; status.textContent='running'; emit('start',{module:mod}); try{mod.callMain([]);}catch(e){if(!(e&&e.name==='ExitStatus'))log(''+e,true);}}).catch(e=>{status.textContent='failed to load';log(''+e,true);}); }
   function toggleRun(){if(!started)return; key(' '); paused=!paused; run.textContent=paused?'Resume':'Pause'; status.textContent=paused?'paused':'running'; emit(paused?'pause':'resume',{});}

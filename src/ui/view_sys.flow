@@ -406,7 +406,9 @@ export function view_control_draw(c: ptr<Canvas>, u: ptr<Ui>, s: ptr<Sim>,
     let mut max_scroll: i32 = content_h - body_h
     if max_scroll < 0 { max_scroll = 0 }
     if ui_hit(u, lay.ctl_x, lay.ctl_y, lay.ctl_w, lay.ctl_h) and u.wheel != 0 {
-        control_scroll = control_scroll - u.wheel * 24
+        # Trackpads can emit several wheel ticks for one physical gesture;
+        # four framebuffer pixels per tick keeps the panel controllable.
+        control_scroll = control_scroll - u.wheel * 4
         if control_scroll < 0 { control_scroll = 0 }
         if control_scroll > max_scroll { control_scroll = max_scroll }
     }

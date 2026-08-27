@@ -39,9 +39,9 @@ main { flex:1; display:flex; flex-direction:column; align-items:center; justify-
 .intro-word .letter:nth-child(5) { animation-delay:.93s; }
 .intro-word .letter:nth-child(6) { animation-delay:1.10s; }
 .intro-word .letter:nth-child(7) { animation-delay:1.27s; }
-.stage { position:relative; line-height:0; width:min(1280px,100%); }
+.stage { position:relative; line-height:0; width:min(1000px,100%,calc((100vh - 190px) * 4 / 3)); }
 canvas { display:block; width:100%; height:auto; aspect-ratio:4/3; background:#000;
-  border:1px solid #293246; border-radius:8px; image-rendering:pixelated; }
+  max-height:calc(100vh - 190px); border:1px solid #293246; border-radius:8px; image-rendering:pixelated; }
 .overlay { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center;
   justify-content:center; gap:11px; background:linear-gradient(135deg,#0c101add,#121a29e8);
   border-radius:8px; line-height:1.5; transition:opacity .35s, transform .35s; }

@@ -1,0 +1,38 @@
+[experiment]
+name = "open-field-baseline"
+preset = "open_field"
+seed = 1337
+rats = 24
+duration_s = 120
+sample_hz = 30
+
+[simulation]
+dt = 0.0166666667
+steps_per_frame = 1
+require_sight = true
+spiking = false
+
+[motion]
+speed_mean = 0.22
+turn_sigma = 1.1
+wall_gain = 8.0
+
+[behavior]
+enabled = true
+metabolism = 0.04
+thirst_rate = 0.025
+
+[neural]
+place_cells = 256
+grid_modules = 3
+head_direction_cells = 36
+boundary_cells = 48
+continuous_attractors = true
+
+[recording]
+trajectory = "trajectory.csv"
+neural = true
+recurrent = true
+
+[analysis]
+metrics = ["occupancy", "speed", "turning", "path_length"]

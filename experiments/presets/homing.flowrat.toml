@@ -1,0 +1,25 @@
+[experiment]
+name = "homing"
+preset = "homing"
+seed = 2718
+rats = 24
+duration_s = 120
+sample_hz = 30
+
+[simulation]
+dt = 0.0166666667
+require_sight = false
+
+[motion]
+speed_mean = 0.23
+turn_sigma = 1.0
+
+[behavior]
+enabled = true
+memory_enabled = true
+
+[neural]
+continuous_attractors = true
+
+[analysis]
+metrics = ["homing_error", "path_length", "speed", "turning"]

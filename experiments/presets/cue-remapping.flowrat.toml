@@ -1,0 +1,23 @@
+[experiment]
+name = "cue-remapping"
+preset = "cue_remapping"
+seed = 1618
+rats = 24
+duration_s = 180
+sample_hz = 30
+
+[simulation]
+dt = 0.0166666667
+require_sight = true
+
+[motion]
+speed_mean = 0.21
+turn_sigma = 1.0
+
+[neural]
+place_cells = 256
+grid_modules = 3
+boundary_cells = 48
+
+[analysis]
+metrics = ["remapping", "occupancy", "speed", "turning"]

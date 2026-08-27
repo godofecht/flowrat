@@ -1,0 +1,23 @@
+[experiment]
+name = "obstacle-navigation"
+preset = "obstacle_navigation"
+seed = 31415
+rats = 24
+duration_s = 120
+sample_hz = 30
+
+[simulation]
+dt = 0.0166666667
+require_sight = true
+
+[motion]
+speed_mean = 0.24
+turn_sigma = 1.4
+wall_gain = 16.0
+
+[neural]
+boundary_cells = 96
+place_cells = 256
+
+[analysis]
+metrics = ["obstacle_clearance", "speed", "turning", "occupancy"]

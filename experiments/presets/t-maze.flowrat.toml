@@ -1,0 +1,24 @@
+[experiment]
+name = "t-maze-choice"
+preset = "t_maze"
+seed = 2026
+rats = 16
+duration_s = 90
+sample_hz = 30
+
+[simulation]
+dt = 0.0166666667
+steps_per_frame = 1
+require_sight = true
+
+[motion]
+speed_mean = 0.20
+turn_sigma = 0.8
+wall_gain = 12.0
+
+[behavior]
+enabled = true
+drive_hysteresis = 0.08
+
+[analysis]
+metrics = ["goal_choice", "latency", "path_length", "turning"]

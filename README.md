@@ -314,6 +314,26 @@ slower version of the same thing.
 
 `run.sh` needs a display. Everything else runs headless.
 
+## Reproducible experiments
+
+The TOML experiment layer cues an entire protocol: seed, arena, timing,
+movement, behaviour, neural populations, recording, and analysis targets live
+in one file. Included protocols cover open-field exploration, T-maze choice,
+obstacle navigation, homing, and cue remapping.
+
+```bash
+python3 tools/flowrat_experiment.py validate experiments/open-field.flowrat.toml
+python3 tools/flowrat_experiment.py generate experiments/presets/homing.flowrat.toml \
+  --output data/out/experiments/homing.synthetic.csv
+python3 tools/flowrat_experiment.py analyze data/out/experiments/homing.synthetic.csv \
+  --output data/out/experiments/homing.metrics.json
+```
+
+Tracked movement can be imported from a video-tracking export with
+`time,x,y,rat` or common `frame,x_px,y_px,animal_id` columns, then compared to
+the synthetic protocol. See [`experiments/README.md`](experiments/README.md)
+for the schema and real-data workflow.
+
 ### Keys
 
 | key | does |

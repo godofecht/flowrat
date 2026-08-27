@@ -28,6 +28,7 @@ PRESET_DIR = ROOT / "experiments" / "presets"
 DEFAULT_OUT = ROOT / "data" / "out" / "experiments"
 PRESET_IDS = {"open_field": 0, "circle": 1, "two_rooms": 2, "four_rooms": 3,
               "t_maze": 4, "linear_track": 5, "obstacles": 6, "plus_maze": 7}
+PRESET_IDS["large_field"] = 8
 
 PRESET_DEFAULTS = {
     "open_field": {"arena": {"width": 2.0, "height": 2.0, "goal_x": 1.0, "goal_y": 1.0}, "policy": "explore"},
@@ -35,6 +36,7 @@ PRESET_DEFAULTS = {
     "obstacle_navigation": {"arena": {"width": 2.0, "height": 2.0, "goal_x": 1.8, "goal_y": 1.8}, "policy": "avoid"},
     "homing": {"arena": {"width": 2.0, "height": 2.0, "goal_x": 0.3, "goal_y": 0.3}, "policy": "home"},
     "cue_remapping": {"arena": {"width": 2.0, "height": 2.0, "goal_x": 1.7, "goal_y": 1.7}, "policy": "remap"},
+    "large_field": {"arena": {"width": 4.0, "height": 3.2, "goal_x": 2.0, "goal_y": 1.6}, "policy": "colony"},
 }
 
 

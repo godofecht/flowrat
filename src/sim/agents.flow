@@ -167,6 +167,16 @@ export struct Agents {
     # parallel motion pass and applied afterwards in one serial sweep, so
     # several rats sharing a patch never race on its amount.
     eat_request: ptr<f64>,
+
+    # Social and life-history state. `sex` is 0/1 for the deterministic
+    # colony seed, dominance settles through close encounters, and pregnancy
+    # counts down in seconds. These are deliberately per-rat arrays so a
+    # later pair-bond or genotype model can extend the same interface.
+    sex: ptr<i32>,
+    dominance: ptr<f64>,
+    age: ptr<f64>,
+    pregnant: ptr<f64>,
+    repro_cooldown: ptr<f64>,
 }
 
 function alloc_f(count: i64) -> ptr<f64> {
@@ -193,6 +203,8 @@ export function agents_create(cap: i32, trail_len: i32) -> Agents {
         carrying: null,
         food_target: null, supply_kind: null, crowd: null, fam: null, roll_dt: null, bite_pending: null,
         eat_request: null,
+        sex: null, dominance: null, age: null, pregnant: null,
+        repro_cooldown: null,
         state: null, state_timer: null, state_elapsed: null,
         bout_done_state: null, bout_done_len: null, food_cooldown: null,
         scan_cooldown: null, scans: null,
@@ -231,6 +243,11 @@ export function agents_create(cap: i32, trail_len: i32) -> Agents {
     a.fam = mem_alloc_u8(c * (FAM_CELLS as i64), "agents.fam")
     a.supply_kind = alloc_i(c)
     a.eat_request = alloc_f(c)
+    a.sex = alloc_i(c)
+    a.dominance = alloc_f(c)
+    a.age = alloc_f(c)
+    a.pregnant = alloc_f(c)
+    a.repro_cooldown = alloc_f(c)
     a.state = alloc_i(c)
     a.state_timer = alloc_f(c)
     a.state_elapsed = alloc_f(c)
@@ -278,6 +295,11 @@ export function agents_create(cap: i32, trail_len: i32) -> Agents {
             a.fam[i * FAM_CELLS + k] = 0 as u8
         }
         a.eat_request[i] = 0.0
+        a.sex[i] = i % 2
+        a.dominance[i] = 0.35 + ((i % 11) as f64) * 0.06
+        a.age[i] = 30.0 + ((i % 7) as f64) * 4.0
+        a.pregnant[i] = 0.0
+        a.repro_cooldown[i] = 0.0
         a.state[i] = 0
         a.state_timer[i] = 0.0
         a.state_elapsed[i] = 0.0
@@ -331,6 +353,11 @@ export function agents_destroy(a: ptr<Agents>) -> void {
     mem_release(a.fam as ptr<void>)
     mem_release(a.supply_kind as ptr<void>)
     mem_release(a.eat_request as ptr<void>)
+    mem_release(a.sex as ptr<void>)
+    mem_release(a.dominance as ptr<void>)
+    mem_release(a.age as ptr<void>)
+    mem_release(a.pregnant as ptr<void>)
+    mem_release(a.repro_cooldown as ptr<void>)
     mem_release(a.state as ptr<void>)
     mem_release(a.state_timer as ptr<void>)
     mem_release(a.state_elapsed as ptr<void>)
@@ -380,6 +407,11 @@ export function agents_place(a: ptr<Agents>, i: i32, x: f64, y: f64,
     a.roll_dt[i] = 0.0
     a.bite_pending[i] = 0
     a.eat_request[i] = 0.0
+    a.sex[i] = i % 2
+    a.dominance[i] = 0.35 + ((i % 11) as f64) * 0.06
+    a.age[i] = 30.0 + ((i % 7) as f64) * 4.0
+    a.pregnant[i] = 0.0
+    a.repro_cooldown[i] = 0.0
     # A rat placed in an arena has not seen it. Resetting restores naivety,
     # which is what makes the wall hugging come back and is the only way to
     # run the same animal on a new room twice.
@@ -444,6 +476,21 @@ export function agents_max_crowd(a: ptr<Agents>) -> i32 {
         if a.crowd[i] > m { m = a.crowd[i] }
     }
     return m
+}
+
+export function agents_mean_dominance(a: ptr<Agents>) -> f64 {
+    if a.n <= 0 { return 0.0 }
+    let mut s: f64 = 0.0
+    for i in 0 to a.n { s = s + a.dominance[i] }
+    return s / (a.n as f64)
+}
+
+export function agents_count_pregnant(a: ptr<Agents>) -> i32 {
+    let mut n: i32 = 0
+    for i in 0 to a.n {
+        if a.pregnant[i] > 0.0 { n = n + 1 }
+    }
+    return n
 }
 
 export function agents_total_notes(a: ptr<Agents>) -> i32 {

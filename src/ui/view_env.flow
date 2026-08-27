@@ -447,6 +447,20 @@ function draw_rat(c: ptr<Canvas>, v: ptr<View>, a: ptr<Agents>,
             view_sy(v, a.y[i] + sin(hd) * hlen), col_scale(col, 0.55))
     dr_disc(c, sx, sy, r, col)
 
+    # Social rank is visible without opening a panel: dominant animals carry
+    # a warm outer halo, while juveniles and pregnant females get a second
+    # life-history marker. The ring is deliberately thin so the animal remains
+    # the focal point of the scene.
+    if a.dominance[i] > 0.62 {
+        dr_circle(c, sx, sy, r + 2, rgb(224, 177, 104))
+    }
+    if a.pregnant[i] > 0.0 {
+        dr_circle(c, sx, sy, r + 4, rgb(202, 132, 184))
+    }
+    if a.age[i] < 60.0 {
+        dr_circle(c, sx, sy, r + 2, rgb(126, 174, 206))
+    }
+
     # A scanning rat gets a marker, because a stopped rat looks the same as a
     # resting one otherwise and the head sweep is small on screen.
     if a.state[i] == ST_SCAN {

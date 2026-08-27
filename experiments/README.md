@@ -28,6 +28,20 @@ The included protocols are behavioral experiments, not just visual arenas:
 - `obstacle-navigation`: boundary and obstacle avoidance
 - `homing`: outbound exploration followed by return-to-home
 - `cue-remapping`: a goal/cue change halfway through the run
+- `large-field`: a 4 x 3.2 m colony arena with distributed food, water,
+  slow proximity-gated bites, social rank, and reproduction
+
+## Video showcase
+
+The live simulator can be captured and assembled into a rough-cut video with
+one command (the output is ignored by git):
+
+```bash
+./tools/showcase.sh
+```
+
+It stages a T-maze choice, obstacle navigation, and the large colony field,
+then writes `data/out/showcase/flowrat-showcase.mp4`.
 
 ## Real tracked movement
 

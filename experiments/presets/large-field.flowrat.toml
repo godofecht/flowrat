@@ -1,0 +1,28 @@
+[experiment]
+name = "large colony field"
+preset = "large_field"
+seed = 17
+rats = 32
+duration_s = 180.0
+sample_hz = 30.0
+
+[simulation]
+dt = 0.0166666667
+steps_per_frame = 2
+
+[behavior]
+feeding = true
+slow_bite_seconds = 0.7
+food_requires_proximity = true
+social_hierarchy = true
+reproduction = true
+
+[recording]
+trajectory = true
+neural = true
+recurrent = true
+occupancy = true
+ratemap = true
+
+[analysis]
+metrics = ["speed", "turn_rate", "occupancy_entropy", "directional_persistence"]

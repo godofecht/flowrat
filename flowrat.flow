@@ -70,9 +70,9 @@ import "src/io/config.flow"
 # Keys tracked for edge detection. A key that fires on the level rather than
 # the edge toggles many times while it is held, which is unusable for
 # anything that flips a state.
-const NKEYS: i32 = 23
+const NKEYS: i32 = 24
 
-let mut key_prev: array<i32, 23> = [0]
+let mut key_prev: array<i32, 24> = [0]
 
 function key_code(slot: i32) -> i32 {
     if slot == 0 { return KEY_SPACE }
@@ -88,16 +88,17 @@ function key_code(slot: i32) -> i32 {
     if slot == 10 { return KEY_6 }
     if slot == 11 { return KEY_7 }
     if slot == 12 { return KEY_8 }
-    if slot == 13 { return KEY_T }
-    if slot == 14 { return KEY_Y }
-    if slot == 15 { return KEY_U }
-    if slot == 16 { return KEY_I }
-    if slot == 17 { return KEY_C }
-    if slot == 18 { return KEY_P }
-    if slot == 19 { return KEY_O }
-    if slot == 20 { return KEY_MINUS }
-    if slot == 21 { return KEY_EQUAL }
-    if slot == 22 { return KEY_K }
+    if slot == 13 { return KEY_9 }
+    if slot == 14 { return KEY_T }
+    if slot == 15 { return KEY_Y }
+    if slot == 16 { return KEY_U }
+    if slot == 17 { return KEY_I }
+    if slot == 18 { return KEY_C }
+    if slot == 19 { return KEY_P }
+    if slot == 20 { return KEY_O }
+    if slot == 21 { return KEY_MINUS }
+    if slot == 22 { return KEY_EQUAL }
+    if slot == 23 { return KEY_K }
     return KEY_N
 }
 

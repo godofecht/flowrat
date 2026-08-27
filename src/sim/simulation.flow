@@ -394,6 +394,74 @@ export function sim_env_changed(s: ptr<Sim>) -> void {
 
 # --- the step --------------------------------------------------------------
 
+# Settle a lightweight dominance order and advance reproduction. This pass is
+# serial by design: a close encounter updates two members of the same colony,
+# and births change the active count. The interaction is intentionally slow so
+# hierarchy is an emergent trace in a video rather than a hard-coded rank.
+function social_life_tick(s: ptr<Sim>) -> void {
+    let a: ptr<Agents> = &s.agents
+    let original: i32 = a.n
+    let mut births: i32 = 0
+    for i in 0 to original {
+        a.age[i] = a.age[i] + s.dt
+        if a.repro_cooldown[i] > 0.0 {
+            a.repro_cooldown[i] = a.repro_cooldown[i] - s.dt
+        }
+        if a.pregnant[i] > 0.0 {
+            a.pregnant[i] = a.pregnant[i] - s.dt
+            if a.pregnant[i] <= 0.0 { births = births + 1 }
+        }
+
+        let mut d: f64 = 0.0
+        let mut dx: f64 = 0.0
+        let mut dy: f64 = 0.0
+        let near: i32 = grid_nearest(&s.near, i, s.motion.social_range,
+                                     &d, &dx, &dy)
+        if near < 0 { continue }
+        # Winner-take-a-little: repeated close encounters settle toward a
+        # stable order without making rank immutable.
+        if a.dominance[i] > a.dominance[near] {
+            a.dominance[i] = a.dominance[i] + 0.0015 * s.dt
+            a.dominance[near] = a.dominance[near] - 0.0015 * s.dt
+        } else {
+            a.dominance[i] = a.dominance[i] - 0.0015 * s.dt
+            a.dominance[near] = a.dominance[near] + 0.0015 * s.dt
+        }
+        if a.dominance[i] < 0.05 { a.dominance[i] = 0.05 }
+        if a.dominance[i] > 0.95 { a.dominance[i] = 0.95 }
+
+        # A female needs proximity, adulthood, and enough energetic slack.
+        # Pregnancy is a visible 18-second state; delivery adds one juvenile
+        # when the fixed-capacity colony has room.
+        if a.sex[i] == 1 and a.age[i] > 60.0 and a.pregnant[i] <= 0.0
+           and a.repro_cooldown[i] <= 0.0 and a.hunger[i] < 0.65
+           and d < s.motion.social_range * 1.5
+           and a.sex[near] == 0 and a.age[near] > 60.0 {
+            a.pregnant[i] = 18.0
+            a.repro_cooldown[i] = 48.0
+            a.repro_cooldown[near] = 12.0
+        }
+    }
+    if births > 0 {
+        let room: i32 = a.cap - a.n
+        if births > room { births = room }
+        let first: i32 = a.n
+        agents_set_count(a, a.n + births)
+        for k in 0 to births {
+            let child: i32 = first + k
+            let parent: i32 = k % original
+            let x: f64 = a.x[parent] + rng_sym(s.seed, 891, (child as u32) + 1, 0.025)
+            let y: f64 = a.y[parent] + rng_sym(s.seed, 892, (child as u32) + 1, 0.025)
+            agents_place(a, child, x, y,
+                         rng_range(s.seed, 893, (child as u32) + 1, -PI, PI),
+                         s.motion.speed_mean * 0.55)
+            a.age[child] = 0.0
+            a.sex[child] = child % 2
+            a.dominance[child] = 0.25
+        }
+    }
+}
+
 export function sim_step(s: ptr<Sim>) -> void {
     let t_sim: i64 = prof_begin()
 
@@ -404,6 +472,8 @@ export function sim_step(s: ptr<Sim>) -> void {
     let t_nb: i64 = prof_begin()
     grid_build(&s.near, &s.agents, &s.env, sim_social_radius(s))
     prof_end(PROF_NEIGH, t_nb)
+
+    social_life_tick(s)
 
     let t_ag: i64 = prof_begin()
     motion_step_all(&s.agents, &s.env, &s.motion, &s.behaviour, &s.memory,

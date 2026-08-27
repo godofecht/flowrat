@@ -323,6 +323,10 @@ export function view_perf_draw(c: ptr<Canvas>, u: ptr<Ui>, s: ptr<Sim>,
     y = y + 16
     ui_kv_int(c, x0, y, w, "rats", s.agents.n, C_TEXT)
     y = y + 11
+    ui_kv_int(c, x0, y, w, "pregnant", agents_count_pregnant(&s.agents), C_TEXT)
+    y = y + 11
+    ui_kv_fixed(c, x0, y, w, "mean rank", agents_mean_dominance(&s.agents), 2, C_TEXT)
+    y = y + 11
     ui_kv_int(c, x0, y, w, "population cells", sim_total_cells(s), C_TEXT)
     y = y + 11
     ui_kv_int(c, x0, y, w, "recurrent cells", s.sheet.n + s.ring.n, C_TEXT)
@@ -652,6 +656,7 @@ function preset_short(k: i32) -> string {
     if k == PRESET_LINEAR_TRACK { return "track" }
     if k == PRESET_OBSTACLES { return "pillars" }
     if k == PRESET_PLUS_MAZE { return "plus" }
+    if k == PRESET_LARGE_FIELD { return "large" }
     return "open"
 }
 

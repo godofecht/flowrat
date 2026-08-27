@@ -19,7 +19,8 @@ export const PRESET_T_MAZE: i32 = 4
 export const PRESET_LINEAR_TRACK: i32 = 5
 export const PRESET_OBSTACLES: i32 = 6
 export const PRESET_PLUS_MAZE: i32 = 7
-export const PRESET_COUNT: i32 = 8
+export const PRESET_LARGE_FIELD: i32 = 8
+export const PRESET_COUNT: i32 = 9
 
 # A 2 x 2 m box. The default: no internal structure, so place fields tile
 # cleanly and any boundary response comes from the outer wall alone.
@@ -226,6 +227,25 @@ export function preset_plus_maze(e: ptr<Env>) -> void {
     e.preset = PRESET_PLUS_MAZE
 }
 
+# A 4 x 3.2 m colony field for long-form runs and video. The scale is large
+# enough for territories and social regrouping to read spatially, while four
+# food patches and two water points keep the colony moving instead of
+# collapsing onto one resource.
+export function preset_large_field(e: ptr<Env>) -> void {
+    env_set_rect(e, 0.0, 0.0, 4.0, 3.2)
+    env_add_cue(e, 2.0, 3.0, 1.0)
+    env_add_cue(e, 0.35, 1.6, 0.8)
+    env_add_cue(e, 3.65, 1.6, 0.8)
+    env_add_zone_food(e, ZONE_REWARD, SHAPE_CIRCLE, 0.45, 2.7, 0.18, 0.0, 26.0, 1.1)
+    env_add_zone_food(e, ZONE_REWARD, SHAPE_CIRCLE, 3.55, 2.7, 0.18, 0.0, 26.0, 1.1)
+    env_add_zone_food(e, ZONE_REWARD, SHAPE_CIRCLE, 0.55, 0.45, 0.16, 0.0, 20.0, 0.9)
+    env_add_zone_food(e, ZONE_REWARD, SHAPE_CIRCLE, 3.45, 0.45, 0.16, 0.0, 20.0, 0.9)
+    add_water(e, 1.35, 1.55, 0.16)
+    add_water(e, 2.65, 1.55, 0.16)
+    env_add_zone(e, ZONE_START, SHAPE_CIRCLE, 2.0, 1.6, 0.22, 0.0)
+    e.preset = PRESET_LARGE_FIELD
+}
+
 export function env_preset_apply(e: ptr<Env>, which: i32) -> void {
     if which == PRESET_CIRCLE { preset_circle(e)
                                 return }
@@ -241,6 +261,8 @@ export function env_preset_apply(e: ptr<Env>, which: i32) -> void {
                                    return }
     if which == PRESET_PLUS_MAZE { preset_plus_maze(e)
                                    return }
+    if which == PRESET_LARGE_FIELD { preset_large_field(e)
+                                     return }
     preset_open_field(e)
 }
 
@@ -252,5 +274,6 @@ export function env_preset_name(which: i32) -> string {
     if which == PRESET_LINEAR_TRACK { return "linear track" }
     if which == PRESET_OBSTACLES { return "obstacles" }
     if which == PRESET_PLUS_MAZE { return "plus maze" }
+    if which == PRESET_LARGE_FIELD { return "large field" }
     return "open field"
 }

@@ -1,0 +1,577 @@
+# Batched rat state, structure of arrays.
+#
+# LAYOUT
+#   One allocation per quantity, `cap` elements each. Rat i is the i-th entry
+#   of every array; there is no Rat object anywhere in the program. Every
+#   kernel that touches rats walks one or two of these arrays end to end, so
+#   each one is a unit-stride stream, and adding a field to the model costs
+#   nothing to the kernels that do not read it.
+#
+#   The same layout is what a GPU port would want: each array maps to one
+#   device buffer and each kernel indexes by global thread id. Nothing here
+#   holds a pointer into another rat's data, so there is no pointer chasing
+#   to unpick later.
+#
+# SENSORY CACHE
+#   wall_dist, wall_nx/ny, the ray fan, nearest cue and current zone are
+#   filled once per step by agents_sense and then read by the motion model,
+#   the boundary population and the inspector panel. Computing them once is
+#   worth a lot: a ray fan is the most expensive thing in the step, and three
+#   consumers would otherwise each pay for it.
+#
+# TRAILS
+#   Each rat owns a fixed ring buffer of past positions. A ring keeps the
+#   trail cost constant per step and independent of how long the run has
+#   been going, which matters because the environment view redraws it every
+#   frame.
+
+# GEO_FAR and dist2 come from src/env/geometry.flow. Flow resolves imports
+# relative to the importing file and rejects "..", so cross-directory
+# dependencies are satisfied by the entry point's import list.
+
+extern {
+    function sin(x: f64) -> f64
+    function cos(x: f64) -> f64
+}
+
+# How many places a rat can remember food being. Small on purpose: a rat is
+# not a database, and a short list that decays is both cheaper and closer to
+# the thing being modelled than a complete map would be.
+export const MEM_SLOTS: i32 = 6
+
+# Rays cast per rat per step. 16 is enough for a boundary-vector population
+# to show clear directional tuning and cheap enough to keep the sensory pass
+# off the top of the profile at a thousand rats.
+export const RAY_COUNT: i32 = 16
+
+export struct Agents {
+    n: i32,
+    cap: i32,
+
+    x: ptr<f64>,
+    y: ptr<f64>,
+    heading: ptr<f64>,
+    # Where the head points, as an offset from the body axis.
+    #
+    # A rat's head is not bolted to its shoulders: it turns, sweeps and looks
+    # to the side while the body carries straight on. This matters here for
+    # two reasons. Head-direction cells encode the head, and the whiskers and
+    # eyes are on it, so the sensory fan is cast from the head rather than
+    # from the direction of travel.
+    head_angle: ptr<f64>,
+    speed: ptr<f64>,
+    ang_vel: ptr<f64>,
+    # Linear and angular acceleration from the last step, kept because the
+    # velocity population and the inspector both want them and recomputing a
+    # difference after the state has moved on is not possible.
+    accel: ptr<f64>,
+    ang_accel: ptr<f64>,
+    active: ptr<i32>,
+    id: ptr<i32>,
+
+    # Sensory cache, valid after agents_sense for the current positions.
+    wall_dist: ptr<f64>,
+    wall_nx: ptr<f64>,
+    wall_ny: ptr<f64>,
+    cue_dist: ptr<f64>,
+    cue_idx: ptr<i32>,
+    zone_reward: ptr<i32>,
+    rays: ptr<f64>,
+
+    trail_len: i32,
+    trail_head: i32,
+    trail_fill: i32,
+    trail_x: ptr<f64>,
+    trail_y: ptr<f64>,
+
+    # Cumulative path length per rat, a cheap sanity check that motion is
+    # actually happening and a useful denominator for occupancy statistics.
+    distance: ptr<f64>,
+
+    # Motivational state.
+    #
+    # hunger runs 0 to 1 and rises on its own. It is what turns foraging from
+    # a random walk that happens to pass food into behaviour with a reason:
+    # a sated rat explores, a hungry one goes and gets something.
+    hunger: ptr<f64>,
+    eaten: ptr<f64>,
+    # thirst runs the same way and competes with hunger for the animal's
+    # time. One drive is a reflex: the rat is hungry, so it goes to the food.
+    # Two drives that cannot both be served at once is where behaviour starts
+    # to look like a choice, because being at the water is being away from
+    # the food.
+    thirst: ptr<f64>,
+    drunk: ptr<f64>,
+    # Amount the rat is carrying back to the nest. How long a mouthful has
+    # left lives in the behavioural state's timer.
+    carrying: ptr<f64>,
+    # Patch being consumed from, or headed for. -1 for neither. Food and
+    # water share this column, because a rat pursues one thing at a time and
+    # holding a slot for each would let it walk two directions at once.
+    food_target: ptr<i32>,
+    # Which kind that patch is, ZONE_REWARD or ZONE_WATER, or -1 when there
+    # is no target. This is the record of which drive currently has the
+    # animal, and it is what the hysteresis holds on to.
+    supply_kind: ptr<i32>,
+
+    # What the rat is doing, how long it has left of a timed bout, and how
+    # long it has been doing it. See src/sim/behaviour.flow.
+    state: ptr<i32>,
+    state_timer: ptr<f64>,
+    state_elapsed: ptr<f64>,
+    # A bout that ended this step, for the serial pass that folds it into the
+    # ethogram. -1 when none ended. Recording it per rat rather than writing
+    # the histogram from the parallel loop is what keeps the counts
+    # reproducible.
+    bout_done_state: ptr<i32>,
+    bout_done_len: ptr<f64>,
+    # Seconds left before this rat will try a patch again after one gave it
+    # nothing. Without it, a crowd at a patch that regrows slower than they
+    # eat will each try and fail every single step.
+    food_cooldown: ptr<f64>,
+    # Seconds before this rat will stop and look around at a junction again,
+    # and how many times it has.
+    scan_cooldown: ptr<f64>,
+    scans: ptr<i32>,
+    # How many other rats were within eating reach when this one last took a
+    # mouthful. Kept per rat so the interface can show a crowd without
+    # recomputing one, and so the ethogram panel can say why eating is slow.
+    crowd: ptr<i32>,
+    # Seconds since this rat last got to roll for a maintenance behaviour.
+    # See the long note at the roll in src/sim/behaviour.flow.
+    roll_dt: ptr<f64>,
+    # Set when a rat starts a mouthful, cleared when the serial feeding pass
+    # hands it the one item that mouthful is for. A bite is a discrete act,
+    # so the request has to be a discrete flag rather than a rate.
+    bite_pending: ptr<i32>,
+    # A coarse map of where this rat has been, FAM_CELLS bytes per rat, laid
+    # out rat major. See src/sim/novelty.flow. Still the largest per-rat array
+    # in FlowRat at 1 MB across the maximum batch, and it was eight times that
+    # until the cells stopped being doubles.
+    fam: ptr<u8>,
+
+    # What the rat remembers about where food was. MEM_SLOTS entries per rat,
+    # laid out rat major. See src/sim/memory.flow.
+    mem_patch: ptr<i32>,
+    mem_x: ptr<f64>,
+    mem_y: ptr<f64>,
+    mem_conf: ptr<f64>,
+
+    # Dead-reckoned vector from the rat to the nest, maintained by
+    # integrating its own movement rather than by looking. Accumulates error,
+    # which is the whole point: this is what path integration buys and what
+    # it costs.
+    home_dx: ptr<f64>,
+    home_dy: ptr<f64>,
+    # What this rat wants to remove from a patch this step. Filled by the
+    # parallel motion pass and applied afterwards in one serial sweep, so
+    # several rats sharing a patch never race on its amount.
+    eat_request: ptr<f64>,
+}
+
+function alloc_f(count: i64) -> ptr<f64> {
+    return mem_alloc(count * 8, "agent state") as ptr<f64>
+}
+
+function alloc_i(count: i64) -> ptr<i32> {
+    return mem_alloc(count * 4, "agent state") as ptr<i32>
+}
+
+export function agents_create(cap: i32, trail_len: i32) -> Agents {
+    let c: i64 = cap as i64
+    let t: i64 = (cap as i64) * (trail_len as i64)
+    let mut a: Agents = Agents {
+        n: 0, cap: cap,
+        x: null, y: null, heading: null, speed: null, ang_vel: null,
+        accel: null, ang_accel: null, active: null, id: null,
+        wall_dist: null, wall_nx: null, wall_ny: null,
+        cue_dist: null, cue_idx: null, zone_reward: null, rays: null,
+        trail_len: trail_len, trail_head: 0, trail_fill: 0,
+        trail_x: null, trail_y: null,
+        distance: null,
+        hunger: null, eaten: null, thirst: null, drunk: null,
+        carrying: null,
+        food_target: null, supply_kind: null, crowd: null, fam: null, roll_dt: null, bite_pending: null,
+        eat_request: null,
+        state: null, state_timer: null, state_elapsed: null,
+        bout_done_state: null, bout_done_len: null, food_cooldown: null,
+        scan_cooldown: null, scans: null,
+        mem_patch: null, mem_x: null, mem_y: null, mem_conf: null,
+        home_dx: null, home_dy: null
+    }
+    a.x = alloc_f(c)
+    a.y = alloc_f(c)
+    a.heading = alloc_f(c)
+    a.head_angle = alloc_f(c)
+    a.speed = alloc_f(c)
+    a.ang_vel = alloc_f(c)
+    a.accel = alloc_f(c)
+    a.ang_accel = alloc_f(c)
+    a.active = alloc_i(c)
+    a.id = alloc_i(c)
+    a.wall_dist = alloc_f(c)
+    a.wall_nx = alloc_f(c)
+    a.wall_ny = alloc_f(c)
+    a.cue_dist = alloc_f(c)
+    a.cue_idx = alloc_i(c)
+    a.zone_reward = alloc_i(c)
+    a.rays = alloc_f(c * (RAY_COUNT as i64))
+    a.trail_x = alloc_f(t)
+    a.trail_y = alloc_f(t)
+    a.distance = alloc_f(c)
+    a.hunger = alloc_f(c)
+    a.thirst = alloc_f(c)
+    a.drunk = alloc_f(c)
+    a.eaten = alloc_f(c)
+    a.carrying = alloc_f(c)
+    a.food_target = alloc_i(c)
+    a.crowd = alloc_i(c)
+    a.roll_dt = alloc_f(c)
+    a.bite_pending = alloc_i(c)
+    a.fam = mem_alloc_u8(c * (FAM_CELLS as i64), "agents.fam")
+    a.supply_kind = alloc_i(c)
+    a.eat_request = alloc_f(c)
+    a.state = alloc_i(c)
+    a.state_timer = alloc_f(c)
+    a.state_elapsed = alloc_f(c)
+    a.bout_done_state = alloc_i(c)
+    a.bout_done_len = alloc_f(c)
+    a.food_cooldown = alloc_f(c)
+    a.scan_cooldown = alloc_f(c)
+    a.scans = alloc_i(c)
+    let m: i64 = c * (MEM_SLOTS as i64)
+    a.mem_patch = alloc_i(m)
+    a.mem_x = alloc_f(m)
+    a.mem_y = alloc_f(m)
+    a.mem_conf = alloc_f(m)
+    a.home_dx = alloc_f(c)
+    a.home_dy = alloc_f(c)
+    for i in 0 to cap {
+        a.x[i] = 0.0
+        a.y[i] = 0.0
+        a.heading[i] = 0.0
+        a.head_angle[i] = 0.0
+        a.speed[i] = 0.0
+        a.ang_vel[i] = 0.0
+        a.accel[i] = 0.0
+        a.ang_accel[i] = 0.0
+        a.active[i] = 0
+        a.id[i] = i
+        a.wall_dist[i] = GEO_FAR
+        a.wall_nx[i] = 0.0
+        a.wall_ny[i] = 0.0
+        a.cue_dist[i] = GEO_FAR
+        a.cue_idx[i] = -1
+        a.zone_reward[i] = -1
+        a.distance[i] = 0.0
+        a.hunger[i] = 0.0
+        a.thirst[i] = 0.0
+        a.drunk[i] = 0.0
+        a.eaten[i] = 0.0
+        a.carrying[i] = 0.0
+        a.food_target[i] = -1
+        a.supply_kind[i] = -1
+        a.crowd[i] = 0
+        a.roll_dt[i] = 0.0
+        a.bite_pending[i] = 0
+        for k in 0 to FAM_CELLS {
+            a.fam[i * FAM_CELLS + k] = 0 as u8
+        }
+        a.eat_request[i] = 0.0
+        a.state[i] = 0
+        a.state_timer[i] = 0.0
+        a.state_elapsed[i] = 0.0
+        a.bout_done_state[i] = -1
+        a.bout_done_len[i] = 0.0
+        a.food_cooldown[i] = 0.0
+        a.scan_cooldown[i] = 0.0
+        a.scans[i] = 0
+        a.home_dx[i] = 0.0
+        a.home_dy[i] = 0.0
+        for k in 0 to MEM_SLOTS {
+            a.mem_patch[i * MEM_SLOTS + k] = -1
+            a.mem_x[i * MEM_SLOTS + k] = 0.0
+            a.mem_y[i * MEM_SLOTS + k] = 0.0
+            a.mem_conf[i * MEM_SLOTS + k] = 0.0
+        }
+    }
+    return a
+}
+
+export function agents_destroy(a: ptr<Agents>) -> void {
+    mem_release(a.x as ptr<void>)
+    mem_release(a.y as ptr<void>)
+    mem_release(a.heading as ptr<void>)
+    mem_release(a.head_angle as ptr<void>)
+    mem_release(a.speed as ptr<void>)
+    mem_release(a.ang_vel as ptr<void>)
+    mem_release(a.accel as ptr<void>)
+    mem_release(a.ang_accel as ptr<void>)
+    mem_release(a.active as ptr<void>)
+    mem_release(a.id as ptr<void>)
+    mem_release(a.wall_dist as ptr<void>)
+    mem_release(a.wall_nx as ptr<void>)
+    mem_release(a.wall_ny as ptr<void>)
+    mem_release(a.cue_dist as ptr<void>)
+    mem_release(a.cue_idx as ptr<void>)
+    mem_release(a.zone_reward as ptr<void>)
+    mem_release(a.rays as ptr<void>)
+    mem_release(a.trail_x as ptr<void>)
+    mem_release(a.trail_y as ptr<void>)
+    mem_release(a.distance as ptr<void>)
+    mem_release(a.hunger as ptr<void>)
+    mem_release(a.thirst as ptr<void>)
+    mem_release(a.drunk as ptr<void>)
+    mem_release(a.eaten as ptr<void>)
+    mem_release(a.carrying as ptr<void>)
+    mem_release(a.food_target as ptr<void>)
+    mem_release(a.crowd as ptr<void>)
+    mem_release(a.roll_dt as ptr<void>)
+    mem_release(a.bite_pending as ptr<void>)
+    mem_release(a.fam as ptr<void>)
+    mem_release(a.supply_kind as ptr<void>)
+    mem_release(a.eat_request as ptr<void>)
+    mem_release(a.state as ptr<void>)
+    mem_release(a.state_timer as ptr<void>)
+    mem_release(a.state_elapsed as ptr<void>)
+    mem_release(a.bout_done_state as ptr<void>)
+    mem_release(a.bout_done_len as ptr<void>)
+    mem_release(a.food_cooldown as ptr<void>)
+    mem_release(a.scan_cooldown as ptr<void>)
+    mem_release(a.scans as ptr<void>)
+    mem_release(a.mem_patch as ptr<void>)
+    mem_release(a.mem_x as ptr<void>)
+    mem_release(a.mem_y as ptr<void>)
+    mem_release(a.mem_conf as ptr<void>)
+    mem_release(a.home_dx as ptr<void>)
+    mem_release(a.home_dy as ptr<void>)
+}
+
+export function agents_set_count(a: ptr<Agents>, n: i32) -> void {
+    let mut k: i32 = n
+    if k < 0 { k = 0 }
+    if k > a.cap { k = a.cap }
+    a.n = k
+    for i in 0 to a.cap {
+        if i < k { a.active[i] = 1 } else { a.active[i] = 0 }
+    }
+}
+
+export function agents_place(a: ptr<Agents>, i: i32, x: f64, y: f64,
+                             heading: f64, speed: f64) -> void {
+    if i < 0 or i >= a.cap { return }
+    a.x[i] = x
+    a.y[i] = y
+    a.heading[i] = heading
+    a.head_angle[i] = 0.0
+    a.speed[i] = speed
+    a.ang_vel[i] = 0.0
+    a.accel[i] = 0.0
+    a.ang_accel[i] = 0.0
+    a.distance[i] = 0.0
+    a.hunger[i] = 0.0
+    a.eaten[i] = 0.0
+    a.thirst[i] = 0.0
+    a.drunk[i] = 0.0
+    a.carrying[i] = 0.0
+    a.food_target[i] = -1
+    a.supply_kind[i] = -1
+    a.crowd[i] = 0
+    a.roll_dt[i] = 0.0
+    a.bite_pending[i] = 0
+    a.eat_request[i] = 0.0
+    # A rat placed in an arena has not seen it. Resetting restores naivety,
+    # which is what makes the wall hugging come back and is the only way to
+    # run the same animal on a new room twice.
+    for k in 0 to FAM_CELLS {
+        a.fam[i * FAM_CELLS + k] = 0 as u8
+    }
+    # The reckoning starts fresh wherever the rat is put down, which is the
+    # nest. Leaving the old vector here made a rat that was moved believe the
+    # nest had moved with it.
+    a.home_dx[i] = 0.0
+    a.home_dy[i] = 0.0
+    a.state[i] = 0
+    a.state_timer[i] = 0.0
+    a.state_elapsed[i] = 0.0
+    a.bout_done_state[i] = -1
+    a.bout_done_len[i] = 0.0
+    a.food_cooldown[i] = 0.0
+    a.head_angle[i] = 0.0
+    a.scan_cooldown[i] = 0.0
+    a.scans[i] = 0
+    a.home_dx[i] = 0.0
+    a.home_dy[i] = 0.0
+    for k in 0 to MEM_SLOTS {
+        a.mem_patch[i * MEM_SLOTS + k] = -1
+        a.mem_conf[i * MEM_SLOTS + k] = 0.0
+    }
+}
+
+# Where the head points in the room, which is what a head-direction cell
+# encodes and where the whiskers are looking. The body's heading plus the
+# head's offset from it.
+export function agents_head_dir(a: ptr<Agents>, i: i32) -> f64 {
+    return wrap_pi(a.heading[i] + a.head_angle[i])
+}
+
+# How many notes about food the colony is holding. The headline number for
+# the memory block: it climbs as the rats learn the arena and falls when the
+# patches stop paying.
+export function agents_total_drunk(a: ptr<Agents>) -> f64 {
+    let mut s: f64 = 0.0
+    for i in 0 to a.n {
+        s = s + a.drunk[i]
+    }
+    return s
+}
+
+export function agents_mean_thirst(a: ptr<Agents>) -> f64 {
+    if a.n <= 0 { return 0.0 }
+    let mut s: f64 = 0.0
+    for i in 0 to a.n {
+        s = s + a.thirst[i]
+    }
+    return s / (a.n as f64)
+}
+
+# The most rats that were within eating reach of any one animal at its last
+# mouthful. The headline number for the social block: it says whether the
+# colony is competing for a spot or spread out over the arena.
+export function agents_max_crowd(a: ptr<Agents>) -> i32 {
+    let mut m: i32 = 0
+    for i in 0 to a.n {
+        if a.crowd[i] > m { m = a.crowd[i] }
+    }
+    return m
+}
+
+export function agents_total_notes(a: ptr<Agents>) -> i32 {
+    let mut n: i32 = 0
+    for i in 0 to a.n {
+        for k in 0 to MEM_SLOTS {
+            if a.mem_patch[i * MEM_SLOTS + k] >= 0 { n = n + 1 }
+        }
+    }
+    return n
+}
+
+export function agents_total_scans(a: ptr<Agents>) -> i32 {
+    let mut n: i32 = 0
+    for i in 0 to a.n {
+        n = n + a.scans[i]
+    }
+    return n
+}
+
+# True while the rat has its head down in a patch. Reads the behavioural
+# state rather than a separate timer, so there is one answer to the question.
+export function agents_is_eating(a: ptr<Agents>, i: i32) -> bool {
+    return a.state[i] == 2
+}
+
+# Rats currently in a given behavioural state.
+export function agents_count_state(a: ptr<Agents>, st: i32) -> i32 {
+    let mut n: i32 = 0
+    for i in 0 to a.n {
+        if a.state[i] == st { n = n + 1 }
+    }
+    return n
+}
+
+export function agents_mean_hunger(a: ptr<Agents>) -> f64 {
+    if a.n == 0 { return 0.0 }
+    let mut s: f64 = 0.0
+    for i in 0 to a.n {
+        s = s + a.hunger[i]
+    }
+    return s / (a.n as f64)
+}
+
+export function agents_total_eaten(a: ptr<Agents>) -> f64 {
+    let mut s: f64 = 0.0
+    for i in 0 to a.n {
+        s = s + a.eaten[i]
+    }
+    return s
+}
+
+export function agents_total_carried(a: ptr<Agents>) -> f64 {
+    let mut s: f64 = 0.0
+    for i in 0 to a.n {
+        s = s + a.carrying[i]
+    }
+    return s
+}
+
+export function agents_count_eating(a: ptr<Agents>) -> i32 {
+    return agents_count_state(a, 2)
+}
+
+# Wipe the trail history. Called on reset and after a teleport, so the view
+# does not draw a straight line across the arena between two unrelated spots.
+export function agents_clear_trails(a: ptr<Agents>) -> void {
+    a.trail_head = 0
+    a.trail_fill = 0
+    for i in 0 to a.cap {
+        for k in 0 to a.trail_len {
+            a.trail_x[i * a.trail_len + k] = a.x[i]
+            a.trail_y[i * a.trail_len + k] = a.y[i]
+        }
+    }
+}
+
+# Append the current positions to every trail. One shared head index across
+# all rats keeps this to a single pointer bump.
+export function agents_push_trail(a: ptr<Agents>) -> void {
+    let h: i32 = a.trail_head
+    for i in 0 to a.n {
+        a.trail_x[i * a.trail_len + h] = a.x[i]
+        a.trail_y[i * a.trail_len + h] = a.y[i]
+    }
+    a.trail_head = (h + 1) % a.trail_len
+    if a.trail_fill < a.trail_len { a.trail_fill = a.trail_fill + 1 }
+}
+
+# Read back the k-th most recent trail point of rat i. k = 0 is the newest.
+export function agents_trail_at(a: ptr<Agents>, i: i32, k: i32,
+                                x_out: ptr<f64>, y_out: ptr<f64>) -> bool {
+    if k >= a.trail_fill {
+        x_out[0] = a.x[i]
+        y_out[0] = a.y[i]
+        return false
+    }
+    let slot: i32 = (a.trail_head - 1 - k + a.trail_len * 2) % a.trail_len
+    x_out[0] = a.trail_x[i * a.trail_len + slot]
+    y_out[0] = a.trail_y[i * a.trail_len + slot]
+    return true
+}
+
+export function agents_ray(a: ptr<Agents>, i: i32, r: i32) -> f64 {
+    return a.rays[i * RAY_COUNT + r]
+}
+
+# Index of the rat closest to a world point, or -1 when none is active.
+# Used by the environment view to turn a click into a selection.
+export function agents_pick(a: ptr<Agents>, x: f64, y: f64,
+                            max_dist: f64) -> i32 {
+    let mut best: f64 = max_dist * max_dist
+    let mut best_i: i32 = -1
+    for i in 0 to a.n {
+        let d: f64 = dist2(x, y, a.x[i], a.y[i])
+        if d < best {
+            best = d
+            best_i = i
+        }
+    }
+    return best_i
+}
+
+export function agents_mean_speed(a: ptr<Agents>) -> f64 {
+    if a.n == 0 { return 0.0 }
+    let mut s: f64 = 0.0
+    for i in 0 to a.n {
+        s = s + a.speed[i]
+    }
+    return s / (a.n as f64)
+}

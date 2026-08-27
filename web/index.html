@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>flowrat - Flow on WebAssembly</title>
+<style>
+:root { color-scheme: dark; --bg:#090b12; --panel:#111622; --line:#293246;
+  --text:#edf0f7; --muted:#8993a8; --accent:#f0a855; --blue:#83adff; }
+* { box-sizing:border-box; }
+html, body { margin:0; min-height:100%; }
+body { background:radial-gradient(circle at 50% -10%,#1c2438 0,#090b12 48%);
+  color:var(--text); font:14px/1.5 ui-sans-serif,-apple-system,"Segoe UI",sans-serif;
+  display:flex; flex-direction:column; min-height:100vh; }
+header { display:flex; align-items:center; gap:12px; padding:12px 20px;
+  border-bottom:1px solid #202839; opacity:0; transform:translateY(-10px);
+  animation:rise .65s .95s cubic-bezier(.2,.8,.2,1) forwards; }
+header h1 { margin:0; font-size:22px; line-height:1; font-weight:400; }
+header .brand-mark { color:var(--text); font:italic 400 1em/1 "Brush Script MT","Segoe Script","URW Chancery L",cursive;
+  letter-spacing:-.04em; }
+header .meta { color:var(--muted); font-size:12px; }
+header a { color:var(--blue); text-decoration:none; }
+main { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center;
+  padding:22px 16px; gap:14px; opacity:0; transform:translateY(18px);
+  animation:rise .8s 1.05s cubic-bezier(.2,.8,.2,1) forwards; }
+.intro { position:fixed; inset:0; z-index:5; display:grid; place-items:center;
+  background:var(--bg); pointer-events:none; animation:intro-out .7s 2.65s ease forwards; }
+.intro-word { position:relative; color:var(--text); font:italic 400 clamp(72px,16vw,180px)/1 "Brush Script MT","Segoe Script","URW Chancery L",cursive;
+  letter-spacing:-.07em; white-space:nowrap; filter:drop-shadow(0 8px 24px #edf0f722); }
+.intro-word::after { content:""; position:absolute; left:0; bottom:-.08em; width:100%; height:5px;
+  border-radius:50%; background:var(--accent); transform:scaleX(0); transform-origin:left;
+  animation:stroke .45s 1.92s ease forwards; }
+.intro-word .letter { display:inline-block; opacity:0; transform:translateY(.22em) rotate(5deg);
+  animation:letter-in .48s cubic-bezier(.2,.8,.2,1) forwards; }
+.intro-word .letter:nth-child(1) { animation-delay:.25s; }
+.intro-word .letter:nth-child(2) { animation-delay:.42s; }
+.intro-word .letter:nth-child(3) { animation-delay:.59s; }
+.intro-word .letter:nth-child(4) { animation-delay:.76s; }
+.intro-word .letter:nth-child(5) { animation-delay:.93s; }
+.intro-word .letter:nth-child(6) { animation-delay:1.10s; }
+.intro-word .letter:nth-child(7) { animation-delay:1.27s; }
+.stage { position:relative; line-height:0; width:min(1280px,100%); }
+canvas { display:block; width:100%; height:auto; aspect-ratio:4/3; background:#000;
+  border:1px solid #293246; border-radius:8px; image-rendering:pixelated; }
+.overlay { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center;
+  justify-content:center; gap:11px; background:linear-gradient(135deg,#0c101add,#121a29e8);
+  border-radius:8px; line-height:1.5; transition:opacity .35s, transform .35s; }
+.overlay.hidden { opacity:0; transform:scale(1.02); pointer-events:none; }
+.overlay strong { font-size:20px; }
+.overlay span { color:var(--muted); max-width:40ch; text-align:center; }
+button { font:inherit; color:#0b0d13; background:var(--blue); border:0; border-radius:6px;
+  padding:8px 14px; cursor:pointer; font-weight:700; transition:transform .15s,background .15s; }
+button:hover { background:#a5c5ff; transform:translateY(-1px); }
+button.secondary { color:var(--text); background:#202a3e; }
+button.secondary:hover { background:#2d3a54; }
+button:disabled { color:#68738a; background:#202531; cursor:default; transform:none; }
+.transport { width:min(1280px,100%); display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+  padding:10px 12px; background:#111622cc; border:1px solid var(--line); border-radius:8px; }
+.transport .spacer { flex:1; }
+#status { color:var(--muted); font-size:12px; }
+.keys, footer { color:var(--muted); font-size:12px; text-align:center; }
+footer { padding:12px; border-top:1px solid #202839; }
+pre#out { width:min(880px,100%); margin:0; max-height:22vh; overflow:auto; color:#9ece6a;
+  background:#07090d; border:1px solid #202839; border-radius:6px; padding:10px; font:12px/1.5 ui-monospace,monospace; }
+pre#out:empty { display:none; } .err { color:#f7768e; }
+.wiki { width:min(1280px,100%); margin-top:28px; padding:22px; display:grid; grid-template-columns:190px 1fr;
+  gap:24px; background:#f2eddf; color:#28312f; border:1px solid #b7aa8d; border-radius:3px;
+  box-shadow:8px 8px 0 #b85c4633; position:relative; overflow:hidden; }
+.wiki::before { content:"水 · ลม"; position:absolute; right:20px; top:7px; color:#b85c46; font:italic 20px/1 Georgia,serif; opacity:.7; }
+.wiki-nav { border-right:1px solid #cbbfa7; padding:6px 20px 6px 4px; }
+.wiki-kicker { color:#b85c46; font-size:11px; letter-spacing:.18em; text-transform:uppercase; }
+.wiki h2,.wiki h3 { font-family:Georgia,"Times New Roman",serif; font-weight:500; }
+.wiki h2 { margin:3px 0 8px; font-size:29px; }
+.wiki h3 { margin:0 0 5px; font-size:18px; }
+.wiki p { margin:0; color:#53605b; }
+.wiki-nav a { display:block; padding:8px 0; color:#53605b; text-decoration:none; border-bottom:1px solid #d9d0be; }
+.wiki-nav a:hover { color:#b85c46; }
+.wiki-body { display:grid; gap:16px; padding-top:6px; }
+.wiki-intro { max-width:68ch; font-size:15px; }
+.wiki-cards { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
+.wiki-card { min-height:115px; padding:14px; background:#ebe5d5; border-top:3px solid #6d8e87; }
+.wiki-card:nth-child(2) { border-color:#b85c46; } .wiki-card:nth-child(3) { border-color:#c69b46; }
+.wiki-card p { font-size:13px; }
+@media (max-width:700px) { .wiki { grid-template-columns:1fr; } .wiki-nav { border-right:0; border-bottom:1px solid #cbbfa7; padding:0 0 10px; display:flex; gap:14px; } .wiki-nav a { border:0; } .wiki-cards { grid-template-columns:1fr; } }
+@keyframes letter-in { to { opacity:1; transform:none; } } @keyframes stroke { to { transform:scaleX(1); } }
+@keyframes intro-out { to { opacity:0; visibility:hidden; } }
+@keyframes rise { to { opacity:1; transform:none; } }
+@media (prefers-reduced-motion:reduce) { *,*::before,*::after { animation-duration:.01ms!important; animation-delay:0ms!important; } }
+</style>
+</head>
+<body>
+<div class="intro" aria-label="flowrat intro"><div class="intro-word"><span class="letter">f</span><span class="letter">l</span><span class="letter">o</span><span class="letter">w</span><span class="letter">r</span><span class="letter">a</span><span class="letter">t</span></div></div>
+<header><h1><span class="brand-mark">flowrat</span></h1><span class="meta">Flow → C → WebAssembly · neural navigation lab</span>
+  <span class="meta"><a href="/Users/abhishekshivakumar/ratville/flowrat.flow">source</a></span></header>
+<main>
+  <div class="stage"><canvas id="canvas" width="800" height="600"></canvas>
+    <div class="overlay" id="overlay"><strong>Ready to explore</strong>
+      <span>Launch the simulation when you’re ready. Keyboard shortcuts remain active after launch.</span>
+      <button id="start">Launch simulation</button></div></div>
+  <div class="transport" aria-label="simulation transport">
+    <button id="run" class="secondary" disabled>Pause</button>
+    <button id="step" class="secondary" disabled>Step</button>
+    <button id="reset" class="secondary" disabled>Reset</button>
+    <button id="fullscreen" class="secondary">Fullscreen</button><span class="spacer"></span><span id="status">idle</span>
+  </div>
+  <div class="keys">Space run/pause · S step · R reset · Arrows/WASD move · P pause · F fit view</div>
+  <pre id="out"></pre>
+  <section class="wiki" aria-label="FlowRat wiki">
+    <nav class="wiki-nav"><div class="wiki-kicker">FlowRat / wiki</div>
+      <a href="#overview">Overview</a><a href="#systems">Systems</a><a href="#extend">Extend</a></nav>
+    <div class="wiki-body"><div id="overview" class="wiki-intro"><h2>A small atlas of a living model</h2>
+      <p>FlowRat is an open simulation of navigation, memory, behaviour, and neural dynamics. This field guide is written in plain English for curious humans and future contributors.</p></div>
+      <div id="systems" class="wiki-cards"><article class="wiki-card"><h3>Environment</h3><p>Shape arenas, cues, food, water, and nests. Every wall is both a place to navigate and a signal to the model.</p></article>
+        <article class="wiki-card"><h3>Neural circuits</h3><p>Place, grid, head-direction, velocity, and boundary populations share one live simulation and one honest visual vocabulary.</p></article>
+        <article class="wiki-card"><h3>Observation</h3><p>Inspect rates, trajectories, attractors, and behaviour while the rats move. Record the same state as CSV for later study.</p></article></div>
+      <div id="extend"><h3>Extend the experiment</h3><p>Register a parameter with <code>FlowRat.registerParameter({name, value, min, max})</code>, listen for changes, and connect your own controls or analysis to the canvas.</p></div>
+    </div>
+  </section>
+</main>
+<footer>FlowRat · crafted with Codex · <span id="credit">extensible simulation canvas</span></footer>
+<script src="flowrat.js"></script>
+<script>
+(function () {
+  const $ = id => document.getElementById(id), overlay=$('overlay'), canvas=$('canvas');
+  const start=$('start'), run=$('run'), step=$('step'), reset=$('reset'), full=$('fullscreen'), status=$('status'), out=$('out');
+  let started=false, paused=false, module=null, listeners={};
+  const params={};
+  function emit(name,data) {(listeners[name]||[]).forEach(fn=>fn(data));}
+  function log(text,err) { const line=document.createElement('span'); if(err) line.className='err'; line.textContent=text+'\n'; out.appendChild(line); out.scrollTop=out.scrollHeight; }
+  function key(k) { window.dispatchEvent(new KeyboardEvent('keydown',{key:k,bubbles:true})); window.dispatchEvent(new KeyboardEvent('keyup',{key:k,bubbles:true})); }
+  function boot() { if(started)return; started=true; overlay.classList.add('hidden'); start.disabled=true; status.textContent='loading module…'; window.focus();
+    createFlowModule({print:t=>log(t,false),printErr:t=>log(t,true),canvas}).then(mod=>{ module=mod; run.disabled=step.disabled=reset.disabled=false; status.textContent='running'; emit('start',{module:mod}); try{mod.callMain([]);}catch(e){if(!(e&&e.name==='ExitStatus'))log(''+e,true);}}).catch(e=>{status.textContent='failed to load';log(''+e,true);}); }
+  function toggleRun(){if(!started)return; key(' '); paused=!paused; run.textContent=paused?'Resume':'Pause'; status.textContent=paused?'paused':'running'; emit(paused?'pause':'resume',{});}
+  window.FlowRat={version:'1.0',start:boot,pause:()=>{if(!paused)toggleRun()},resume:()=>{if(paused)toggleRun()},step:()=>{if(started){key('s');emit('step',{})}},reset:()=>{if(started){key('r');emit('reset',{})}},stop:()=>window.flowGfxStop&&window.flowGfxStop(),
+    registerParameter(def){if(!def||!def.name)throw Error('parameter needs a name');params[def.name]={...def,value:def.value};emit('parameter:registered',params[def.name]);return params[def.name]},
+    setParameter(name,value){if(!params[name])throw Error('unknown parameter: '+name);params[name].value=value;emit('parameter',params[name]);window.dispatchEvent(new CustomEvent('flowrat:parameter',{detail:params[name]}));return params[name]},
+    getParameters(){return JSON.parse(JSON.stringify(params))},on(name,fn){(listeners[name]||(listeners[name]=[])).push(fn);return()=>listeners[name]=listeners[name].filter(x=>x!==fn)}};
+  overlay.onclick=boot; start.onclick=e=>{e.stopPropagation();boot()}; run.onclick=toggleRun; step.onclick=()=>FlowRat.step(); reset.onclick=()=>FlowRat.reset();
+  full.onclick=()=>{const target=document.querySelector('.stage'); if(!document.fullscreenElement)target.requestFullscreen?.();else document.exitFullscreen?.()};
+  window.flowGfxOnStart=(title,w,h)=>{status.textContent='running '+w+'×'+h}; window.flowGfxOnExit=frames=>{status.textContent='finished after '+frames+' frames';run.disabled=step.disabled=reset.disabled=true;emit('exit',{frames})};
+  if(location.search.includes('autostart=1'))setTimeout(boot,300);
+})();
+</script>
+</body>
+</html>

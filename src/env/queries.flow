@@ -1,0 +1,424 @@
+# Spatial queries over an environment.
+#
+# These are the only thing the motion model and the sensory populations know
+# about the world. Keeping them in one module means a new arena type has to
+# satisfy this interface and nothing else.
+#
+# All of them are read-only in the environment and write only through the
+# out-pointers they are given, so they are safe to call from a `parallel for`
+# body over agents. That is the property that makes the whole per-agent
+# sensory sweep parallel, and it is worth preserving in anything added here.
+
+# rng_u01 comes from src/core/rng.flow. Flow resolves imports relative to the
+# importing file and rejects "..", so cross-directory dependencies are
+# satisfied by the entry point's import list rather than named here. See
+# docs/architecture.md.
+import "geometry.flow"
+import "environment.flow"
+
+extern {
+    function sqrt(x: f64) -> f64
+    function fabs(x: f64) -> f64
+    function sin(x: f64) -> f64
+    function cos(x: f64) -> f64
+    function atan2(y: f64, x: f64) -> f64
+}
+
+# --- containment -----------------------------------------------------------
+
+# Inside the outer arena shell, ignoring obstacles.
+export function env_in_shell(e: ptr<Env>, x: f64, y: f64) -> bool {
+    if e.kind == ENV_CIRCLE {
+        return point_in_circle(x, y, e.cx, e.cy, e.radius)
+    }
+    if x < e.x0 or x > e.x1 { return false }
+    if y < e.y0 or y > e.y1 { return false }
+    return true
+}
+
+# Inside a solid obstacle.
+export function env_in_solid(e: ptr<Env>, x: f64, y: f64) -> bool {
+    for i in 0 to e.n_solids {
+        if point_in_rect(x, y, e.solid_x[i], e.solid_y[i],
+                         e.solid_w[i], e.solid_h[i]) {
+            return true
+        }
+    }
+    return false
+}
+
+# Reachable free space: inside the shell and outside every obstacle. This is
+# the predicate to use when sampling positions, seeding rats, or placing
+# receptive-field centres.
+export function env_is_free(e: ptr<Env>, x: f64, y: f64) -> bool {
+    if !env_in_shell(e, x, y) { return false }
+    if env_in_solid(e, x, y) { return false }
+    return true
+}
+
+# --- nearest wall ----------------------------------------------------------
+
+# Distance to the closest wall, with the index of that wall and the unit
+# normal pointing away from it toward the query point. The normal is derived
+# from the point rather than from the segment's winding, so it always faces
+# the side the rat is on and can be used directly to push out of a collision.
+export function env_nearest_wall(e: ptr<Env>, x: f64, y: f64,
+                                 idx_out: ptr<i32>,
+                                 nx_out: ptr<f64>,
+                                 ny_out: ptr<f64>) -> f64 {
+    let mut best: f64 = GEO_FAR
+    let mut best_i: i32 = -1
+    let mut best_qx: f64 = x
+    let mut best_qy: f64 = y
+    let mut t: f64 = 0.0
+    for i in 0 to e.n_walls {
+        let ax: f64 = e.wx0[i]
+        let ay: f64 = e.wy0[i]
+        let bx: f64 = e.wx1[i]
+        let by: f64 = e.wy1[i]
+        let d: f64 = point_seg_dist(x, y, ax, ay, bx, by, &t)
+        if d < best {
+            best = d
+            best_i = i
+            best_qx = ax + t * (bx - ax)
+            best_qy = ay + t * (by - ay)
+        }
+    }
+    idx_out[0] = best_i
+    if best_i < 0 {
+        nx_out[0] = 0.0
+        ny_out[0] = 0.0
+        return GEO_FAR
+    }
+    let dx: f64 = x - best_qx
+    let dy: f64 = y - best_qy
+    let len: f64 = sqrt(dx * dx + dy * dy)
+    if len < 0.000001 {
+        # Standing exactly on the wall. Fall back to the segment's own normal
+        # so the caller still gets a usable direction to escape along.
+        seg_normal(e.wx0[best_i], e.wy0[best_i],
+                   e.wx1[best_i], e.wy1[best_i], nx_out, ny_out)
+    } else {
+        nx_out[0] = dx / len
+        ny_out[0] = dy / len
+    }
+    return best
+}
+
+# Distance only, when the caller does not need the normal.
+export function env_wall_distance(e: ptr<Env>, x: f64, y: f64) -> f64 {
+    let mut t: f64 = 0.0
+    let mut best: f64 = GEO_FAR
+    for i in 0 to e.n_walls {
+        let d: f64 = point_seg_dist(x, y, e.wx0[i], e.wy0[i],
+                                    e.wx1[i], e.wy1[i], &t)
+        if d < best { best = d }
+    }
+    return best
+}
+
+# --- ray casting -----------------------------------------------------------
+
+# Distance from (x, y) along `angle` to the first wall, in metres. Returns
+# GEO_FAR when the ray escapes, which only happens if the arena is not
+# closed.
+export function env_ray_distance(e: ptr<Env>, x: f64, y: f64,
+                                 angle: f64) -> f64 {
+    let dx: f64 = cos(angle)
+    let dy: f64 = sin(angle)
+    let mut best: f64 = GEO_FAR
+    for i in 0 to e.n_walls {
+        let t: f64 = ray_seg(x, y, dx, dy, e.wx0[i], e.wy0[i],
+                             e.wx1[i], e.wy1[i])
+        if t < best { best = t }
+    }
+    return best
+}
+
+# Ray cast that also reports which wall was hit.
+export function env_ray_hit(e: ptr<Env>, x: f64, y: f64, angle: f64,
+                            idx_out: ptr<i32>) -> f64 {
+    let dx: f64 = cos(angle)
+    let dy: f64 = sin(angle)
+    let mut best: f64 = GEO_FAR
+    let mut best_i: i32 = -1
+    for i in 0 to e.n_walls {
+        let t: f64 = ray_seg(x, y, dx, dy, e.wx0[i], e.wy0[i],
+                             e.wx1[i], e.wy1[i])
+        if t < best {
+            best = t
+            best_i = i
+        }
+    }
+    idx_out[0] = best_i
+    return best
+}
+
+# Fill `out` with n_rays distances, evenly spaced over a full turn starting
+# at `angle0`. One sweep over the walls per ray; the wall loop is the inner
+# one so a wall's four coordinates stay hot across all rays.
+export function env_ray_fan(e: ptr<Env>, x: f64, y: f64, angle0: f64,
+                            n_rays: i32, out: ptr<f64>) -> void {
+    let step: f64 = TAU / (n_rays as f64)
+    for r in 0 to n_rays {
+        out[r] = env_ray_distance(e, x, y, angle0 + (r as f64) * step)
+    }
+}
+
+# --- visibility ------------------------------------------------------------
+
+# True when nothing blocks the straight line between the two points.
+export function env_line_of_sight(e: ptr<Env>, x0: f64, y0: f64,
+                                  x1: f64, y1: f64) -> bool {
+    for i in 0 to e.n_walls {
+        if seg_seg_hit(x0, y0, x1, y1, e.wx0[i], e.wy0[i],
+                       e.wx1[i], e.wy1[i]) {
+            return false
+        }
+    }
+    return true
+}
+
+# --- cues ------------------------------------------------------------------
+
+# Index of the nearest cue and its distance, or -1 when the arena has none.
+# `require_sight` restricts the search to cues the rat can actually see,
+# which is what makes a landmark behind a barrier stop driving behaviour.
+export function env_nearest_cue(e: ptr<Env>, x: f64, y: f64,
+                                require_sight: bool,
+                                dist_out: ptr<f64>) -> i32 {
+    let mut best: f64 = GEO_FAR
+    let mut best_i: i32 = -1
+    for i in 0 to e.n_cues {
+        let d: f64 = dist(x, y, e.cue_x[i], e.cue_y[i])
+        if d < best {
+            if !require_sight or env_line_of_sight(e, x, y,
+                                                   e.cue_x[i], e.cue_y[i]) {
+                best = d
+                best_i = i
+            }
+        }
+    }
+    dist_out[0] = best
+    return best_i
+}
+
+# Sum of cue strengths under a 1 / (1 + d / length) falloff, a scalar "how
+# much landmark is around here" that the motion model can climb. The rational
+# falloff is used rather than a Gaussian so a distant cue still contributes a
+# usable gradient instead of underflowing to nothing.
+export function env_cue_field(e: ptr<Env>, x: f64, y: f64,
+                              length: f64) -> f64 {
+    if length < 0.000001 { return 0.0 }
+    let mut total: f64 = 0.0
+    for i in 0 to e.n_cues {
+        let d: f64 = dist(x, y, e.cue_x[i], e.cue_y[i])
+        total = total + e.cue_strength[i] / (1.0 + d / length)
+    }
+    return total
+}
+
+# --- zones -----------------------------------------------------------------
+
+# Index of the first zone of `kind` containing the point, or -1.
+export function env_zone_at(e: ptr<Env>, x: f64, y: f64, kind: i32) -> i32 {
+    for i in 0 to e.n_zones {
+        if e.zone_kind[i] == kind {
+            if e.zone_shape[i] == SHAPE_CIRCLE {
+                if point_in_circle(x, y, e.zone_x[i], e.zone_y[i],
+                                   e.zone_a[i]) {
+                    return i
+                }
+            } else {
+                if point_in_rect(x, y, e.zone_x[i], e.zone_y[i],
+                                 e.zone_a[i], e.zone_b[i]) {
+                    return i
+                }
+            }
+        }
+    }
+    return -1
+}
+
+export function env_zone_center(e: ptr<Env>, idx: i32,
+                                cx_out: ptr<f64>, cy_out: ptr<f64>) -> void {
+    if idx < 0 or idx >= e.n_zones {
+        cx_out[0] = e.cx
+        cy_out[0] = e.cy
+        return
+    }
+    if e.zone_shape[idx] == SHAPE_CIRCLE {
+        cx_out[0] = e.zone_x[idx]
+        cy_out[0] = e.zone_y[idx]
+    } else {
+        cx_out[0] = e.zone_x[idx] + e.zone_a[idx] * 0.5
+        cy_out[0] = e.zone_y[idx] + e.zone_b[idx] * 0.5
+    }
+}
+
+# Nearest reward zone that still holds something, and how far away it is.
+#
+# `require_sight` restricts the search to patches the rat can see, which is
+# what stops a hungry rat walking confidently at a wall because there is food
+# on the other side of it.
+export function env_nearest_food(e: ptr<Env>, x: f64, y: f64,
+                                 require_sight: bool,
+                                 dist_out: ptr<f64>) -> i32 {
+    return env_nearest_supply(e, x, y, ZONE_REWARD, require_sight, dist_out)
+}
+
+export function env_nearest_water(e: ptr<Env>, x: f64, y: f64,
+                                  require_sight: bool,
+                                  dist_out: ptr<f64>) -> i32 {
+    return env_nearest_supply(e, x, y, ZONE_WATER, require_sight, dist_out)
+}
+
+# Nearest patch of one kind that still holds something.
+export function env_nearest_supply(e: ptr<Env>, x: f64, y: f64, kind: i32,
+                                   require_sight: bool,
+                                   dist_out: ptr<f64>) -> i32 {
+    let mut best: f64 = GEO_FAR
+    let mut best_i: i32 = -1
+    for i in 0 to e.n_zones {
+        if e.zone_kind[i] == kind and e.zone_amount[i] > 0.0 {
+            let mut cx: f64 = 0.0
+            let mut cy: f64 = 0.0
+            env_zone_center(e, i, &cx, &cy)
+            let d: f64 = dist(x, y, cx, cy)
+            if d < best {
+                if !require_sight or env_line_of_sight(e, x, y, cx, cy) {
+                    best = d
+                    best_i = i
+                }
+            }
+        }
+    }
+    dist_out[0] = best
+    return best_i
+}
+
+# Index of a reward zone the point is close enough to eat from, or -1.
+# Deliberately a radius around the patch rather than containment: a rat with
+# its nose in a pile of food is not required to stand in the middle of it.
+export function env_food_within(e: ptr<Env>, x: f64, y: f64,
+                                reach: f64) -> i32 {
+    return env_supply_within(e, x, y, ZONE_REWARD, reach)
+}
+
+export function env_water_within(e: ptr<Env>, x: f64, y: f64,
+                                 reach: f64) -> i32 {
+    return env_supply_within(e, x, y, ZONE_WATER, reach)
+}
+
+export function env_supply_within(e: ptr<Env>, x: f64, y: f64, kind: i32,
+                                  reach: f64) -> i32 {
+    for i in 0 to e.n_zones {
+        if e.zone_kind[i] == kind and e.zone_amount[i] > 0.0 {
+            let mut cx: f64 = 0.0
+            let mut cy: f64 = 0.0
+            env_zone_center(e, i, &cx, &cy)
+            let mut r: f64 = reach
+            if e.zone_shape[i] == SHAPE_CIRCLE { r = reach + e.zone_a[i] }
+            if dist(x, y, cx, cy) <= r { return i }
+        }
+    }
+    return -1
+}
+
+# --- placement helpers -----------------------------------------------------
+
+# Push a point back into free space. Used after an integration step that
+# overshot a wall, and after an environment edit that dropped a box on top of
+# a rat. `margin` keeps the result clear of the surface rather than exactly
+# on it, so the next wall query has a well-defined normal.
+export function env_push_inside(e: ptr<Env>, margin: f64,
+                                x_io: ptr<f64>, y_io: ptr<f64>) -> bool {
+    let mut x: f64 = x_io[0]
+    let mut y: f64 = y_io[0]
+    let mut moved: bool = false
+
+    if e.kind == ENV_CIRCLE {
+        let dx: f64 = x - e.cx
+        let dy: f64 = y - e.cy
+        let d: f64 = sqrt(dx * dx + dy * dy)
+        let lim: f64 = e.radius - margin
+        if d > lim {
+            if d < 0.000001 {
+                x = e.cx
+                y = e.cy
+            } else {
+                x = e.cx + dx / d * lim
+                y = e.cy + dy / d * lim
+            }
+            moved = true
+        }
+    } else {
+        let nx: f64 = geo_clamp(x, e.x0 + margin, e.x1 - margin)
+        let ny: f64 = geo_clamp(y, e.y0 + margin, e.y1 - margin)
+        if nx != x or ny != y { moved = true }
+        x = nx
+        y = ny
+    }
+
+    # Leave any obstacle by its nearest face. Picking the smallest of the
+    # four escapes keeps the correction local instead of teleporting the rat
+    # across the box.
+    for i in 0 to e.n_solids {
+        let sx: f64 = e.solid_x[i]
+        let sy: f64 = e.solid_y[i]
+        let sw: f64 = e.solid_w[i]
+        let sh: f64 = e.solid_h[i]
+        if point_in_rect(x, y, sx, sy, sw, sh) {
+            let left: f64 = x - sx
+            let right: f64 = (sx + sw) - x
+            let down: f64 = y - sy
+            let up: f64 = (sy + sh) - y
+            let mut best: f64 = left
+            let mut which: i32 = 0
+            if right < best { best = right
+                              which = 1 }
+            if down < best { best = down
+                             which = 2 }
+            if up < best { best = up
+                           which = 3 }
+            if which == 0 { x = sx - margin }
+            if which == 1 { x = sx + sw + margin }
+            if which == 2 { y = sy - margin }
+            if which == 3 { y = sy + sh + margin }
+            moved = true
+        }
+    }
+
+    x_io[0] = x
+    y_io[0] = y
+    return moved
+}
+
+# Uniform sample from free space by rejection. `tries` bounds the work; the
+# fallback is the arena centre pushed out of anything it lands in, so this
+# always returns a usable point even in a nearly full arena.
+export function env_sample_free(e: ptr<Env>, seed: u32, stream: u32,
+                                counter: u32, tries: i32,
+                                x_out: ptr<f64>, y_out: ptr<f64>) -> bool {
+    let w: f64 = e.x1 - e.x0
+    let h: f64 = e.y1 - e.y0
+    for k in 0 to tries {
+        let c: u32 = counter * 977 + (k as u32)
+        let u: f64 = rng_u01(seed, stream, c)
+        let v: f64 = rng_u01(seed, stream + 31, c)
+        let x: f64 = e.x0 + u * w
+        let y: f64 = e.y0 + v * h
+        if env_is_free(e, x, y) {
+            x_out[0] = x
+            y_out[0] = y
+            return true
+        }
+    }
+    let mut fx: f64 = e.cx
+    let mut fy: f64 = e.cy
+    let moved: bool = env_push_inside(e, 0.02, &fx, &fy)
+    x_out[0] = fx
+    y_out[0] = fy
+    return false
+}
+

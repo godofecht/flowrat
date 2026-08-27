@@ -1,0 +1,640 @@
+# Software drawing into an RGB framebuffer.
+#
+# WHY NOT DRAW WITH gfx_fill_rect
+#   The gfx backend offers a clear, a filled rectangle and a raw RGB blit.
+#   A cockpit needs lines, discs, heatmaps, alpha and per-panel clipping, and
+#   building those out of one fill_rect call per pixel means a backend call
+#   per pixel. Here the whole window is one buffer FlowRat owns, every
+#   primitive is a write into it, and the frame reaches the screen as a
+#   single blit. The heatmaps alone are a hundred thousand pixels a frame,
+#   which settles the question.
+#
+#   Text is drawn the same way, reading glyph bits from stdlib/font.flow.
+#   That keeps everything in one pass; drawing text through the backend would
+#   force a second pass after the blit and split every panel's code in two.
+#
+# COLOURS
+#   Packed 0xRRGGBB in an i32. One argument instead of three keeps the
+#   primitive signatures short enough to read.
+#
+# CLIPPING
+#   The canvas carries a clip rectangle. Panels set it once on entry and
+#   every primitive respects it, so a plot that overruns its box is trimmed
+#   rather than scribbling over its neighbour.
+
+import "stdlib/font.flow"
+
+extern {
+    function sqrt(x: f64) -> f64
+    function fabs(x: f64) -> f64
+    function floor(x: f64) -> f64
+    function sin(x: f64) -> f64
+    function cos(x: f64) -> f64
+}
+
+export struct Canvas {
+    px: ptr<u8>,
+    w: i32,
+    h: i32,
+    clip_x0: i32,
+    clip_y0: i32,
+    clip_x1: i32,
+    clip_y1: i32,
+}
+
+export function canvas_create(w: i32, h: i32) -> Canvas {
+    let mut c: Canvas = Canvas {
+        px: null, w: w, h: h,
+        clip_x0: 0, clip_y0: 0, clip_x1: w, clip_y1: h
+    }
+    c.px = mem_alloc((w as i64) * (h as i64) * 3, "framebuffer") as ptr<u8>
+    return c
+}
+
+export function canvas_destroy(c: ptr<Canvas>) -> void {
+    mem_release(c.px as ptr<void>)
+}
+
+# Reallocate for a new window size. True when the size actually changed, which
+# is the signal to rebuild the layout that goes with it.
+export function canvas_resize(c: ptr<Canvas>, w: i32, h: i32) -> bool {
+    if w <= 0 or h <= 0 { return false }
+    if c.w == w and c.h == h { return false }
+    mem_release(c.px as ptr<void>)
+    c.px = mem_alloc((w as i64) * (h as i64) * 3, "framebuffer") as ptr<u8>
+    c.w = w
+    c.h = h
+    canvas_clip_reset(c)
+    return true
+}
+
+export function canvas_clip(c: ptr<Canvas>, x: i32, y: i32,
+                            w: i32, h: i32) -> void {
+    let mut x0: i32 = x
+    let mut y0: i32 = y
+    let mut x1: i32 = x + w
+    let mut y1: i32 = y + h
+    if x0 < 0 { x0 = 0 }
+    if y0 < 0 { y0 = 0 }
+    if x1 > c.w { x1 = c.w }
+    if y1 > c.h { y1 = c.h }
+    c.clip_x0 = x0
+    c.clip_y0 = y0
+    c.clip_x1 = x1
+    c.clip_y1 = y1
+}
+
+export function canvas_clip_reset(c: ptr<Canvas>) -> void {
+    c.clip_x0 = 0
+    c.clip_y0 = 0
+    c.clip_x1 = c.w
+    c.clip_y1 = c.h
+}
+
+# --- colour ----------------------------------------------------------------
+
+export function rgb(r: i32, g: i32, b: i32) -> i32 {
+    return (r * 65536) + (g * 256) + b
+}
+
+export function col_r(c: i32) -> i32 { return (c / 65536) % 256 }
+export function col_g(c: i32) -> i32 { return (c / 256) % 256 }
+export function col_b(c: i32) -> i32 { return c % 256 }
+
+# Linear blend between two packed colours.
+export function col_mix(a: i32, b: i32, t: f64) -> i32 {
+    let mut u: f64 = t
+    if u < 0.0 { u = 0.0 }
+    if u > 1.0 { u = 1.0 }
+    let r: i32 = (col_r(a) as f64 + (col_r(b) - col_r(a)) as f64 * u) as i32
+    let g: i32 = (col_g(a) as f64 + (col_g(b) - col_g(a)) as f64 * u) as i32
+    let bl: i32 = (col_b(a) as f64 + (col_b(b) - col_b(a)) as f64 * u) as i32
+    return rgb(r, g, bl)
+}
+
+export function col_scale(c: i32, f: f64) -> i32 {
+    let mut r: i32 = ((col_r(c) as f64) * f) as i32
+    let mut g: i32 = ((col_g(c) as f64) * f) as i32
+    let mut b: i32 = ((col_b(c) as f64) * f) as i32
+    if r > 255 { r = 255 }
+    if g > 255 { g = 255 }
+    if b > 255 { b = 255 }
+    if r < 0 { r = 0 }
+    if g < 0 { g = 0 }
+    if b < 0 { b = 0 }
+    return rgb(r, g, b)
+}
+
+# --- pixels ----------------------------------------------------------------
+
+export function dr_px(c: ptr<Canvas>, x: i32, y: i32, col: i32) -> void {
+    if x < c.clip_x0 or x >= c.clip_x1 { return }
+    if y < c.clip_y0 or y >= c.clip_y1 { return }
+    let i: i32 = (y * c.w + x) * 3
+    c.px[i] = col_r(col) as u8
+    c.px[i + 1] = col_g(col) as u8
+    c.px[i + 2] = col_b(col) as u8
+}
+
+# Alpha blend one pixel. Used for trails and overlays, where drawing opaque
+# would hide the arena underneath.
+export function dr_blend(c: ptr<Canvas>, x: i32, y: i32, col: i32,
+                         a: f64) -> void {
+    if x < c.clip_x0 or x >= c.clip_x1 { return }
+    if y < c.clip_y0 or y >= c.clip_y1 { return }
+    if a <= 0.0 { return }
+    if a >= 1.0 {
+        dr_px(c, x, y, col)
+        return
+    }
+    let i: i32 = (y * c.w + x) * 3
+    let sr: f64 = c.px[i] as f64
+    let sg: f64 = c.px[i + 1] as f64
+    let sb: f64 = c.px[i + 2] as f64
+    c.px[i] = (sr + ((col_r(col) as f64) - sr) * a) as u8
+    c.px[i + 1] = (sg + ((col_g(col) as f64) - sg) * a) as u8
+    c.px[i + 2] = (sb + ((col_b(col) as f64) - sb) * a) as u8
+}
+
+export function dr_clear(c: ptr<Canvas>, col: i32) -> void {
+    let r: u8 = col_r(col) as u8
+    let g: u8 = col_g(col) as u8
+    let b: u8 = col_b(col) as u8
+    let n: i32 = c.w * c.h
+    parallel for i in 0 to n {
+        c.px[i * 3] = r
+        c.px[i * 3 + 1] = g
+        c.px[i * 3 + 2] = b
+    }
+}
+
+# --- rectangles ------------------------------------------------------------
+
+export function dr_rect(c: ptr<Canvas>, x: i32, y: i32, w: i32, h: i32,
+                        col: i32) -> void {
+    let mut x0: i32 = x
+    let mut y0: i32 = y
+    let mut x1: i32 = x + w
+    let mut y1: i32 = y + h
+    if x0 < c.clip_x0 { x0 = c.clip_x0 }
+    if y0 < c.clip_y0 { y0 = c.clip_y0 }
+    if x1 > c.clip_x1 { x1 = c.clip_x1 }
+    if y1 > c.clip_y1 { y1 = c.clip_y1 }
+    if x1 <= x0 or y1 <= y0 { return }
+    let r: u8 = col_r(col) as u8
+    let g: u8 = col_g(col) as u8
+    let b: u8 = col_b(col) as u8
+    for yy in y0 to y1 {
+        let row: i32 = yy * c.w
+        for xx in x0 to x1 {
+            let i: i32 = (row + xx) * 3
+            c.px[i] = r
+            c.px[i + 1] = g
+            c.px[i + 2] = b
+        }
+    }
+}
+
+export function dr_rect_alpha(c: ptr<Canvas>, x: i32, y: i32, w: i32,
+                              h: i32, col: i32, a: f64) -> void {
+    for yy in y to y + h {
+        for xx in x to x + w {
+            dr_blend(c, xx, yy, col, a)
+        }
+    }
+}
+
+export function dr_frame(c: ptr<Canvas>, x: i32, y: i32, w: i32, h: i32,
+                         col: i32) -> void {
+    dr_rect(c, x, y, w, 1, col)
+    dr_rect(c, x, y + h - 1, w, 1, col)
+    dr_rect(c, x, y, 1, h, col)
+    dr_rect(c, x + w - 1, y, 1, h, col)
+}
+
+# --- lines -----------------------------------------------------------------
+
+export function dr_hline(c: ptr<Canvas>, x0: i32, x1: i32, y: i32,
+                         col: i32) -> void {
+    let mut a: i32 = x0
+    let mut b: i32 = x1
+    if a > b {
+        a = x1
+        b = x0
+    }
+    dr_rect(c, a, y, b - a + 1, 1, col)
+}
+
+export function dr_vline(c: ptr<Canvas>, x: i32, y0: i32, y1: i32,
+                         col: i32) -> void {
+    let mut a: i32 = y0
+    let mut b: i32 = y1
+    if a > b {
+        a = y1
+        b = y0
+    }
+    dr_rect(c, x, a, 1, b - a + 1, col)
+}
+
+# Bresenham. Integer only, so a long trajectory trail costs no divisions.
+export function dr_line(c: ptr<Canvas>, x0: i32, y0: i32, x1: i32, y1: i32,
+                        col: i32) -> void {
+    let mut x: i32 = x0
+    let mut y: i32 = y0
+    let mut dx: i32 = x1 - x0
+    let mut dy: i32 = y1 - y0
+    let mut sx: i32 = 1
+    let mut sy: i32 = 1
+    if dx < 0 {
+        dx = -dx
+        sx = -1
+    }
+    if dy < 0 {
+        dy = -dy
+        sy = -1
+    }
+    let mut err: i32 = dx - dy
+    let mut guard: i32 = 0
+    let limit: i32 = dx + dy + 2
+    while guard <= limit {
+        dr_px(c, x, y, col)
+        if x == x1 and y == y1 { return }
+        let e2: i32 = err * 2
+        if e2 > -dy {
+            err = err - dy
+            x = x + sx
+        }
+        if e2 < dx {
+            err = err + dx
+            y = y + sy
+        }
+        guard = guard + 1
+    }
+}
+
+export function dr_line_alpha(c: ptr<Canvas>, x0: i32, y0: i32,
+                              x1: i32, y1: i32, col: i32, a: f64) -> void {
+    let mut x: i32 = x0
+    let mut y: i32 = y0
+    let mut dx: i32 = x1 - x0
+    let mut dy: i32 = y1 - y0
+    let mut sx: i32 = 1
+    let mut sy: i32 = 1
+    if dx < 0 {
+        dx = -dx
+        sx = -1
+    }
+    if dy < 0 {
+        dy = -dy
+        sy = -1
+    }
+    let mut err: i32 = dx - dy
+    let mut guard: i32 = 0
+    let limit: i32 = dx + dy + 2
+    while guard <= limit {
+        dr_blend(c, x, y, col, a)
+        if x == x1 and y == y1 { return }
+        let e2: i32 = err * 2
+        if e2 > -dy {
+            err = err - dy
+            x = x + sx
+        }
+        if e2 < dx {
+            err = err + dx
+            y = y + sy
+        }
+        guard = guard + 1
+    }
+}
+
+# Thick line, drawn as a run of discs. Used for walls, where a single pixel
+# reads as a hairline and disappears next to the trails.
+export function dr_line_thick(c: ptr<Canvas>, x0: i32, y0: i32,
+                              x1: i32, y1: i32, col: i32, t: i32) -> void {
+    if t <= 1 {
+        dr_line(c, x0, y0, x1, y1, col)
+        return
+    }
+    let dx: f64 = (x1 - x0) as f64
+    let dy: f64 = (y1 - y0) as f64
+    let len: f64 = sqrt(dx * dx + dy * dy)
+    let steps: i32 = (len as i32) + 1
+    let rad: i32 = t / 2
+    for i in 0 to steps + 1 {
+        let f: f64 = (i as f64) / (steps as f64)
+        let px: i32 = x0 + (dx * f) as i32
+        let py: i32 = y0 + (dy * f) as i32
+        dr_disc(c, px, py, rad, col)
+    }
+}
+
+# --- circles ---------------------------------------------------------------
+
+export function dr_disc(c: ptr<Canvas>, cx: i32, cy: i32, r: i32,
+                        col: i32) -> void {
+    if r <= 0 {
+        dr_px(c, cx, cy, col)
+        return
+    }
+    let r2: i32 = r * r
+    for y in -r to r + 1 {
+        for x in -r to r + 1 {
+            if x * x + y * y <= r2 {
+                dr_px(c, cx + x, cy + y, col)
+            }
+        }
+    }
+}
+
+# A round sprite at the sizes a round sprite is actually drawn at.
+#
+# A true disc is wrong twice over down here. At radius three the only pixels
+# at exactly distance r are the four on the axes, so the rows come out
+# 1,5,5,7,5,5,1: a blob with a spike out of each side, which reads as a star.
+# Trimming that ring instead gives 5,5,5,5,5, which is a square. Neither is a
+# seed.
+#
+# Allowing one more than r squared gives 3,5,7,7,7,5,3, which is the shape
+# anyone drawing a seven pixel circle by hand would draw. Above ten pixels or
+# so the correction stops mattering and this is a disc again.
+export function dr_blob(c: ptr<Canvas>, cx: i32, cy: i32, r: i32,
+                        col: i32) -> void {
+    if r <= 0 {
+        dr_px(c, cx, cy, col)
+        return
+    }
+    let lim: i32 = r * r + 1
+    for y in -r to r + 1 {
+        for x in -r to r + 1 {
+            if x * x + y * y <= lim {
+                dr_px(c, cx + x, cy + y, col)
+            }
+        }
+    }
+}
+
+export function dr_disc_alpha(c: ptr<Canvas>, cx: i32, cy: i32, r: i32,
+                              col: i32, a: f64) -> void {
+    let r2: i32 = r * r
+    for y in -r to r + 1 {
+        for x in -r to r + 1 {
+            if x * x + y * y <= r2 {
+                dr_blend(c, cx + x, cy + y, col, a)
+            }
+        }
+    }
+}
+
+export function dr_circle(c: ptr<Canvas>, cx: i32, cy: i32, r: i32,
+                          col: i32) -> void {
+    if r <= 0 { return }
+    let r2: i32 = r * r
+    let inner: i32 = (r - 1) * (r - 1)
+    for y in -r to r + 1 {
+        for x in -r to r + 1 {
+            let d: i32 = x * x + y * y
+            if d <= r2 and d >= inner {
+                dr_px(c, cx + x, cy + y, col)
+            }
+        }
+    }
+}
+
+# --- text ------------------------------------------------------------------
+
+export const CHAR_W: i32 = 5
+export const CHAR_H: i32 = 7
+export const CHAR_ADV: i32 = 6
+
+# Letters whose stdlib glyph carries a descender inside the seven-row box.
+#
+# In that font, lowercase p is uppercase P shifted down one row and nothing
+# else, so at scale 1 the two are indistinguishable: "population" renders as
+# "PoPulation". Same story for g against 9. Dropping these five glyphs one
+# more pixel gives the descender somewhere to go below the baseline, and the
+# pairs separate. Their top row is blank (except j, whose dot moves with the
+# rest, which is correct anyway), so nothing is clipped by the shift.
+function is_descender(ch: i32) -> bool {
+    if ch == 103 { return true }
+    if ch == 106 { return true }
+    if ch == 112 { return true }
+    if ch == 113 { return true }
+    if ch == 121 { return true }
+    return false
+}
+
+export function dr_char(c: ptr<Canvas>, x: i32, y: i32, ch: i32,
+                        scale: i32, col: i32) -> i32 {
+    if scale <= 0 { return 0 }
+    let mut y0: i32 = y
+    if is_descender(ch) { y0 = y + scale }
+    for row in 0 to CHAR_H {
+        for cx in 0 to CHAR_W {
+            if font_pixel(ch, cx, row) {
+                if scale == 1 {
+                    dr_px(c, x + cx, y0 + row, col)
+                } else {
+                    dr_rect(c, x + cx * scale, y0 + row * scale,
+                            scale, scale, col)
+                }
+            }
+        }
+    }
+    return CHAR_ADV * scale
+}
+
+export function dr_text(c: ptr<Canvas>, x: i32, y: i32, s: string,
+                        scale: i32, col: i32) -> i32 {
+    if scale <= 0 { return 0 }
+    let bytes: ptr<u8> = s as ptr<u8>
+    let mut i: i32 = 0
+    let mut pen: i32 = x
+    while bytes[i] != 0 {
+        pen = pen + dr_char(c, pen, y, bytes[i] as i32, scale, col)
+        i = i + 1
+    }
+    return pen - x
+}
+
+export function dr_text_width(s: string, scale: i32) -> i32 {
+    let bytes: ptr<u8> = s as ptr<u8>
+    let mut i: i32 = 0
+    while bytes[i] != 0 {
+        i = i + 1
+    }
+    if i == 0 { return 0 }
+    return i * CHAR_ADV * scale - scale
+}
+
+export function dr_text_right(c: ptr<Canvas>, rx: i32, y: i32, s: string,
+                              scale: i32, col: i32) -> void {
+    let w: i32 = dr_text_width(s, scale)
+    let t: i32 = dr_text(c, rx - w, y, s, scale, col)
+}
+
+export function dr_text_center(c: ptr<Canvas>, cx: i32, y: i32, s: string,
+                               scale: i32, col: i32) -> void {
+    let w: i32 = dr_text_width(s, scale)
+    let t: i32 = dr_text(c, cx - w / 2, y, s, scale, col)
+}
+
+# Integer, drawn digit by digit from the low end into a small stack buffer.
+export function dr_int(c: ptr<Canvas>, x: i32, y: i32, n: i32,
+                       scale: i32, col: i32) -> i32 {
+    let mut digits: array<i32, 12> = [0]
+    let mut v: i32 = n
+    let mut pen: i32 = x
+    if v < 0 {
+        pen = pen + dr_char(c, pen, y, 45, scale, col)
+        v = -v
+    }
+    let mut count: i32 = 0
+    if v == 0 {
+        digits[0] = 0
+        count = 1
+    } else {
+        while v > 0 and count < 12 {
+            digits[count] = v % 10
+            v = v / 10
+            count = count + 1
+        }
+    }
+    let mut k: i32 = count - 1
+    while k >= 0 {
+        pen = pen + dr_char(c, pen, y, 48 + digits[k], scale, col)
+        k = k - 1
+    }
+    return pen - x
+}
+
+export function dr_int_right(c: ptr<Canvas>, rx: i32, y: i32, n: i32,
+                             scale: i32, col: i32) -> void {
+    let w: i32 = dr_int_width(n, scale)
+    let t: i32 = dr_int(c, rx - w, y, n, scale, col)
+}
+
+export function dr_int_width(n: i32, scale: i32) -> i32 {
+    let mut v: i32 = n
+    let mut d: i32 = 1
+    if v < 0 {
+        d = d + 1
+        v = -v
+    }
+    let mut count: i32 = 1
+    while v >= 10 {
+        v = v / 10
+        count = count + 1
+    }
+    return (count + d - 1) * CHAR_ADV * scale - scale
+}
+
+# Fixed-point number. Rounds at the requested precision so a value of
+# 0.0999 shows as 0.10 rather than 0.09.
+export function dr_fixed(c: ptr<Canvas>, x: i32, y: i32, v: f64,
+                         decimals: i32, scale: i32, col: i32) -> i32 {
+    let mut pen: i32 = x
+    let mut val: f64 = v
+    if val != val {
+        return dr_text(c, x, y, "nan", scale, col)
+    }
+    if val < 0.0 {
+        pen = pen + dr_char(c, pen, y, 45, scale, col)
+        val = -val
+    }
+    let mut mult: f64 = 1.0
+    for i in 0 to decimals {
+        mult = mult * 10.0
+    }
+    let scaled: f64 = floor(val * mult + 0.5)
+    if scaled > 2000000000.0 {
+        return dr_text(c, x, y, "big", scale, col)
+    }
+    let total: i32 = scaled as i32
+    let whole: i32 = total / (mult as i32)
+    pen = pen + dr_int(c, pen, y, whole, scale, col)
+    if decimals > 0 {
+        pen = pen + dr_char(c, pen, y, 46, scale, col)
+        let mut frac: i32 = total - whole * (mult as i32)
+        # Leading zeros of the fraction have to be written out; dr_int would
+        # drop them and 1.05 would print as 1.5.
+        let mut place: i32 = (mult as i32) / 10
+        while place >= 1 {
+            let d: i32 = (frac / place) % 10
+            pen = pen + dr_char(c, pen, y, 48 + d, scale, col)
+            place = place / 10
+        }
+    }
+    return pen - x
+}
+
+export function dr_fixed_width(v: f64, decimals: i32, scale: i32) -> i32 {
+    let mut chars: i32 = 0
+    let mut val: f64 = v
+    if val != val { return 3 * CHAR_ADV * scale - scale }
+    if val < 0.0 {
+        chars = chars + 1
+        val = -val
+    }
+    let mut mult: f64 = 1.0
+    for i in 0 to decimals {
+        mult = mult * 10.0
+    }
+    let scaled: f64 = floor(val * mult + 0.5)
+    let total: i32 = scaled as i32
+    let whole: i32 = total / (mult as i32)
+    let mut w: i32 = whole
+    let mut digits: i32 = 1
+    while w >= 10 {
+        w = w / 10
+        digits = digits + 1
+    }
+    chars = chars + digits
+    if decimals > 0 { chars = chars + 1 + decimals }
+    return chars * CHAR_ADV * scale - scale
+}
+
+export function dr_fixed_right(c: ptr<Canvas>, rx: i32, y: i32, v: f64,
+                               decimals: i32, scale: i32, col: i32) -> void {
+    let w: i32 = dr_fixed_width(v, decimals, scale)
+    let t: i32 = dr_fixed(c, rx - w, y, v, decimals, scale, col)
+}
+
+# --- colour maps -----------------------------------------------------------
+
+# Perceptually ordered dark-to-bright ramp for rate maps. Five control points
+# through blue, teal, green, yellow, white: monotone in lightness, so a
+# brighter pixel always means a higher rate.
+export function map_rate(t: f64) -> i32 {
+    let mut u: f64 = t
+    if u < 0.0 { u = 0.0 }
+    if u > 1.0 { u = 1.0 }
+    let s: f64 = u * 4.0
+    let seg: i32 = s as i32
+    let f: f64 = s - (seg as f64)
+    if seg == 0 { return col_mix(rgb(12, 16, 34), rgb(28, 62, 110), f) }
+    if seg == 1 { return col_mix(rgb(28, 62, 110), rgb(30, 132, 122), f) }
+    if seg == 2 { return col_mix(rgb(30, 132, 122), rgb(150, 196, 68), f) }
+    if seg == 3 { return col_mix(rgb(150, 196, 68), rgb(252, 236, 160), f) }
+    return rgb(252, 236, 160)
+}
+
+# Diverging map for signed quantities such as a weight kernel: blue below
+# zero, near-black at zero, orange above.
+export function map_signed(t: f64) -> i32 {
+    let mut u: f64 = t
+    if u < -1.0 { u = -1.0 }
+    if u > 1.0 { u = 1.0 }
+    if u < 0.0 { return col_mix(rgb(18, 20, 26), rgb(70, 130, 220), -u) }
+    return col_mix(rgb(18, 20, 26), rgb(240, 150, 60), u)
+}
+
+# Distinct colours for selecting one rat out of a batch.
+export function map_agent(i: i32) -> i32 {
+    let k: i32 = i % 6
+    if k == 0 { return rgb(240, 190, 100) }
+    if k == 1 { return rgb(120, 200, 230) }
+    if k == 2 { return rgb(200, 140, 220) }
+    if k == 3 { return rgb(140, 220, 150) }
+    if k == 4 { return rgb(235, 130, 120) }
+    return rgb(190, 190, 200)
+}

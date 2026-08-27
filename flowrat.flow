@@ -1,0 +1,264 @@
+# FlowRat: rat navigation and neural dynamics, live.
+#
+# Run:  ./run.sh
+#
+# IMPORT ORDER
+#   Flow resolves an import relative to the importing file and rejects "..",
+#   so a module in src/neural cannot name one in src/env. Modules therefore
+#   import only their siblings, and this file lists every module in dependency
+#   order. Flow merges them into one namespace, so a cross-directory call
+#   resolves as long as both modules appear below. Adding a module means
+#   adding one line here.
+#
+# THE FRAME
+#   input, simulate, draw, present. Simulation and rendering are separate
+#   stages with separate profiler slots, and steps_per_frame decouples their
+#   rates: the display stays at sixty while the simulation runs as many steps
+#   per frame as asked for.
+#
+#   Everything is drawn into one RGB buffer FlowRat owns and reaches the
+#   screen as a single blit.
+
+import "stdlib/gfx.flow"
+import "stdlib/keys.flow"
+
+import "src/core/mem.flow"
+import "src/core/rng.flow"
+import "src/core/clock.flow"
+import "src/core/profile.flow"
+
+import "src/env/geometry.flow"
+import "src/env/environment.flow"
+import "src/env/queries.flow"
+import "src/env/presets.flow"
+
+import "src/sim/agents.flow"
+import "src/sim/integrate.flow"
+import "src/sim/behaviour.flow"
+import "src/sim/memory.flow"
+import "src/sim/spatial.flow"
+import "src/sim/novelty.flow"
+import "src/sim/motion.flow"
+
+import "src/neural/population.flow"
+import "src/neural/place.flow"
+import "src/neural/head_direction.flow"
+import "src/neural/velocity.flow"
+import "src/neural/grid.flow"
+import "src/neural/boundary.flow"
+import "src/neural/attractor.flow"
+import "src/neural/circuit.flow"
+
+import "src/sim/simulation.flow"
+import "src/analysis/ratemap.flow"
+import "src/analysis/scores.flow"
+import "src/analysis/session.flow"
+import "src/ui/view_analysis.flow"
+
+import "src/ui/draw.flow"
+import "src/ui/widgets.flow"
+import "src/ui/layout.flow"
+import "src/ui/view_env.flow"
+import "src/ui/view_pop.flow"
+import "src/ui/view_sys.flow"
+import "src/ui/view_net.flow"
+import "src/ui/view_etho.flow"
+
+import "src/io/record.flow"
+import "src/io/config.flow"
+
+# Keys tracked for edge detection. A key that fires on the level rather than
+# the edge toggles many times while it is held, which is unusable for
+# anything that flips a state.
+const NKEYS: i32 = 23
+
+let mut key_prev: array<i32, 23> = [0]
+
+function key_code(slot: i32) -> i32 {
+    if slot == 0 { return KEY_SPACE }
+    if slot == 1 { return KEY_S }
+    if slot == 2 { return KEY_R }
+    if slot == 3 { return KEY_TAB }
+    if slot == 4 { return KEY_F }
+    if slot == 5 { return KEY_1 }
+    if slot == 6 { return KEY_2 }
+    if slot == 7 { return KEY_3 }
+    if slot == 8 { return KEY_4 }
+    if slot == 9 { return KEY_5 }
+    if slot == 10 { return KEY_6 }
+    if slot == 11 { return KEY_7 }
+    if slot == 12 { return KEY_8 }
+    if slot == 13 { return KEY_T }
+    if slot == 14 { return KEY_Y }
+    if slot == 15 { return KEY_U }
+    if slot == 16 { return KEY_I }
+    if slot == 17 { return KEY_C }
+    if slot == 18 { return KEY_P }
+    if slot == 19 { return KEY_O }
+    if slot == 20 { return KEY_MINUS }
+    if slot == 21 { return KEY_EQUAL }
+    if slot == 22 { return KEY_K }
+    return KEY_N
+}
+
+# True on the frame a key goes down.
+function key_edge(g: Gfx, slot: i32) -> bool {
+    let now: bool = gfx_key_down(g, key_code(slot))
+    let mut fired: bool = false
+    if now and key_prev[slot] == 0 { fired = true }
+    if now { key_prev[slot] = 1 } else { key_prev[slot] = 0 }
+    return fired
+}
+
+function main() -> i32 {
+    rec_ensure_dirs()
+
+    let g: Gfx = gfx_open(WIN_W, WIN_H, "FlowRat")
+    let mut cv: Canvas = canvas_create(WIN_W, WIN_H)
+    let mut lay: Layout = layout_build(WIN_W, WIN_H)
+    # Interface scale. 1 lays the cockpit out at the window's own size; 2 and
+    # 3 lay it out smaller and let the backend stretch it, which makes every
+    # glyph correspondingly larger. Adjusted with - and =.
+    let mut ui_scale: i32 = 1
+    let mut u: Ui = ui_create()
+    let mut ed: Editor = editor_new()
+    let mut rec: Recorder = rec_new()
+    # The analysis tab records into this while the simulation runs, so a rate
+    # map fills in live rather than being produced by a separate offline pass.
+    let mut analysis: Session = session_create(32, 32)
+    let mut s: Sim = sim_create(DEFAULT_RATS, PRESET_OPEN_FIELD,
+                                DEFAULT_SEED as u32)
+    let mut defs: Defaults = defaults_new(s.sheet.nx)
+
+    let mut v: View = view_new(lay.env_x, lay.env_y, lay.env_w, lay.env_h)
+    view_fit(&v, s.env.x0, s.env.y0, s.env.x1, s.env.y1)
+
+    let mut frame_ms: f64 = 16.7
+    let mut running: bool = true
+
+    while running {
+        let t_frame: i64 = prof_begin()
+        if !gfx_frame_pump(g) { break }
+
+        # --- follow the window ---------------------------------------------
+        # The window is resizable and can go full screen, so the framebuffer,
+        # the canvas and the layout are all rebuilt whenever its size or the
+        # interface scale changes. Doing it here, before any drawing, means
+        # the frame about to be drawn is already the right shape.
+        let mut want_w: i32 = 0
+        let mut want_h: i32 = 0
+        layout_buffer_size(gfx_view_width(g), gfx_view_height(g), ui_scale,
+                           &want_w, &want_h)
+        if want_w != cv.w or want_h != cv.h {
+            let resized: bool = gfx_resize_buffer(g, want_w, want_h)
+            let recanvas: bool = canvas_resize(&cv, want_w, want_h)
+            lay = layout_build(want_w, want_h)
+            view_set_rect(&v, lay.env_x, lay.env_y, lay.env_w, lay.env_h)
+            view_fit(&v, s.env.x0, s.env.y0, s.env.x1, s.env.y1)
+        }
+
+        # --- input ---------------------------------------------------------
+        let mo: Mouse = gfx_mouse(g)
+        ui_begin_full(&u, mo.x, mo.y, mo.left != 0, mo.right != 0,
+                      mo.wheel, clock_ms())
+
+        if key_edge(g, 0) { s.running = !s.running }
+        if key_edge(g, 1) {
+            s.running = false
+            sim_single_step(&s)
+        }
+        if key_edge(g, 2) { sim_reset(&s, s.agents.n) }
+        if key_edge(g, 3) { ed.tool = (ed.tool + 1) % TOOL_COUNT }
+        if key_edge(g, 4) {
+            view_fit(&v, s.env.x0, s.env.y0, s.env.x1, s.env.y1)
+        }
+        for k in 0 to PRESET_COUNT {
+            if key_edge(g, 5 + k) {
+                sim_set_preset(&s, k)
+                view_fit(&v, s.env.x0, s.env.y0, s.env.x1, s.env.y1)
+            }
+        }
+        if key_edge(g, 13) { ed.show_trails = !ed.show_trails }
+        if key_edge(g, 14) { ed.show_rays = !ed.show_rays }
+        if key_edge(g, 15) { ed.show_cells = !ed.show_cells }
+        if key_edge(g, 16) { ed.show_decode = !ed.show_decode }
+        if key_edge(g, 22) { ed.show_known = !ed.show_known }
+        if key_edge(g, 17) { s.can_enabled = !s.can_enabled }
+        if key_edge(g, 18) { s.can_anchor = !s.can_anchor }
+        if key_edge(g, 19) {
+            if rec.active { rec_stop(&rec) } else {
+                let ok: bool = rec_start(&rec, &s)
+            }
+        }
+        if key_edge(g, 20) and ui_scale > 1 { ui_scale = ui_scale - 1 }
+        if key_edge(g, 21) and ui_scale < 3 { ui_scale = ui_scale + 1 }
+        if key_edge(g, 22) { sim_set_circuit(&s, !s.circuit.enabled) }
+
+        # --- simulate ------------------------------------------------------
+        if s.running {
+            for k in 0 to s.steps_per_frame {
+                sim_step(&s)
+                rec_step(&rec, &s)
+                # Sampled right after the step, so the spikes counted are the
+                # ones fired at the position they are counted against.
+                session_sample(&analysis, &s)
+            }
+        }
+
+        # --- draw ----------------------------------------------------------
+        let t_render: i64 = prof_begin()
+        dr_clear(&cv, C_BG)
+        view_header_draw(&cv, &s, &ed, frame_ms, &lay)
+
+        # Panels that own controls are drawn before the environment view, so
+        # a click landing on a control is marked consumed and the view
+        # underneath does not also act on it.
+        let ctl_rebuild: bool = view_control_draw(&cv, &u, &s, &ed, &v,
+                                                  &defs, &lay)
+        view_pop_draw(&cv, &u, &s, &ed, &lay)
+
+        # Row two is tabbed, so exactly one of these draws. The editor panel
+        # still has to report whether it changed the arena even when it is
+        # not the visible tab, hence the flag rather than an early return.
+        view_tabs_draw(&cv, &u, &ed, &lay)
+        let mut edt_changed: bool = false
+        if ed.tab == TAB_RAT { view_rat_draw(&cv, &u, &s, &ed, &lay) }
+        if ed.tab == TAB_ETHO { view_etho_draw(&cv, &u, &s, &defs, &ed, &lay) }
+        if ed.tab == TAB_CAN { view_can_draw(&cv, &u, &s, &defs, &lay) }
+        if ed.tab == TAB_NET { view_net_draw(&cv, &u, &s, &defs, &ed, &lay) }
+        if ed.tab == TAB_ANALYSIS {
+            view_analysis_draw(&cv, &u, &s, &analysis, &ed, &lay)
+        }
+        if ed.tab == TAB_PERF { view_perf_draw(&cv, &u, &s, frame_ms, &lay) }
+        if ed.tab == TAB_EDIT {
+            edt_changed = view_editor_draw(&cv, &u, &s, &ed, &rec, &v,
+                                           &defs, &lay)
+        }
+
+        view_set_rect(&v, lay.env_x, lay.env_y, lay.env_w, lay.env_h)
+        let env_changed: bool = view_env_input(&u, &v, &s, &ed, &lay)
+        view_env_draw(&cv, &u, &v, &s, &ed, &lay)
+
+        if ctl_rebuild {
+            sim_configure_populations(&s)
+        }
+        if env_changed or edt_changed {
+            sim_env_changed(&s)
+        }
+
+        gfx_blit_rgb(g, 0, 0, cv.w, cv.h, cv.px)
+        prof_end(PROF_RENDER, t_render)
+
+        gfx_present(g)
+        prof_end(PROF_FRAME, t_frame)
+        frame_ms = prof_last_ms(PROF_FRAME)
+        gfx_wait_frame(g, 60)
+    }
+
+    rec_stop(&rec)
+    session_destroy(&analysis)
+    sim_destroy(&s)
+    canvas_destroy(&cv)
+    gfx_close(g)
+    return 0
+}

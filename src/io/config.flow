@@ -1,0 +1,585 @@
+# Saving and loading a whole setup.
+#
+# FORMAT
+#   Whitespace-separated decimal numbers in a fixed order, with the format
+#   version first. Reading is a loop of fscanf("%lf"), which skips whitespace
+#   for us, so a file can be laid out one value per line for readability or
+#   packed onto one line and both parse identically.
+#
+#   A keyed format would be friendlier to hand-edit, and it would also need a
+#   tokeniser, a key table and a policy for unknown keys. This is a fixed
+#   schema owned by one program; the version number is what handles change.
+#   cfg_write_field and cfg_read_field are called in the same order by the
+#   writer and the reader, which is what keeps the two halves in step: they
+#   are literally the same sequence of calls.
+#
+#   The arena travels with the configuration, including every wall, cue,
+#   solid and zone the operator drew. Loading restores the arena exactly, so
+#   an edited environment is reproducible rather than something that has to
+#   be rebuilt by hand.
+
+extern {
+    function fopen(path: string, mode: string) -> ptr<void>
+    function fclose(f: ptr<void>) -> i32
+    function fputs(s: string, f: ptr<void>) -> i32
+    function fprintf(f: ptr<void>, fmt: string, a: f64) -> i32
+    function fscanf(f: ptr<void>, fmt: string, out: ptr<f64>) -> i32
+    function flow_rt_mkdir(path: string, mode: i32) -> i32
+}
+
+# Largest configuration the reader will accept, in numbers. The fixed header
+# is under a hundred; the rest is the arena, whose worst case is every table
+# full: 512 walls of four, 128 solids of four, 64 cues of three, 64 zones of
+# six. Six thousand covers that with room to spare.
+const CFG_MAX_VALUES: i32 = 6144
+
+export const CONFIG_VERSION: f64 = 10.0
+
+# Values written so far. The writer appends this as the last number in the
+# file, and the reader checks it against how many it actually read.
+#
+# The first attempt at detecting truncation counted the fixed header by hand
+# and skipped it. The count was wrong by two, because the schema had grown
+# twice since the number was written down, and a perfectly good file was
+# refused. A length the writer computes cannot drift from the writer.
+let mut cfg_written: i32 = 0
+
+function put(f: ptr<void>, v: f64) -> void {
+    let w: i32 = fprintf(f, "%.9g\n", v)
+    cfg_written = cfg_written + 1
+}
+
+function put_i(f: ptr<void>, v: i32) -> void {
+    put(f, v as f64)
+}
+
+function put_b(f: ptr<void>, v: bool) -> void {
+    if v { put(f, 1.0) } else { put(f, 0.0) }
+}
+
+# Returns 0 at end of file, which is how a truncated file is detected without
+# a separate length check.
+function get(f: ptr<void>) -> f64 {
+    let mut v: f64 = 0.0
+    let n: i32 = fscanf(f, "%lf", &v)
+    if n != 1 { return 0.0 }
+    return v
+}
+
+function get_i(f: ptr<void>) -> i32 {
+    return get(f) as i32
+}
+
+function get_b(f: ptr<void>) -> bool {
+    return get(f) > 0.5
+}
+
+export function config_save(s: ptr<Sim>, ed: ptr<Editor>,
+                            path: string) -> bool {
+    let d: i32 = flow_rt_mkdir("data", 493)
+    let d2: i32 = flow_rt_mkdir("data/configs", 493)
+    let f: ptr<void> = fopen(path, "w")
+    if f == null { return false }
+
+    cfg_written = 0
+    put(f, CONFIG_VERSION)
+
+    # Run control.
+    put_i(f, s.agents.n)
+    put(f, s.dt)
+    put_i(f, s.seed as i32)
+    put_i(f, s.integrator)
+    put_i(f, s.steps_per_frame)
+    put_b(f, s.require_sight)
+    put_b(f, s.spiking)
+    put_b(f, s.can_enabled)
+    put_b(f, s.can_anchor)
+    put_i(f, s.can_substeps)
+
+    # Motion.
+    put_i(f, s.motion.model)
+    put(f, s.motion.speed_mean)
+    put(f, s.motion.speed_sigma)
+    put(f, s.motion.speed_tau)
+    put(f, s.motion.speed_max)
+    put(f, s.motion.turn_sigma)
+    put(f, s.motion.turn_tau)
+    put(f, s.motion.turn_max)
+    put(f, s.motion.wall_range)
+    put(f, s.motion.wall_gain)
+    put(f, s.motion.thigmotaxis)
+    put(f, s.motion.cue_gain)
+    put(f, s.motion.rest_rate)
+    put(f, s.motion.margin)
+    put(f, s.motion.metabolism)
+    put(f, s.motion.thirst_rate)
+    put(f, s.motion.eat_rate)
+    put(f, s.motion.sate_per_unit)
+    put(f, s.motion.slake_per_unit)
+    put(f, s.motion.social_range)
+    put(f, s.motion.social_push)
+    put(f, s.motion.follow_gain)
+    put(f, s.motion.crowd_share)
+    put(f, s.motion.eat_reach)
+    put(f, s.motion.bite_seconds)
+    put(f, s.motion.forage_gain)
+    put(f, s.motion.eat_threshold)
+    put_b(f, s.motion.hoard)
+    put(f, s.motion.carry_capacity)
+    put(f, s.motion.head_tau)
+    put(f, s.motion.head_sigma)
+    put(f, s.motion.head_max)
+
+    # Behaviour and memory.
+    put_b(f, s.behaviour.enabled)
+    put(f, s.behaviour.groom_rate)
+    put(f, s.behaviour.rear_rate)
+    put(f, s.behaviour.rest_rate)
+    put(f, s.behaviour.groom_min)
+    put(f, s.behaviour.groom_max)
+    put(f, s.behaviour.rear_min)
+    put(f, s.behaviour.rear_max)
+    put(f, s.behaviour.rest_min)
+    put(f, s.behaviour.rest_max)
+    put(f, s.behaviour.nest_rest_min)
+    put(f, s.behaviour.nest_rest_max)
+    put(f, s.behaviour.drive_hysteresis)
+    put(f, s.behaviour.move_min)
+    put_b(f, s.behaviour.vte_enabled)
+    put(f, s.behaviour.junction_open)
+    put(f, s.behaviour.scan_min)
+    put(f, s.behaviour.scan_max)
+    put(f, s.behaviour.scan_cooldown)
+    put(f, s.behaviour.scan_hz)
+    put(f, s.behaviour.scan_extent)
+    put_b(f, s.memory.enabled)
+    put(f, s.memory.decay)
+    put(f, s.memory.disappointment)
+    put(f, s.memory.usable)
+    put(f, s.memory.home_drift)
+    put(f, s.memory.home_sense)
+    put_b(f, s.novelty.enabled)
+    put(f, s.novelty.gain)
+    put(f, s.novelty.decay)
+    put_i(f, s.novelty.decay_every)
+    put(f, s.novelty.wall_hug)
+    put(f, s.novelty.seek_new)
+    put(f, s.novelty.cue_novelty)
+
+    # Populations.
+    put(f, s.place_p.sigma)
+    put(f, s.place_p.sigma_jitter)
+    put(f, s.place_p.peak_rate)
+    put_b(f, s.place_p.los_gate)
+    put(f, s.hd_p.kappa)
+    put(f, s.hd_p.peak_rate)
+    put(f, s.hd_p.speed_gain)
+    put(f, s.vel_p.speed_max)
+    put(f, s.vel_p.sigma)
+    put(f, s.vel_p.peak_rate)
+    put(f, s.vel_p.kappa)
+    put_i(f, s.grid_p.n_modules)
+    put(f, s.grid_p.base_spacing)
+    put(f, s.grid_p.spacing_ratio)
+    put(f, s.grid_p.base_orientation)
+    put(f, s.grid_p.peak_rate)
+    put(f, s.grid_p.sharpness)
+    put_i(f, s.bvc_p.n_bearings)
+    put_i(f, s.bvc_p.n_distances)
+    put(f, s.bvc_p.max_distance)
+    put(f, s.bvc_p.sigma0)
+    put(f, s.bvc_p.peak_rate)
+    put_b(f, s.bvc_p.allocentric)
+    for k in 0 to SIM_POP_COUNT {
+        let p: ptr<Pop> = sim_pop(s, k)
+        put_b(f, p.enabled)
+    }
+
+    # Attractors.
+    put(f, s.sheet.sigma_excite)
+    put(f, s.sheet.gain_target)
+    put(f, s.sheet.dc_gain)
+    put(f, s.sheet.shift)
+    put(f, s.sheet.tau)
+    put(f, s.sheet.anchor_gain)
+    put(f, s.ring.sigma_excite)
+    put(f, s.ring.gain_target)
+    put(f, s.ring.dc_gain)
+    put(f, s.ring.shift)
+    put(f, s.ring.tau)
+    put(f, s.ring.anchor_gain)
+
+    # View and editor.
+    put_i(f, ed.tool)
+    put(f, ed.zone_radius)
+    put(f, ed.food_amount)
+    put(f, ed.food_regrow)
+    put(f, ed.water_amount)
+    put(f, ed.water_regrow)
+    put(f, ed.cue_strength)
+    put_b(f, ed.show_trails)
+    put_b(f, ed.show_rays)
+    put_b(f, ed.show_cells)
+    put_b(f, ed.show_decode)
+    put_b(f, ed.show_known)
+    put_i(f, ed.ana_pop)
+    put_i(f, ed.ana_cell)
+    put_i(f, ed.trail_len)
+    put_i(f, ed.sel_pop)
+    put_i(f, ed.sel_cell)
+
+    # Arena. The preset index is stored for the label; the geometry that
+    # follows is authoritative, so an edited arena reloads as edited rather
+    # than snapping back to its preset.
+    put_i(f, s.env.preset)
+    put_i(f, s.env.kind)
+    put(f, s.env.x0)
+    put(f, s.env.y0)
+    put(f, s.env.x1)
+    put(f, s.env.y1)
+    put(f, s.env.cx)
+    put(f, s.env.cy)
+    put(f, s.env.radius)
+    put_i(f, s.env.n_boundary)
+    put_i(f, s.env.n_walls)
+    for i in 0 to s.env.n_walls {
+        put(f, s.env.wx0[i])
+        put(f, s.env.wy0[i])
+        put(f, s.env.wx1[i])
+        put(f, s.env.wy1[i])
+    }
+    put_i(f, s.env.n_solids)
+    for i in 0 to s.env.n_solids {
+        put(f, s.env.solid_x[i])
+        put(f, s.env.solid_y[i])
+        put(f, s.env.solid_w[i])
+        put(f, s.env.solid_h[i])
+    }
+    put_i(f, s.env.n_cues)
+    for i in 0 to s.env.n_cues {
+        put(f, s.env.cue_x[i])
+        put(f, s.env.cue_y[i])
+        put(f, s.env.cue_strength[i])
+    }
+    put_i(f, s.env.n_zones)
+    for i in 0 to s.env.n_zones {
+        put_i(f, s.env.zone_kind[i])
+        put_i(f, s.env.zone_shape[i])
+        put(f, s.env.zone_x[i])
+        put(f, s.env.zone_y[i])
+        put(f, s.env.zone_a[i])
+        put(f, s.env.zone_b[i])
+        put(f, s.env.zone_capacity[i])
+        put(f, s.env.zone_regrow[i])
+    }
+
+    # The trailer. Its value is the number of values in the finished file,
+    # itself included, so a file cut anywhere loses it and is detected
+    # without the reader having to know the schema's length.
+    put(f, (cfg_written + 1) as f64)
+
+    let c: i32 = fclose(f)
+    return true
+}
+
+# Reading is in two passes: the whole file into memory, then a check that
+# what arrived is a configuration, and only then is anything applied.
+#
+# The single pass this replaces read straight into the simulation as it went,
+# and fscanf returning nothing at end of file was indistinguishable from a
+# zero. A file truncated anywhere therefore loaded as a success and left an
+# arena of zero extent with no boundary walls at all, which the rats promptly
+# left. Applying nothing is the only safe response to a file that stops
+# early, and that cannot be decided until the end has been reached.
+
+let mut cfg_buf: ptr<f64> = null
+let mut cfg_len: i32 = 0
+let mut cfg_pos: i32 = 0
+let mut cfg_short: bool = false
+
+function cfg_take() -> f64 {
+    if cfg_pos >= cfg_len {
+        cfg_short = true
+        return 0.0
+    }
+    let v: f64 = cfg_buf[cfg_pos]
+    cfg_pos = cfg_pos + 1
+    return v
+}
+
+function cfg_take_i() -> i32 {
+    return cfg_take() as i32
+}
+
+function cfg_take_b() -> bool {
+    return cfg_take() > 0.5
+}
+
+# True when `n` more values are still available, so a count read from the
+# file can be checked before it is used to size a loop.
+function cfg_has(n: i32) -> bool {
+    if n < 0 { return false }
+    return cfg_pos + n <= cfg_len
+}
+
+export function config_load(s: ptr<Sim>, ed: ptr<Editor>,
+                            path: string) -> bool {
+    let f: ptr<void> = fopen(path, "r")
+    if f == null { return false }
+    if cfg_buf == null {
+        cfg_buf = mem_alloc((CFG_MAX_VALUES as i64) * 8, "config buffer") as ptr<f64>
+        if cfg_buf == null {
+            let cx: i32 = fclose(f)
+            return false
+        }
+    }
+    cfg_len = 0
+    cfg_pos = 0
+    cfg_short = false
+    let mut v: f64 = 0.0
+    while cfg_len < CFG_MAX_VALUES and fscanf(f, "%lf", &v) == 1 {
+        cfg_buf[cfg_len] = v
+        cfg_len = cfg_len + 1
+    }
+    let c0: i32 = fclose(f)
+
+    # Length first. The trailer says how long the file should be, so a file
+    # that stops early fails here regardless of where it was cut.
+    if cfg_len < 3 { return false }
+    if cfg_buf[cfg_len - 1] != (cfg_len as f64) { return false }
+
+    let version: f64 = cfg_take()
+    # The layout changes whenever a block is added in the middle of the file,
+    # which it did at 5.0 for behaviour and memory, 6.0 for thirst, 7.0 for
+    # the social terms, 8.0 for novelty, 9.0 for the analysis tab and 10.0
+    # when food became discrete items. An older file has the right trailer and the
+    # wrong shape, so
+    # every value after the changed block would land in the wrong field.
+    # Refusing it is the only reading that is not silently wrong.
+    if version < 9.5 or version > CONFIG_VERSION + 0.5 { return false }
+
+    let n_rats: i32 = cfg_take_i()
+    s.dt = cfg_take()
+    s.seed = cfg_take_i() as u32
+    s.integrator = cfg_take_i()
+    s.steps_per_frame = cfg_take_i()
+    s.require_sight = cfg_take_b()
+    s.spiking = cfg_take_b()
+    s.can_enabled = cfg_take_b()
+    s.can_anchor = cfg_take_b()
+    s.can_substeps = cfg_take_i()
+
+    s.motion.model = cfg_take_i()
+    s.motion.speed_mean = cfg_take()
+    s.motion.speed_sigma = cfg_take()
+    s.motion.speed_tau = cfg_take()
+    s.motion.speed_max = cfg_take()
+    s.motion.turn_sigma = cfg_take()
+    s.motion.turn_tau = cfg_take()
+    s.motion.turn_max = cfg_take()
+    s.motion.wall_range = cfg_take()
+    s.motion.wall_gain = cfg_take()
+    s.motion.thigmotaxis = cfg_take()
+    s.motion.cue_gain = cfg_take()
+    s.motion.rest_rate = cfg_take()
+    s.motion.margin = cfg_take()
+    s.motion.metabolism = cfg_take()
+    s.motion.thirst_rate = cfg_take()
+    s.motion.eat_rate = cfg_take()
+    s.motion.sate_per_unit = cfg_take()
+    s.motion.slake_per_unit = cfg_take()
+    s.motion.social_range = cfg_take()
+    s.motion.social_push = cfg_take()
+    s.motion.follow_gain = cfg_take()
+    s.motion.crowd_share = cfg_take()
+    s.motion.eat_reach = cfg_take()
+    s.motion.bite_seconds = cfg_take()
+    s.motion.forage_gain = cfg_take()
+    s.motion.eat_threshold = cfg_take()
+    s.motion.hoard = cfg_take_b()
+    s.motion.carry_capacity = cfg_take()
+    s.motion.head_tau = cfg_take()
+    s.motion.head_sigma = cfg_take()
+    s.motion.head_max = cfg_take()
+
+    s.behaviour.enabled = cfg_take_b()
+    s.behaviour.groom_rate = cfg_take()
+    s.behaviour.rear_rate = cfg_take()
+    s.behaviour.rest_rate = cfg_take()
+    s.behaviour.groom_min = cfg_take()
+    s.behaviour.groom_max = cfg_take()
+    s.behaviour.rear_min = cfg_take()
+    s.behaviour.rear_max = cfg_take()
+    s.behaviour.rest_min = cfg_take()
+    s.behaviour.rest_max = cfg_take()
+    s.behaviour.nest_rest_min = cfg_take()
+    s.behaviour.nest_rest_max = cfg_take()
+    s.behaviour.drive_hysteresis = cfg_take()
+    s.behaviour.move_min = cfg_take()
+    s.behaviour.vte_enabled = cfg_take_b()
+    s.behaviour.junction_open = cfg_take()
+    s.behaviour.scan_min = cfg_take()
+    s.behaviour.scan_max = cfg_take()
+    s.behaviour.scan_cooldown = cfg_take()
+    s.behaviour.scan_hz = cfg_take()
+    s.behaviour.scan_extent = cfg_take()
+    s.memory.enabled = cfg_take_b()
+    s.memory.decay = cfg_take()
+    s.memory.disappointment = cfg_take()
+    s.memory.usable = cfg_take()
+    s.memory.home_drift = cfg_take()
+    s.memory.home_sense = cfg_take()
+    s.novelty.enabled = cfg_take_b()
+    s.novelty.gain = cfg_take()
+    s.novelty.decay = cfg_take()
+    s.novelty.decay_every = cfg_take_i()
+    s.novelty.wall_hug = cfg_take()
+    s.novelty.seek_new = cfg_take()
+    s.novelty.cue_novelty = cfg_take()
+
+    s.place_p.sigma = cfg_take()
+    s.place_p.sigma_jitter = cfg_take()
+    s.place_p.peak_rate = cfg_take()
+    s.place_p.los_gate = cfg_take_b()
+    s.hd_p.kappa = cfg_take()
+    s.hd_p.peak_rate = cfg_take()
+    s.hd_p.speed_gain = cfg_take()
+    s.vel_p.speed_max = cfg_take()
+    s.vel_p.sigma = cfg_take()
+    s.vel_p.peak_rate = cfg_take()
+    s.vel_p.kappa = cfg_take()
+    s.grid_p.n_modules = cfg_take_i()
+    s.grid_p.base_spacing = cfg_take()
+    s.grid_p.spacing_ratio = cfg_take()
+    s.grid_p.base_orientation = cfg_take()
+    s.grid_p.peak_rate = cfg_take()
+    s.grid_p.sharpness = cfg_take()
+    s.bvc_p.n_bearings = cfg_take_i()
+    s.bvc_p.n_distances = cfg_take_i()
+    s.bvc_p.max_distance = cfg_take()
+    s.bvc_p.sigma0 = cfg_take()
+    s.bvc_p.peak_rate = cfg_take()
+    s.bvc_p.allocentric = cfg_take_b()
+    for k in 0 to SIM_POP_COUNT {
+        let p: ptr<Pop> = sim_pop(s, k)
+        p.enabled = cfg_take_b()
+    }
+
+    s.sheet.sigma_excite = cfg_take()
+    s.sheet.gain_target = cfg_take()
+    s.sheet.dc_gain = cfg_take()
+    s.sheet.shift = cfg_take()
+    s.sheet.tau = cfg_take()
+    s.sheet.anchor_gain = cfg_take()
+    s.ring.sigma_excite = cfg_take()
+    s.ring.gain_target = cfg_take()
+    s.ring.dc_gain = cfg_take()
+    s.ring.shift = cfg_take()
+    s.ring.tau = cfg_take()
+    s.ring.anchor_gain = cfg_take()
+
+    ed.tool = cfg_take_i()
+    ed.zone_radius = cfg_take()
+    ed.food_amount = cfg_take()
+    ed.food_regrow = cfg_take()
+    ed.water_amount = cfg_take()
+    ed.water_regrow = cfg_take()
+    ed.cue_strength = cfg_take()
+    ed.show_trails = cfg_take_b()
+    ed.show_rays = cfg_take_b()
+    ed.show_cells = cfg_take_b()
+    ed.show_decode = cfg_take_b()
+    ed.show_known = cfg_take_b()
+    ed.ana_pop = cfg_take_i()
+    ed.ana_cell = cfg_take_i()
+    ed.trail_len = cfg_take_i()
+    ed.sel_pop = cfg_take_i()
+    ed.sel_cell = cfg_take_i()
+
+    let preset: i32 = cfg_take_i()
+    let kind: i32 = cfg_take_i()
+    env_clear(&s.env)
+    s.env.preset = preset
+    s.env.kind = kind
+    s.env.x0 = cfg_take()
+    s.env.y0 = cfg_take()
+    s.env.x1 = cfg_take()
+    s.env.y1 = cfg_take()
+    s.env.cx = cfg_take()
+    s.env.cy = cfg_take()
+    s.env.radius = cfg_take()
+    let n_boundary: i32 = cfg_take_i()
+    let n_walls: i32 = cfg_take_i()
+    for i in 0 to n_walls {
+        let ax: f64 = cfg_take()
+        let ay: f64 = cfg_take()
+        let bx: f64 = cfg_take()
+        let by: f64 = cfg_take()
+        let idx: i32 = env_add_wall(&s.env, ax, ay, bx, by)
+    }
+    s.env.n_boundary = n_boundary
+    let n_solids: i32 = cfg_take_i()
+    for i in 0 to n_solids {
+        let x: f64 = cfg_take()
+        let y: f64 = cfg_take()
+        let w: f64 = cfg_take()
+        let h: f64 = cfg_take()
+        env_add_solid(&s.env, x, y, w, h)
+    }
+    let n_cues: i32 = cfg_take_i()
+    for i in 0 to n_cues {
+        let x: f64 = cfg_take()
+        let y: f64 = cfg_take()
+        let st: f64 = cfg_take()
+        let idx: i32 = env_add_cue(&s.env, x, y, st)
+    }
+    let n_zones: i32 = cfg_take_i()
+    for i in 0 to n_zones {
+        let zk: i32 = cfg_take_i()
+        let zs: i32 = cfg_take_i()
+        let x: f64 = cfg_take()
+        let y: f64 = cfg_take()
+        let a: f64 = cfg_take()
+        let b: f64 = cfg_take()
+        let cap: f64 = cfg_take()
+        let regrow: f64 = cfg_take()
+        let idx: i32 = env_add_zone_food(&s.env, zk, zs, x, y, a, b,
+                                         cap, regrow)
+    }
+
+    # An arena that arrived intact but describes nothing usable is replaced
+    # by its own preset, so the simulation is always left in a state it can
+    # run in. Reporting failure and leaving a broken arena behind would be
+    # the worst of both.
+    if !arena_usable(&s.env) {
+        env_preset_apply(&s.env, preset)
+        sim_configure_populations(s)
+        sim_reset(s, n_rats)
+        return false
+    }
+
+    # Rebuild everything the loaded values feed. can_set_sigma rather than
+    # can_build_kernel: the kernel radius is derived from the width, so a
+    # loaded width has to be allowed to resize the kernel. Rebuilding the
+    # kernel alone would keep the radius the file was never asked about and
+    # silently give a different network from the one that was saved.
+    can_set_sigma(&s.sheet, s.sheet.sigma_excite, s.dt)
+    can_set_sigma(&s.ring, s.ring.sigma_excite, s.dt)
+    sim_configure_populations(s)
+    sim_reset(s, n_rats)
+    return true
+}
+
+# Whether the arena that was just read can actually be run in. The trailer
+# and version checks mean a file that gets this far was written by this
+# writer, so this is the second line rather than the first: it catches a file
+# that is the right shape and still describes nothing usable.
+function arena_usable(e: ptr<Env>) -> bool {
+    if e.x1 - e.x0 < 0.01 or e.y1 - e.y0 < 0.01 { return false }
+    if e.x1 - e.x0 > 1000.0 or e.y1 - e.y0 > 1000.0 { return false }
+    if e.n_boundary < 3 { return false }
+    if e.n_walls < e.n_boundary { return false }
+    if e.kind < 0 or e.kind > ENV_POLY { return false }
+    return true
+}
+

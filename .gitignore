@@ -1,0 +1,4 @@
+# Generated recordings, frames, and local WASM build output
+data/out/
+build/
+.DS_Store

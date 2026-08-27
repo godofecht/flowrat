@@ -1,0 +1,395 @@
+# The network view: why one place cell is firing.
+#
+# Everything drawn here is read from the same arrays circuit_update reads.
+# When the circuit is off there is nothing to draw, and the panel says so
+# rather than inventing a diagram: with analytic place fields there are no
+# connections, and a picture of connections that do not exist would be the
+# most misleading thing in the whole interface.
+#
+# THREE VIEWS OF THE SAME THING
+#   left    the input cells as nodes, edges weighted by how much each one is
+#           contributing at this instant
+#   middle  the boundary inputs as a polar plot of what they are tuned to,
+#           which reads as the cell's recipe: a wall this far away, in that
+#           direction
+#   right   the arithmetic, as a bar: summed drive against the threshold it
+#           has to clear, and the rate that comes out
+#
+# The polar plot is the one worth looking at. A place cell here has no access
+# to position; it fires because a particular arrangement of walls is present.
+# The plot shows that arrangement directly, which is what makes it obvious
+# why moving a wall moves the field.
+
+import "draw.flow"
+import "widgets.flow"
+import "layout.flow"
+
+extern {
+    function sin(x: f64) -> f64
+    function cos(x: f64) -> f64
+    function sqrt(x: f64) -> f64
+    function fabs(x: f64) -> f64
+}
+
+export function view_net_draw(c: ptr<Canvas>, u: ptr<Ui>, s: ptr<Sim>,
+                              d: ptr<Defaults>, ed: ptr<Editor>,
+                              lay: ptr<Layout>) -> void {
+    ui_panel(c, lay.net_x, lay.net_y, lay.net_w, lay.net_h,
+             "place cell connectome")
+    let x0: i32 = lay.net_x + PAD
+    let y0: i32 = ui_panel_body_y(lay.net_y)
+    let w: i32 = lay.net_w - PAD * 2
+    let h: i32 = lay.net_y + lay.net_h - y0 - PAD
+
+    # The controls that shape this wiring sit in the tab that draws it, on
+    # the right, and stay there whether the circuit is on or off. Off is the
+    # state in which the reader most needs the switch.
+    let cw: i32 = 250
+    let bodyw: i32 = w - cw - 20
+    draw_pop_controls(c, u, s, d, x0 + bodyw + 20, y0, cw)
+
+    if !s.circuit.enabled {
+        let midx: i32 = lay.net_x + bodyw / 2 + PAD
+        dr_text_center(c, midx, lay.net_y + lay.net_h / 2 - 16,
+                       "place fields are analytic, so there is no circuit",
+                       1, C_DIM)
+        dr_text_center(c, midx, lay.net_y + lay.net_h / 2 - 2,
+                       "turn on input-driven place cells, on the right",
+                       1, C_DIM)
+        dr_text_center(c, midx, lay.net_y + lay.net_h / 2 + 14,
+                       "then a place cell fires from boundary and grid input rather than from position",
+                       1, C_DIM)
+        return
+    }
+
+    let rat: i32 = sim_selected(s)
+    let cell: i32 = clamp_cell_index(ed.sel_cell, s.place.n)
+
+    # Cell picker along the top: one tick per place cell, height by its
+    # current rate, with the selected one marked. Clicking chooses a cell.
+    let pick_h: i32 = 26
+    draw_cell_picker(c, u, s, ed, x0, y0, bodyw, pick_h, rat, cell)
+
+    let by: i32 = y0 + pick_h + 10
+    let bh: i32 = h - pick_h - 10
+    if bh < 60 { return }
+
+    # Three columns in what is left after the controls.
+    let col1: i32 = (bodyw * 40) / 100
+    let col2: i32 = (bodyw * 32) / 100
+    let col3: i32 = bodyw - col1 - col2 - 24
+
+    draw_edges(c, s, ed, x0, by, col1, bh, rat, cell)
+    draw_polar(c, s, x0 + col1 + 12, by, col2, bh, rat, cell)
+    draw_arithmetic(c, s, x0 + col1 + col2 + 24, by, col3, bh, rat, cell)
+}
+
+function clamp_cell_index(cell: i32, n: i32) -> i32 {
+    if n <= 0 { return 0 }
+    if cell < 0 { return 0 }
+    if cell >= n { return n - 1 }
+    return cell
+}
+
+# --- the cell picker -------------------------------------------------------
+
+function draw_cell_picker(c: ptr<Canvas>, u: ptr<Ui>, s: ptr<Sim>,
+                          ed: ptr<Editor>, x: i32, y: i32, w: i32, h: i32,
+                          rat: i32, cell: i32) -> void {
+    let t: i32 = dr_text(c, x, y, "cell", 1, C_LABEL)
+    let n: i32 = dr_int(c, x + 30, y, cell, 1, C_ACCENT)
+    dr_text_right(c, x + w, y, "click a bar to follow a different cell",
+                  1, C_DIM)
+
+    let py: i32 = y + 11
+    let ph: i32 = h - 11
+    dr_rect(c, x, py, w, ph, rgb(16, 19, 28))
+    let p: ptr<Pop> = &s.place
+    if p.n > 0 {
+        let base: i32 = pop_base(p, rat)
+        let mut m: f64 = p.p3[0]
+        if m <= 0.0 { m = 1.0 }
+        for i in 0 to p.n {
+            let bx0: i32 = x + (i * w) / p.n
+            let mut bx1: i32 = x + ((i + 1) * w) / p.n
+            if bx1 <= bx0 { bx1 = bx0 + 1 }
+            let mut f: f64 = p.rates[base + i] / m
+            if f < 0.0 { f = 0.0 }
+            if f > 1.0 { f = 1.0 }
+            let bh2: i32 = ((ph as f64) * f) as i32
+            let mut col: i32 = C_ACCENT2
+            if i == cell { col = C_ACCENT }
+            if bh2 > 0 { dr_rect(c, bx0, py + ph - bh2, bx1 - bx0, bh2, col) }
+            if i == cell { dr_rect(c, bx0, py, bx1 - bx0, 2, C_ACCENT) }
+        }
+        if ui_hit(u, x, py, w, ph) and u.pressed and !u.consumed {
+            let idx: i32 = ((u.mx - x) * p.n) / w
+            ed.sel_cell = clamp_cell_index(idx, p.n)
+            u.consumed = true
+        }
+    }
+    dr_frame(c, x, py, w, ph, C_EDGE)
+}
+
+# --- the graph -------------------------------------------------------------
+
+function draw_edges(c: ptr<Canvas>, s: ptr<Sim>, ed: ptr<Editor>,
+                    x: i32, y: i32, w: i32, h: i32,
+                    rat: i32, cell: i32) -> void {
+    let t: i32 = dr_text(c, x, y, "inputs", 1, C_LABEL)
+    let live: i32 = circuit_live_inputs(&s.circuit, cell)
+    dr_text_right(c, x + w - 4, y, "wired", 1, C_DIM)
+    dr_int_right(c, x + w - 40, y, live, 1, C_TEXT)
+
+    let gy: i32 = y + 14
+    let gh: i32 = h - 14
+    dr_rect(c, x, gy, w, gh, rgb(14, 17, 26))
+
+    let fan: i32 = s.circuit.fan_in
+    let tx: i32 = x + w - 26
+    let ty: i32 = gy + gh / 2
+
+    # Strongest contribution this instant, so the edges are scaled against
+    # something meaningful rather than against the largest weight, which does
+    # not change as the rat moves.
+    let mut peak: f64 = 0.0
+    for k in 0 to fan {
+        let v: f64 = circuit_contribution(&s.circuit, &s.bvc, &s.grid,
+                                          rat, cell, k)
+        if v > peak { peak = v }
+    }
+    if peak < 0.000001 { peak = 1.0 }
+
+    let sx: i32 = x + 58
+    for k in 0 to fan {
+        let slot: i32 = cell * fan + k
+        if s.circuit.weight[slot] <= 0.0 { continue }
+        let sy: i32 = gy + 10 + (k * (gh - 20)) / fan
+        let contrib: f64 = circuit_contribution(&s.circuit, &s.bvc, &s.grid,
+                                                rat, cell, k)
+        let f: f64 = contrib / peak
+
+        # Edge brightness is the contribution, so a silent input fades out
+        # and the ones actually holding the cell up stand out.
+        let col: i32 = map_rate(f)
+        let mut a: f64 = 0.15 + 0.85 * f
+        dr_line_alpha(c, sx, sy, tx, ty, col, a)
+
+        # Node, labelled by which population it came from.
+        let is_grid: bool = s.circuit.src_pop[slot] == SRC_GRID
+        let mut ncol: i32 = rgb(110, 170, 200)
+        if is_grid { ncol = rgb(200, 150, 110) }
+        dr_disc(c, sx, sy, 3, col_scale(ncol, 0.4 + 0.6 * f))
+        let lbl: i32 = dr_text(c, x + 2, sy - 3,
+                               circuit_src_name(s.circuit.src_pop[slot]),
+                               1, col_scale(ncol, 0.8))
+        dr_int_right(c, sx - 6, sy - 3, s.circuit.src_cell[slot], 1, C_DIM)
+    }
+
+    # The place cell itself.
+    let rate: f64 = pop_rate(&s.place, rat, cell)
+    let mut pm: f64 = s.place.p3[cell]
+    if pm <= 0.0 { pm = 1.0 }
+    dr_disc(c, tx, ty, 8, map_rate(rate / pm))
+    dr_circle(c, tx, ty, 9, C_ACCENT)
+    dr_text_center(c, tx, ty + 13, "place", 1, C_LABEL)
+    dr_frame(c, x, gy, w, gh, C_EDGE)
+}
+
+# --- the recipe ------------------------------------------------------------
+
+# Boundary inputs plotted where they are tuned: bearing around, preferred
+# distance out from the centre. Dot size is the connection weight, colour is
+# what it is contributing now. Read together, this is the wall arrangement
+# the cell is looking for.
+function draw_polar(c: ptr<Canvas>, s: ptr<Sim>, x: i32, y: i32,
+                    w: i32, h: i32, rat: i32, cell: i32) -> void {
+    let t: i32 = dr_text(c, x, y, "what it is tuned to", 1, C_LABEL)
+    let gy: i32 = y + 14
+    let gh: i32 = h - 14
+    dr_rect(c, x, gy, w, gh, rgb(14, 17, 26))
+
+    let cx: i32 = x + w / 2
+    let cy: i32 = gy + gh / 2
+    let mut rad: i32 = gh / 2 - 16
+    if w / 2 - 16 < rad { rad = w / 2 - 16 }
+    if rad < 10 {
+        dr_frame(c, x, gy, w, gh, C_EDGE)
+        return
+    }
+
+    # Rings at a quarter, a half and three quarters of the largest preferred
+    # distance the boundary population covers.
+    let dmax: f64 = s.bvc_p.max_distance
+    for k in 1 to 4 {
+        dr_circle(c, cx, cy, (rad * k) / 4, rgb(30, 34, 46))
+    }
+    dr_hline(c, cx - rad, cx + rad, cy, rgb(26, 30, 40))
+    dr_vline(c, cx, cy - rad, cy + rad, rgb(26, 30, 40))
+
+    let fan: i32 = s.circuit.fan_in
+    let mut wmax: f64 = 0.0
+    for k in 0 to fan {
+        let ww: f64 = s.circuit.weight[cell * fan + k]
+        if ww > wmax { wmax = ww }
+    }
+    if wmax < 0.000001 { wmax = 1.0 }
+
+    let mut peak: f64 = 0.0
+    for k in 0 to fan {
+        let v: f64 = circuit_contribution(&s.circuit, &s.bvc, &s.grid,
+                                          rat, cell, k)
+        if v > peak { peak = v }
+    }
+    if peak < 0.000001 { peak = 1.0 }
+
+    let mut n_grid: i32 = 0
+    for k in 0 to fan {
+        let slot: i32 = cell * fan + k
+        let ww: f64 = s.circuit.weight[slot]
+        if ww <= 0.0 { continue }
+        if s.circuit.src_pop[slot] == SRC_GRID {
+            n_grid = n_grid + 1
+            continue
+        }
+        let src: i32 = s.circuit.src_cell[slot]
+        let bearing: f64 = s.bvc.p0[src]
+        let mut dist_pref: f64 = s.bvc.p1[src]
+        if dmax > 0.0 { dist_pref = dist_pref / dmax }
+        if dist_pref > 1.0 { dist_pref = 1.0 }
+        let px: i32 = cx + ((cos(bearing) * dist_pref * (rad as f64)) as i32)
+        let py: i32 = cy - ((sin(bearing) * dist_pref * (rad as f64)) as i32)
+        let contrib: f64 = circuit_contribution(&s.circuit, &s.bvc, &s.grid,
+                                                rat, cell, k)
+        let mut r: i32 = 2 + ((ww / wmax) * 4.0) as i32
+        dr_disc(c, px, py, r, map_rate(contrib / peak))
+    }
+
+    dr_text_center(c, cx, gy + 2, "wall bearing and distance", 1, C_DIM)
+    # Two captions on the bottom row, one at each end, so they cannot meet
+    # however narrow the panel gets.
+    let cap_y: i32 = gy + gh - 10
+    let lw: i32 = dr_text(c, x + 4, cap_y, "outer ring", 1, C_DIM)
+    let lv: i32 = dr_fixed(c, x + 4 + lw + 4, cap_y, dmax, 2, 1, C_DIM)
+    let lm: i32 = dr_text(c, x + 4 + lw + 4 + lv + 3, cap_y, "m", 1, C_DIM)
+    if n_grid > 0 {
+        dr_text_right(c, x + w - 4, cap_y, "grid inputs not shown", 1, C_DIM)
+        dr_int_right(c, x + w - 4 - dr_text_width("grid inputs not shown", 1)
+                     - 4, cap_y, n_grid, 1, C_DIM)
+    }
+    dr_frame(c, x, gy, w, gh, C_EDGE)
+}
+
+# --- the arithmetic --------------------------------------------------------
+
+function draw_arithmetic(c: ptr<Canvas>, s: ptr<Sim>, x: i32, y: i32,
+                         w: i32, h: i32, rat: i32, cell: i32) -> void {
+    let t: i32 = dr_text(c, x, y, "and what that adds up to", 1, C_LABEL)
+    let mut ry: i32 = y + 16
+
+    let drive: f64 = s.circuit.last_drive[cell]
+    let theta: f64 = s.circuit.theta[cell]
+    let rate: f64 = pop_rate(&s.place, rat, cell)
+
+    ui_kv_fixed(c, x, ry, w, "summed drive", drive, 4, C_TEXT)
+    ry = ry + 12
+    ui_kv_fixed(c, x, ry, w, "threshold", theta, 4, C_DIM)
+    ry = ry + 12
+    ui_kv_fixed(c, x, ry, w, "gain", s.circuit.cgain[cell], 2, C_DIM)
+    ry = ry + 16
+
+    # Drive against threshold on one track. Everything to the left of the
+    # marker is thrown away by the rectifier; the part to the right is what
+    # the cell actually fires on.
+    let bar_h: i32 = 12
+    let mut scale: f64 = theta * 2.0
+    if drive > scale { scale = drive * 1.1 }
+    if scale < 0.000001 { scale = 1.0 }
+    dr_rect(c, x, ry, w, bar_h, C_PANEL_HI)
+    let dw: i32 = (((drive / scale) * (w as f64)) as i32)
+    let mut bc: i32 = C_ACCENT2
+    if drive > theta { bc = C_ACCENT }
+    dr_rect(c, x, ry, dw, bar_h, bc)
+    let thx: i32 = x + (((theta / scale) * (w as f64)) as i32)
+    dr_vline(c, thx, ry - 3, ry + bar_h + 3, C_BAD)
+    dr_frame(c, x, ry, w, bar_h, C_EDGE)
+    ry = ry + bar_h + 4
+    let hint: i32 = dr_text(c, x, ry, "drive", 1, C_DIM)
+    dr_text_right(c, x + w, ry, "red line is the threshold", 1, C_DIM)
+    ry = ry + 16
+
+    let mut pm: f64 = s.place.p3[cell]
+    if pm <= 0.0 { pm = 1.0 }
+    let mut rc: i32 = C_DIM
+    if rate > 0.0 { rc = C_GOOD }
+    ui_kv_fixed(c, x, ry, w, "rate Hz", rate, 2, rc)
+    ry = ry + 12
+    ui_bar(c, x, ry, w, 6, rate / pm, C_GOOD)
+    ry = ry + 16
+
+    # Where the cell was wired, and where the rat is, so the two can be
+    # compared without leaving the panel.
+    ui_kv_fixed(c, x, ry, w, "wired around x", s.place.p0[cell], 3, C_DIM)
+    ry = ry + 12
+    ui_kv_fixed(c, x, ry, w, "wired around y", s.place.p1[cell], 3, C_DIM)
+    ry = ry + 12
+    ui_kv_fixed(c, x, ry, w, "rat x", s.agents.x[rat], 3, C_TEXT)
+    ry = ry + 12
+    ui_kv_fixed(c, x, ry, w, "rat y", s.agents.y[rat], 3, C_TEXT)
+    ry = ry + 16
+
+    ui_kv_int(c, x, ry, w, "fan in", s.circuit.fan_in, C_DIM)
+    ry = ry + 12
+    ui_kv_fixed(c, x, ry, w, "grid share", s.circuit.grid_share, 2, C_DIM)
+}
+
+# --- the controls that shape the wiring -------------------------------------
+
+function draw_pop_controls(c: ptr<Canvas>, u: ptr<Ui>, s: ptr<Sim>,
+                           d: ptr<Defaults>, x: i32, y: i32,
+                           w: i32) -> void {
+    let mut ry: i32 = y
+    let hw: i32 = (w - 4) / 2
+    let nh: i32 = dr_text(c, x, ry, "populations", 1, C_LABEL)
+    ry = ry + 14
+    if ui_slider(u, c, x, ry, w, 14, "place sigma m",
+                 &s.place_p.sigma, 0.03, 0.35,
+                 d.place.sigma, 3) {
+        sim_configure_populations(s)
+    }
+    ry = ry + 17
+    if ui_slider(u, c, x, ry, w, 14, "grid spacing m",
+                 &s.grid_p.base_spacing, 0.12, 0.9,
+                 d.grid.base_spacing, 2) {
+        sim_configure_populations(s)
+    }
+    ry = ry + 17
+    if ui_toggle(u, c, x, ry, hw, 15, "walls gate", s.place_p.los_gate) {
+        s.place_p.los_gate = !s.place_p.los_gate
+    }
+    if ui_toggle(u, c, x + hw + 4, ry, hw, 15, "spikes", s.spiking) {
+        s.spiking = !s.spiking
+    }
+    ry = ry + 19 + 4
+
+    # Input-driven place cells. This is the difference between five
+    # populations reading position in parallel and a circuit: with it on, a
+    # place cell has no access to position at all and fires only from what
+    # the boundary and grid cells are doing.
+    if ui_toggle(u, c, x, ry, w, 15, "place cells driven by inputs",
+                 s.circuit.enabled) {
+        sim_set_circuit(s, !s.circuit.enabled)
+    }
+    ry = ry + 19
+    if s.circuit.enabled {
+        if ui_slider(u, c, x, ry, w, 14, "field threshold",
+                     &s.circuit.threshold_frac, 0.2, 0.85, 0.55, 2) {
+            sim_rewire(s)
+        }
+        ry = ry + 17
+        if ui_slider(u, c, x, ry, w, 14, "grid share of input",
+                     &s.circuit.grid_share, 0.0, 0.8, 0.35, 2) {
+            sim_rewire(s)
+        }
+    }
+}

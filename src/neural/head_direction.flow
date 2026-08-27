@@ -1,0 +1,109 @@
+# Head-direction cells.
+#
+# Von Mises tuning on heading, which is the circular analogue of a Gaussian
+# and the standard description of a head-direction tuning curve:
+#
+#   rate = peak * exp( kappa * (cos(theta - pref) - 1) )
+#
+# The -1 normalises the peak to `peak` at theta = pref, so changing the
+# concentration sharpens the curve without also changing its height.
+#
+# kappa relates to tuning width: the full width at half maximum is roughly
+# 2 * acos(1 + ln(0.5) / kappa) radians, so kappa = 4 gives about 80 degrees,
+# which is in the range reported for anterodorsal thalamus.
+#
+# PROPERTIES
+#   p0  preferred angle, radians in [-pi, pi)
+#   p1  kappa, concentration
+#   p2  peak rate in Hz
+#   p3  unused
+#   p4  unused
+#
+# Preferred angles tile the circle evenly rather than being sampled at
+# random. An even tiling is what makes the population vector an unbiased
+# estimate of heading, and the decode below relies on it.
+
+extern {
+    function exp(x: f64) -> f64
+    function cos(x: f64) -> f64
+    function sin(x: f64) -> f64
+    function atan2(y: f64, x: f64) -> f64
+    function sqrt(x: f64) -> f64
+}
+
+export struct HeadDirParams {
+    kappa: f64,
+    peak_rate: f64,
+    # Adds a component that grows with running speed, as head-direction
+    # cells in the literature often do. Zero leaves the tuning pure.
+    speed_gain: f64,
+}
+
+export function hd_params_default() -> HeadDirParams {
+    return HeadDirParams {
+        kappa: 4.0,
+        peak_rate: 25.0,
+        speed_gain: 0.0
+    }
+}
+
+export function hd_configure(p: ptr<Pop>, hp: ptr<HeadDirParams>) -> void {
+    let step: f64 = TAU / (p.n as f64)
+    for c in 0 to p.n {
+        p.p0[c] = wrap_pi((c as f64) * step)
+        p.p1[c] = hp.kappa
+        p.p2[c] = hp.peak_rate
+        p.p3[c] = 0.0
+        p.p4[c] = 0.0
+    }
+    p.revision = p.revision + 1
+}
+
+export function hd_rate_at(p: ptr<Pop>, cell: i32, heading: f64) -> f64 {
+    let d: f64 = angle_delta(p.p0[cell], heading)
+    return p.p2[cell] * exp(p.p1[cell] * (cos(d) - 1.0))
+}
+
+# The cells encode where the head points, which is what gives the population
+# its name. Reading the body's heading instead made the decode look perfect,
+# because the thing being decoded was the thing driving the cells with nothing
+# in between. The head moves on its own, so the decode now has something to
+# recover and its error is a real number.
+export function hd_update(p: ptr<Pop>, a: ptr<Agents>,
+                          hp: ptr<HeadDirParams>) -> void {
+    if !p.enabled { return }
+    let sg: f64 = hp.speed_gain
+    parallel for r in 0 to a.n {
+        let base: i32 = r * p.n
+        let h: f64 = agents_head_dir(a, r)
+        let gain: f64 = 1.0 + sg * a.speed[r]
+        for c in 0 to p.n {
+            let d: f64 = angle_delta(p.p0[c], h)
+            p.rates[base + c] = gain * p.p2[c]
+                                * exp(p.p1[c] * (cos(d) - 1.0))
+        }
+    }
+}
+
+# Circular population-vector decode. Returns the estimated heading and writes
+# the resultant length, which is a measure of how sharply the population
+# agrees: 1 is a perfect bump, 0 is uniform activity carrying no direction.
+export function hd_decode(p: ptr<Pop>, rat: i32,
+                          strength_out: ptr<f64>) -> f64 {
+    let base: i32 = rat * p.n
+    let mut sx: f64 = 0.0
+    let mut sy: f64 = 0.0
+    let mut total: f64 = 0.0
+    for c in 0 to p.n {
+        let v: f64 = p.rates[base + c]
+        sx = sx + v * cos(p.p0[c])
+        sy = sy + v * sin(p.p0[c])
+        total = total + v
+    }
+    if total < 0.000001 {
+        strength_out[0] = 0.0
+        return 0.0
+    }
+    strength_out[0] = sqrt(sx * sx + sy * sy) / total
+    return atan2(sy, sx)
+}

@@ -1,0 +1,385 @@
+# Population activity, and the rat inspector.
+#
+# The activity panel shows all five populations at once as bar charts of the
+# selected rat's current rates, then one of them in detail as a raster over
+# time. Seeing them together is the point: it is how you notice that the
+# boundary population lit up at the same moment the place code jumped.
+#
+# Rates are drawn against each population's own configured peak rather than
+# against the running maximum. An autoscaling axis makes a silent population
+# look busy, which is exactly the wrong thing for a panel whose job is to say
+# what is firing.
+
+import "draw.flow"
+import "widgets.flow"
+import "layout.flow"
+
+extern {
+    function sin(x: f64) -> f64
+    function cos(x: f64) -> f64
+    function sqrt(x: f64) -> f64
+    function fabs(x: f64) -> f64
+    function atan2(y: f64, x: f64) -> f64
+}
+
+const BLOCK_H: i32 = 66
+const BARS_H: i32 = 44
+
+# The peak rate a population was configured with, which is the right ceiling
+# for its bar chart. Stored per cell, and uniform across cells for every
+# population here, so cell zero is representative.
+function pop_ceiling(p: ptr<Pop>) -> f64 {
+    if p.n <= 0 { return 1.0 }
+    if p.kind == POP_PLACE { return p.p3[0] }
+    if p.kind == POP_HEAD_DIR { return p.p2[0] }
+    if p.kind == POP_VELOCITY { return p.p3[0] }
+    if p.kind == POP_GRID { return p.p4[0] }
+    return p.p4[0]
+}
+
+export function view_pop_draw(c: ptr<Canvas>, u: ptr<Ui>, s: ptr<Sim>,
+                              ed: ptr<Editor>, lay: ptr<Layout>) -> void {
+    ui_panel(c, lay.pop_x, lay.pop_y, lay.pop_w, lay.pop_h,
+             "population activity")
+    let x: i32 = lay.pop_x + PAD
+    let w: i32 = lay.pop_w - PAD * 2
+    let mut y: i32 = ui_panel_body_y(lay.pop_y)
+    let rat: i32 = sim_selected(s)
+
+    for k in 0 to SIM_POP_COUNT {
+        let p: ptr<Pop> = sim_pop(s, k)
+        let selected: bool = ed.sel_pop == k
+
+        # Clicking anywhere in a block makes that population the detailed
+        # one, so the raster below always has an obvious source.
+        if ui_hit(u, x, y, w, BLOCK_H) and u.pressed and !u.consumed {
+            ed.sel_pop = k
+            u.consumed = true
+        }
+        if selected {
+            dr_rect(c, x - 4, y - 2, w + 8, BLOCK_H, C_PANEL_HI)
+            dr_rect(c, x - 4, y - 2, 2, BLOCK_H, C_ACCENT)
+        }
+
+        if ui_toggle(u, c, x, y, 92, 14, pop_short_name(p.kind), p.enabled) {
+            sim_pop_toggle(s, k)
+        }
+        dr_int_right(c, x + 128, y + 4, p.n, 1, C_DIM)
+        let tc: i32 = dr_text(c, x + 132, y + 4, "cells", 1, C_DIM)
+
+        # Peak of the moment, and where it is. The index is what you click
+        # through to in the tuning preview.
+        dr_text_right(c, x + w - 62, y + 4, "peak", 1, C_DIM)
+        dr_text_right(c, x + w, y + 4, "Hz", 1, C_DIM)
+        dr_fixed_right(c, x + w - 16, y + 4, p.last_max, 1, 1, C_TEXT)
+
+        let by: i32 = y + 18
+        dr_rect(c, x, by, w, BARS_H, rgb(16, 19, 28))
+        if p.enabled {
+            let base: i32 = pop_base(p, rat)
+            let mut col: i32 = C_ACCENT2
+            if selected { col = C_ACCENT }
+            ui_bars(c, x, by, w, BARS_H, p.rates, base, p.n,
+                    pop_ceiling(p), col)
+            # Mark the argmax so the detailed views have an anchor.
+            if p.n > 0 {
+                let ax: i32 = x + (p.last_argmax * w) / p.n
+                dr_vline(c, ax, by, by + 3, C_TEXT)
+            }
+        } else {
+            dr_text_center(c, x + w / 2, by + BARS_H / 2 - 3,
+                           "disabled", 1, C_DIM)
+        }
+        dr_frame(c, x, by, w, BARS_H, C_EDGE)
+        y = y + BLOCK_H
+    }
+
+    # Raster of the detailed population: cells down, time across, newest on
+    # the right. This is where a place field's pass through the rat's path
+    # shows up as a diagonal streak.
+    y = y + 14
+    let rh: i32 = lay.pop_y + lay.pop_h - y - PAD
+    if rh > 20 {
+        let p: ptr<Pop> = sim_pop(s, ed.sel_pop)
+        let t: i32 = dr_text(c, x, y - 12, pop_kind_name(p.kind), 1, C_LABEL)
+        dr_text_right(c, x + w, y - 12, "time ->", 1, C_DIM)
+        draw_raster(c, x, y, w, rh, p)
+        dr_frame(c, x, y, w, rh, C_EDGE)
+    }
+}
+
+# One pixel column per history sample, one row band per cell.
+#
+# When there are more cells than rows, each row takes the maximum over the
+# cells that fall in its band rather than sampling one of them. With 256
+# place cells in 140 rows, point sampling drops nearly half the population,
+# and since only a handful of place cells fire at once the ones dropped are
+# usually the only ones with anything in them: the raster comes out blank
+# while the population is plainly active. Taking the maximum is the honest
+# reduction for a plot whose question is "did anything fire here".
+function draw_raster(c: ptr<Canvas>, x: i32, y: i32, w: i32, h: i32,
+                     p: ptr<Pop>) -> void {
+    dr_rect(c, x, y, w, h, rgb(12, 14, 22))
+    if p.n <= 0 or p.hist_fill < 2 { return }
+    let mut m: f64 = pop_ceiling(p)
+    if m <= 0.0 { m = 1.0 }
+    let cols: i32 = w
+    let mut samples: i32 = p.hist_fill
+    if samples > p.hist_len { samples = p.hist_len }
+    for px in 0 to cols {
+        # Oldest at the left edge. k counts back from the newest sample.
+        let k: i32 = ((cols - 1 - px) * (samples - 1)) / (cols - 1)
+        for py in 0 to h {
+            let c0: i32 = (py * p.n) / h
+            let mut c1: i32 = ((py + 1) * p.n) / h
+            if c1 <= c0 { c1 = c0 + 1 }
+            let mut v: f64 = 0.0
+            for cell in c0 to c1 {
+                let r: f64 = pop_hist_at(p, cell, k)
+                if r > v { v = r }
+            }
+            dr_px(c, x + px, y + py, map_rate(v / m))
+        }
+    }
+}
+
+# --- rat inspector ---------------------------------------------------------
+
+export function view_rat_draw(c: ptr<Canvas>, u: ptr<Ui>, s: ptr<Sim>,
+                              ed: ptr<Editor>, lay: ptr<Layout>) -> void {
+    ui_panel(c, lay.rat_x, lay.rat_y, lay.rat_w, lay.rat_h, "rat inspector")
+    let x: i32 = lay.rat_x + PAD
+    # Fixed columns: row two is the whole window wide, and a key-value row
+    # stretched across it puts the label and its number too far apart to read
+    # as a pair.
+    let w: i32 = COLW
+    let mut y: i32 = ui_panel_body_y(lay.rat_y)
+    let i: i32 = sim_selected(s)
+    if s.agents.n == 0 {
+        let t: i32 = dr_text(c, x, y, "no rats", 1, C_DIM)
+        return
+    }
+
+    let col: i32 = C_ACCENT
+    dr_disc(c, x + 4, y + 3, 4, col)
+    let idt: i32 = dr_text(c, x + 14, y, "rat", 1, C_LABEL)
+    let idn: i32 = dr_int(c, x + 34, y, i, 1, C_TEXT)
+    dr_text_right(c, x + w, y, "of", 1, C_DIM)
+    dr_int_right(c, x + w - 20, y, s.agents.n, 1, C_DIM)
+    y = y + 14
+
+    # A polar plot of the ray fan on the right, with the state readings on
+    # the left. The fan is what the boundary cells read, so showing it next
+    # to their summary makes the link visible.
+    # The fan sits in its own column rather than inside the first one.
+    let plot: i32 = 132
+    let px: i32 = ui_col(x, 1)
+    let fan_y: i32 = y
+    draw_fan(c, px, fan_y, plot, &s.agents, i)
+
+    let lw: i32 = w
+    ui_kv_fixed(c, x, y, lw, "x", s.agents.x[i], 3, C_TEXT)
+    y = y + 11
+    ui_kv_fixed(c, x, y, lw, "y", s.agents.y[i], 3, C_TEXT)
+    y = y + 11
+    ui_kv_fixed(c, x, y, lw, "body heading", s.agents.heading[i], 3, C_TEXT)
+    y = y + 11
+    ui_kv_fixed(c, x, y, lw, "head direction",
+                agents_head_dir(&s.agents, i), 3, C_TEXT)
+    y = y + 11
+    ui_kv_fixed(c, x, y, lw, "head off body", s.agents.head_angle[i], 3,
+                C_DIM)
+    y = y + 11
+    ui_kv_fixed(c, x, y, lw, "speed", s.agents.speed[i], 3, C_TEXT)
+    y = y + 11
+    ui_kv_fixed(c, x, y, lw, "ang vel", s.agents.ang_vel[i], 3, C_TEXT)
+    y = y + 11
+    ui_kv_fixed(c, x, y, lw, "accel", s.agents.accel[i], 2, C_TEXT)
+    y = y + 11
+    ui_kv_fixed(c, x, y, lw, "path", s.agents.distance[i], 2, C_TEXT)
+    y = y + 16
+
+    let sh: i32 = dr_text(c, x, y, "sensed", 1, C_LABEL)
+    y = y + 12
+    ui_kv_fixed(c, x, y, w, "wall distance", s.agents.wall_dist[i], 3, C_TEXT)
+    y = y + 11
+    let bearing: f64 = atan2(-s.agents.wall_ny[i], -s.agents.wall_nx[i])
+    ui_kv_fixed(c, x, y, w, "wall bearing", bearing, 3, C_TEXT)
+    y = y + 11
+    if s.agents.cue_idx[i] >= 0 {
+        ui_kv_fixed(c, x, y, w, "nearest cue", s.agents.cue_dist[i], 3, C_TEXT)
+    } else {
+        ui_kv_text(c, x, y, w, "nearest cue", "none visible", C_DIM)
+    }
+    y = y + 11
+    if s.agents.zone_reward[i] >= 0 {
+        ui_kv_text(c, x, y, w, "reward zone", "in", C_GOOD)
+    } else {
+        ui_kv_text(c, x, y, w, "reward zone", "out", C_DIM)
+    }
+    y = y + 16
+
+    # Third column: what the populations recover, against the truth beside it.
+    let dx: i32 = ui_col(x, 2)
+    let mut y2: i32 = ui_panel_body_y(lay.rat_y) + 14
+    let nh: i32 = dr_text(c, dx, y2, "decoded", 1, C_LABEL)
+    y2 = y2 + 12
+    let perr: f64 = sim_place_error(s)
+    let mut pc: i32 = C_GOOD
+    if perr > 0.08 { pc = C_WARN }
+    if perr > 0.2 { pc = C_BAD }
+    if perr < 0.0 { pc = C_DIM }
+    ui_kv_fixed(c, dx, y2, w, "place error m", perr, 4, pc)
+    y2 = y2 + 11
+    let herr: f64 = sim_hd_error(s)
+    let mut hc: i32 = C_GOOD
+    if herr > 0.15 { hc = C_WARN }
+    if herr > 0.5 { hc = C_BAD }
+    ui_kv_fixed(c, dx, y2, w, "head dir error rad", herr, 4, hc)
+    y2 = y2 + 11
+    ui_kv_fixed(c, dx, y2, w, "decoded speed",
+                velocity_decode_speed(&s.vel, i), 3, C_TEXT)
+    y2 = y2 + 11
+    ui_kv_fixed(c, dx, y2, w, "ring error rad", sim_ring_error(s), 3, C_TEXT)
+
+    # Fourth column: what the rat wants, and how the colony is doing.
+    let fx: i32 = ui_col(x, 3)
+    let mut y3: i32 = ui_panel_body_y(lay.rat_y) + 14
+    let fh: i32 = dr_text(c, fx, y3, "state", 1, C_LABEL)
+    y3 = y3 + 12
+
+    let hunger: f64 = s.agents.hunger[i]
+    let mut hung_c: i32 = C_GOOD
+    if hunger > 0.5 { hung_c = C_WARN }
+    if hunger > 0.85 { hung_c = C_BAD }
+    ui_kv_fixed(c, fx, y3, w, "hunger", hunger, 3, hung_c)
+    y3 = y3 + 11
+    ui_bar(c, fx, y3, w, 6, hunger, hung_c)
+    y3 = y3 + 12
+    let thirst: f64 = s.agents.thirst[i]
+    let mut thr_c: i32 = C_GOOD
+    if thirst > 0.5 { thr_c = C_WARN }
+    if thirst > 0.85 { thr_c = C_BAD }
+    ui_kv_fixed(c, fx, y3, w, "thirst", thirst, 3, thr_c)
+    y3 = y3 + 11
+    ui_bar(c, fx, y3, w, 6, thirst, thr_c)
+    y3 = y3 + 12
+    # Which of the two has the animal. This is the choice the drives make,
+    # and it is the one line that says what the rat is currently about.
+    let kind: i32 = s.agents.supply_kind[i]
+    if kind == ZONE_WATER {
+        ui_kv_text(c, fx, y3, w, "going for", "water", rgb(120, 190, 220))
+    } else {
+        if kind == ZONE_REWARD {
+            ui_kv_text(c, fx, y3, w, "going for", "food", rgb(214, 176, 96))
+        } else {
+            ui_kv_text(c, fx, y3, w, "going for", "nothing in particular",
+                       C_DIM)
+        }
+    }
+    y3 = y3 + 12
+    ui_kv_fixed(c, fx, y3, w, "eaten", s.agents.eaten[i], 2, C_TEXT)
+    y3 = y3 + 11
+    ui_kv_fixed(c, fx, y3, w, "drunk", s.agents.drunk[i], 2, C_TEXT)
+    y3 = y3 + 11
+    ui_kv_fixed(c, fx, y3, w, "carrying", s.agents.carrying[i], 2, C_TEXT)
+    y3 = y3 + 16
+
+    let ch: i32 = dr_text(c, fx, y3, "colony", 1, C_LABEL)
+    y3 = y3 + 12
+    let food: f64 = env_food_remaining(&s.env)
+    let cap: f64 = env_food_capacity(&s.env)
+    let mut fc2: i32 = C_GOOD
+    if cap > 0.0 and food < cap * 0.25 { fc2 = C_WARN }
+    if food <= 0.0 { fc2 = C_BAD }
+    ui_kv_fixed(c, fx, y3, w, "food in arena", food, 2, fc2)
+    y3 = y3 + 11
+    if cap > 0.0 {
+        ui_bar(c, fx, y3, w, 6, food / cap, fc2)
+    } else {
+        dr_text(c, fx, y3, "no food placed", 1, C_DIM)
+    }
+    y3 = y3 + 12
+    ui_kv_fixed(c, fx, y3, w, "eaten by all",
+                agents_total_eaten(&s.agents), 2, C_TEXT)
+    y3 = y3 + 11
+    let water: f64 = env_water_remaining(&s.env)
+    let wcap: f64 = env_water_capacity(&s.env)
+    let mut wc2: i32 = C_GOOD
+    if wcap > 0.0 and water < wcap * 0.25 { wc2 = C_WARN }
+    if water <= 0.0 { wc2 = C_BAD }
+    ui_kv_fixed(c, fx, y3, w, "water in arena", water, 2, wc2)
+    y3 = y3 + 11
+    if wcap > 0.0 {
+        ui_bar(c, fx, y3, w, 6, water / wcap, wc2)
+    } else {
+        dr_text(c, fx, y3, "no water placed", 1, C_DIM)
+    }
+    y3 = y3 + 12
+    ui_kv_fixed(c, fx, y3, w, "mean hunger",
+                agents_mean_hunger(&s.agents), 3, C_TEXT)
+    y3 = y3 + 11
+    ui_kv_fixed(c, fx, y3, w, "mean thirst",
+                agents_mean_thirst(&s.agents), 3, C_TEXT)
+    y3 = y3 + 11
+    # How the colony is split between the two drives right now.
+    let mut on_food: i32 = 0
+    let mut on_water: i32 = 0
+    let mut starving: i32 = 0
+    for k in 0 to s.agents.n {
+        if s.agents.supply_kind[k] == ZONE_REWARD { on_food = on_food + 1 }
+        if s.agents.supply_kind[k] == ZONE_WATER { on_water = on_water + 1 }
+        if s.agents.hunger[k] > 0.9 or s.agents.thirst[k] > 0.9 {
+            starving = starving + 1
+        }
+    }
+    ui_kv_int(c, fx, y3, w, "after food", on_food, rgb(214, 176, 96))
+    y3 = y3 + 11
+    ui_kv_int(c, fx, y3, w, "after water", on_water, rgb(120, 190, 220))
+    y3 = y3 + 11
+    let mut sc: i32 = C_DIM
+    if starving > 0 { sc = C_BAD }
+    ui_kv_int(c, fx, y3, w, "in real need", starving, sc)
+    y3 = y3 + 11
+    ui_kv_int(c, fx, y3, w, "scans at forks",
+              agents_total_scans(&s.agents), C_DIM)
+}
+
+# Polar plot of the ray fan. Straight ahead is up, which matches the way the
+# rat is drawn in the arena when it is heading north and keeps the mapping
+# between the two views obvious.
+function draw_fan(c: ptr<Canvas>, x: i32, y: i32, size: i32,
+                  a: ptr<Agents>, i: i32) -> void {
+    let cx: i32 = x + size / 2
+    let cy: i32 = y + size / 2
+    let rad: i32 = size / 2 - 2
+    dr_rect(c, x, y, size, size, rgb(14, 17, 26))
+    dr_circle(c, cx, cy, rad, C_EDGE)
+    dr_circle(c, cx, cy, rad / 2, rgb(30, 34, 46))
+
+    # Scale to the longest ray so the shape of the fan is readable in a
+    # corridor as well as in an open arena.
+    let mut m: f64 = 0.001
+    for r in 0 to RAY_COUNT {
+        let d: f64 = agents_ray(a, i, r)
+        if d < GEO_FAR and d > m { m = d }
+    }
+    let step: f64 = TAU / (RAY_COUNT as f64)
+    let mut px: i32 = cx
+    let mut py: i32 = cy
+    for r in 0 to RAY_COUNT + 1 {
+        let idx: i32 = r % RAY_COUNT
+        let mut d: f64 = agents_ray(a, i, idx)
+        if d >= GEO_FAR { d = m }
+        let f: f64 = d / m
+        # Ray 0 points along the heading, drawn upward.
+        let ang: f64 = (idx as f64) * step + HALF_PI
+        let ex: i32 = cx + ((cos(ang) * f * (rad as f64)) as i32)
+        let ey: i32 = cy - ((sin(ang) * f * (rad as f64)) as i32)
+        if r > 0 { dr_line(c, px, py, ex, ey, rgb(120, 190, 210)) }
+        px = ex
+        py = ey
+    }
+    dr_disc(c, cx, cy, 2, C_ACCENT)
+    dr_text_center(c, cx, y + size + 2, "ray fan", 1, C_DIM)
+}

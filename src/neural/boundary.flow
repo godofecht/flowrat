@@ -1,0 +1,159 @@
+# Boundary vector cells.
+#
+# A BVC fires when a wall is at a preferred distance in a preferred
+# direction. The Hartley model writes the rate as an integral around the
+# animal of the boundary's presence, weighted by a Gaussian in distance and a
+# Gaussian in bearing. The ray fan already cached on the agents is the
+# discretisation of that integral, so this population is a sum over the fan:
+#
+#   rate = peak * sum_r  exp( -(d_r - d_pref)^2 / (2 sigma_d^2) )
+#                      * exp( -(phi_r - phi_pref)^2 / (2 sigma_a^2) )
+#                      * dphi
+#
+# with the sum normalised so that the peak rate is reached when a wall sits
+# exactly at the preferred distance and bearing.
+#
+# The distance tuning of a real BVC broadens with distance, which is what
+# makes far-field cells vague and near-field cells sharp. That is kept:
+#
+#   sigma_d = sigma0 * (1 + d_pref / beta)
+#
+# ALLOCENTRIC OR EGOCENTRIC
+#   Classic BVCs are allocentric: the preferred bearing is fixed in the room.
+#   Egocentric boundary cells use a bearing relative to the head. Both are
+#   real cell types and the difference is one addition, so both are provided
+#   and chosen by a flag. The ray fan is stored relative to the heading, so
+#   the egocentric case is the direct read and the allocentric case rotates
+#   the fan's bearings by the heading before comparing.
+#
+# PROPERTIES
+#   p0  preferred bearing, radians
+#   p1  preferred distance, metres
+#   p2  sigma in distance at this preferred distance
+#   p3  sigma in bearing, radians
+#   p4  peak rate in Hz
+
+extern {
+    function exp(x: f64) -> f64
+    function sqrt(x: f64) -> f64
+    function fabs(x: f64) -> f64
+}
+
+export struct BoundaryParams {
+    n_bearings: i32,
+    n_distances: i32,
+    min_distance: f64,
+    max_distance: f64,
+    sigma0: f64,
+    # Distance at which the radial tuning width has doubled.
+    beta: f64,
+    sigma_angle: f64,
+    peak_rate: f64,
+    allocentric: bool,
+}
+
+export function boundary_params_default() -> BoundaryParams {
+    return BoundaryParams {
+        n_bearings: 12,
+        n_distances: 4,
+        min_distance: 0.06,
+        max_distance: 0.7,
+        sigma0: 0.055,
+        beta: 0.9,
+        sigma_angle: 0.32,
+        peak_rate: 20.0,
+        allocentric: true
+    }
+}
+
+# Cells tile the (bearing, distance) grid. n is expected to be
+# n_bearings * n_distances; any remainder wraps around the same grid, which
+# keeps the population valid at any cell count the UI allows.
+export function boundary_configure(p: ptr<Pop>,
+                                   bp: ptr<BoundaryParams>) -> void {
+    let mut nb: i32 = bp.n_bearings
+    let mut nd: i32 = bp.n_distances
+    if nb < 1 { nb = 1 }
+    if nd < 1 { nd = 1 }
+    let bstep: f64 = TAU / (nb as f64)
+    for c in 0 to p.n {
+        let bi: i32 = c % nb
+        let di: i32 = (c / nb) % nd
+        let dfrac: f64 = ((di as f64) + 0.5) / (nd as f64)
+        let dpref: f64 = bp.min_distance
+                         + dfrac * (bp.max_distance - bp.min_distance)
+        p.p0[c] = wrap_pi((bi as f64) * bstep)
+        p.p1[c] = dpref
+        p.p2[c] = bp.sigma0 * (1.0 + dpref / bp.beta)
+        p.p3[c] = bp.sigma_angle
+        p.p4[c] = bp.peak_rate
+    }
+    p.revision = p.revision + 1
+}
+
+# Rate of one cell given a full ray fan. `heading` is added to each ray's
+# bearing for the allocentric case and ignored otherwise.
+export function boundary_rate_from_fan(p: ptr<Pop>, cell: i32,
+                                       rays: ptr<f64>, base: i32,
+                                       heading: f64,
+                                       allocentric: bool) -> f64 {
+    let step: f64 = TAU / (RAY_COUNT as f64)
+    let dpref: f64 = p.p1[cell]
+    let sd: f64 = p.p2[cell]
+    let sa: f64 = p.p3[cell]
+    let bpref: f64 = p.p0[cell]
+    let mut acc: f64 = 0.0
+    let mut norm: f64 = 0.0
+    for r in 0 to RAY_COUNT {
+        let mut bearing: f64 = (r as f64) * step
+        if allocentric { bearing = bearing + heading }
+        let da: f64 = angle_delta(bpref, bearing)
+        # Bearings more than three sigma away contribute under 1% and are
+        # skipped; with 16 rays and a 0.32 rad width that removes most of
+        # the fan from the inner loop.
+        if fabs(da) < 3.0 * sa {
+            let wa: f64 = exp(-da * da / (2.0 * sa * sa))
+            let dd: f64 = rays[base + r] - dpref
+            let wd: f64 = exp(-dd * dd / (2.0 * sd * sd))
+            acc = acc + wa * wd
+            norm = norm + wa
+        }
+    }
+    if norm < 0.000001 { return 0.0 }
+    # Normalising by the angular weight makes the peak rate mean the same
+    # thing at every bearing, whatever the fan resolution happens to be.
+    return p.p4[cell] * acc / norm
+}
+
+export function boundary_update(p: ptr<Pop>, a: ptr<Agents>,
+                                bp: ptr<BoundaryParams>) -> void {
+    if !p.enabled { return }
+    let allo: bool = bp.allocentric
+    parallel for r in 0 to a.n {
+        let obase: i32 = r * p.n
+        let rbase: i32 = r * RAY_COUNT
+        # The fan is cast from the head, so the allocentric bearing of ray r
+        # is the head's direction plus the ray's offset. Passing the body's
+        # heading here would rotate every preferred bearing by however far
+        # the animal happened to be looking.
+        let h: f64 = agents_head_dir(a, r)
+        for c in 0 to p.n {
+            p.rates[obase + c] = boundary_rate_from_fan(p, c, a.rays, rbase,
+                                                        h, allo)
+        }
+    }
+}
+
+# Rate of one cell at an arbitrary place in the arena, by casting a fresh
+# fan. Slower than the cached path and used only for the tuning preview,
+# which evaluates one cell over a grid of positions.
+export function boundary_rate_at(p: ptr<Pop>, cell: i32, e: ptr<Env>,
+                                 x: f64, y: f64, heading: f64,
+                                 allocentric: bool,
+                                 scratch: ptr<f64>) -> f64 {
+    let step: f64 = TAU / (RAY_COUNT as f64)
+    for r in 0 to RAY_COUNT {
+        scratch[r] = env_ray_distance(e, x, y, heading + (r as f64) * step)
+    }
+    return boundary_rate_from_fan(p, cell, scratch, 0, heading, allocentric)
+}

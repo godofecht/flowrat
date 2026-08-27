@@ -1,0 +1,426 @@
+# The ethogram: what the colony spends its time doing.
+#
+# This is the first panel in FlowRat that measures behaviour rather than
+# mechanism, and the first number in it that can be held against a published
+# one. An open-field rat that is fed and in a familiar arena spends roughly
+# half its time moving, with rearing, grooming and resting taking up most of
+# the rest. If the time budget here says something else, either the model is
+# wrong or the arena is telling the animal something.
+#
+# Three views of the same record: how the time divides, how long the bouts
+# are, and what everyone is doing at this instant.
+
+import "draw.flow"
+import "widgets.flow"
+import "layout.flow"
+
+extern {
+    function log(x: f64) -> f64
+}
+
+# One colour per behaviour, used by the budget bar, the histograms and the
+# live counts, so a state is the same colour everywhere it appears.
+export function state_colour(st: i32) -> i32 {
+    if st == ST_FORAGE { return rgb(214, 176, 96) }
+    if st == ST_EAT { return rgb(240, 214, 150) }
+    if st == ST_DRINK { return rgb(120, 190, 220) }
+    if st == ST_GROOM { return rgb(190, 150, 210) }
+    if st == ST_REAR { return rgb(140, 200, 150) }
+    if st == ST_REST { return rgb(96, 112, 150) }
+    if st == ST_HOME { return rgb(226, 138, 110) }
+    return rgb(90, 140, 175)
+}
+
+export function view_etho_draw(c: ptr<Canvas>, u: ptr<Ui>, s: ptr<Sim>,
+                               d: ptr<Defaults>, ed: ptr<Editor>,
+                               lay: ptr<Layout>) -> void {
+    ui_panel(c, lay.etho_x, lay.etho_y, lay.etho_w, lay.etho_h,
+             "ethogram")
+    let x0: i32 = lay.etho_x + PAD
+    let top: i32 = ui_panel_body_y(lay.etho_y)
+    let w: i32 = COLW
+
+    if !s.behaviour.enabled {
+        dr_text_center(c, lay.etho_x + lay.etho_w / 2,
+                       lay.etho_y + lay.etho_h / 2 - 6,
+                       "the behavioural state machine is off", 1, C_DIM)
+        dr_text_center(c, lay.etho_x + lay.etho_w / 2,
+                       lay.etho_y + lay.etho_h / 2 + 8,
+                       "every rat is simply exploring, so there is no budget to show",
+                       1, C_DIM)
+        return
+    }
+
+    draw_budget(c, s, x0, top, w)
+    draw_bouts(c, s, ui_col(x0, 1), top, w)
+    # Under the bout histogram, which leaves it room and puts it in the tab
+    # that shows what it changes. See the note in view_sys.flow: the control
+    # panel is the run controls, and a parameter that shapes one behaviour
+    # lives beside that behaviour.
+    draw_social(c, u, s, d, ui_col(x0, 1), top + BOUTS_H, w)
+    draw_now(c, s, ed, ui_col(x0, 2), top, w, lay)
+    # The fourth column is memory: the controls, then what the selected rat
+    # actually holds. They belong together, and the control panel had no room
+    # left for either.
+    let mx: i32 = ui_col(x0, 3)
+    if mx + w <= lay.etho_x + lay.etho_w - PAD {
+        draw_memory(c, u, s, d, ed, mx, top, w)
+    }
+}
+
+# --- memory: the controls, and what the rat is holding -----------------------
+
+function draw_memory(c: ptr<Canvas>, u: ptr<Ui>, s: ptr<Sim>,
+                     d: ptr<Defaults>, ed: ptr<Editor>, x: i32, y: i32,
+                     w: i32) -> void {
+    let t: i32 = dr_text(c, x, y, "memory", 1, C_LABEL)
+    dr_int_right(c, x + w, y, agents_total_notes(&s.agents), 1, C_DIM)
+    let mut ry: i32 = y + 14
+
+    # Turning this off is the control condition for the whole feature: the
+    # rats fall back to walking toward food they can see, which is what they
+    # did before, and in an arena with a wall across it they mostly fail.
+    if ui_toggle(u, c, x, ry, w, 15, "remembers where food was",
+                 s.memory.enabled) {
+        s.memory.enabled = !s.memory.enabled
+    }
+    ry = ry + 19
+    let mut ch: bool = ui_slider(u, c, x, ry, w, 14, "forgetting /s",
+                                 &s.memory.decay, 0.0, 0.2, d.memory.decay, 3)
+    ry = ry + 17
+    ch = ui_slider(u, c, x, ry, w, 14, "worth walking to",
+                   &s.memory.usable, 0.0, 0.9, d.memory.usable, 2)
+    ry = ry + 17
+    ch = ui_slider(u, c, x, ry, w, 14, "homing drift",
+                   &s.memory.home_drift, 0.0, 0.3, d.memory.home_drift, 3)
+    ry = ry + 17
+    ch = ui_slider(u, c, x, ry, w, 14, "smells nest from m",
+                   &s.memory.home_sense, 0.02, 0.5, d.memory.home_sense, 2)
+    ry = ry + 21
+
+    ry = ry + 6
+    let nh: i32 = dr_text(c, x, ry, "novelty", 1, C_LABEL)
+    if s.agents.n > 0 {
+        dr_fixed_right(c, x + w, ry,
+                       novelty_mean(&s.agents, &s.env, sim_selected(s)),
+                       2, 1, C_DIM)
+    }
+    ry = ry + 14
+    if ui_toggle(u, c, x, ry, w, 15, "learns the room",
+                 s.novelty.enabled) {
+        s.novelty.enabled = !s.novelty.enabled
+    }
+    ry = ry + 19
+    let mut nc: bool = ui_slider(u, c, x, ry, w, 14, "hugs a new wall",
+                                 &s.novelty.wall_hug, 0.0, 6.0,
+                                 d.novelty.wall_hug, 1)
+    ry = ry + 17
+    nc = ui_slider(u, c, x, ry, w, 14, "heads for the unknown",
+                   &s.novelty.seek_new, 0.0, 3.0, d.novelty.seek_new, 2)
+    ry = ry + 17
+    nc = ui_slider(u, c, x, ry, w, 14, "forgets a place /s",
+                   &s.novelty.decay, 0.0, 0.02, d.novelty.decay, 4)
+    ry = ry + 21
+
+    if s.agents.n > 0 {
+        draw_knowledge(c, s, sim_selected(s), x, ry, w)
+    }
+}
+
+# --- the time budget --------------------------------------------------------
+
+function draw_budget(c: ptr<Canvas>, s: ptr<Sim>, x: i32, y: i32,
+                     w: i32) -> void {
+    let t: i32 = dr_text(c, x, y, "time budget", 1, C_LABEL)
+    dr_fixed_right(c, x + w, y, s.etho.elapsed, 1, 1, C_DIM)
+    let mut ry: i32 = y + 13
+
+    # One stacked bar, which is how a budget is usually drawn and which makes
+    # the proportions readable without comparing numbers.
+    let bar_h: i32 = 16
+    dr_rect(c, x, ry, w, bar_h, rgb(16, 19, 28))
+    let mut px: i32 = x
+    for st in 0 to ST_COUNT {
+        let f: f64 = ethogram_fraction(&s.etho, st)
+        let seg: i32 = ((w as f64) * f) as i32
+        if seg > 0 {
+            dr_rect(c, px, ry, seg, bar_h, state_colour(st))
+            px = px + seg
+        }
+    }
+    dr_frame(c, x, ry, w, bar_h, C_EDGE)
+    ry = ry + bar_h + 8
+
+    dr_text(c, x, ry, "state", 1, C_DIM)
+    dr_text_right(c, x + w - 96, ry, "share", 1, C_DIM)
+    dr_text_right(c, x + w - 46, ry, "bouts", 1, C_DIM)
+    dr_text_right(c, x + w, ry, "mean s", 1, C_DIM)
+    ry = ry + 12
+
+    for st in 0 to ST_COUNT {
+        let f: f64 = ethogram_fraction(&s.etho, st)
+        # A state that has never happened is shown dim rather than hidden, so
+        # its absence is visible: a rat that never rests is a finding.
+        let mut col: i32 = C_TEXT
+        if f <= 0.0 { col = C_DIM }
+        dr_rect(c, x, ry + 1, 6, 6, state_colour(st))
+        dr_text(c, x + 10, ry, state_name(st), 1, col)
+        dr_fixed_right(c, x + w - 96, ry, f * 100.0, 1, 1, col)
+        dr_int_right(c, x + w - 46, ry, s.etho.bouts[st], 1, col)
+        dr_fixed_right(c, x + w, ry, ethogram_mean_bout(&s.etho, st), 2, 1,
+                       col)
+        ry = ry + 11
+    }
+
+    ry = ry + 8
+    let loco: f64 = ethogram_fraction(&s.etho, ST_EXPLORE)
+                    + ethogram_fraction(&s.etho, ST_FORAGE)
+                    + ethogram_fraction(&s.etho, ST_HOME)
+    let upkeep: f64 = ethogram_fraction(&s.etho, ST_GROOM)
+                      + ethogram_fraction(&s.etho, ST_REAR)
+                      + ethogram_fraction(&s.etho, ST_REST)
+    ui_kv_fixed(c, x, ry, w, "locomotion %", loco * 100.0, 1, C_TEXT)
+    ry = ry + 11
+    ui_kv_fixed(c, x, ry, w, "upkeep %", upkeep * 100.0, 1, C_TEXT)
+    ry = ry + 11
+    ui_kv_fixed(c, x, ry, w, "consuming %",
+                (ethogram_fraction(&s.etho, ST_EAT)
+                 + ethogram_fraction(&s.etho, ST_DRINK)) * 100.0, 1, C_TEXT)
+    ry = ry + 15
+    dr_text(c, x, ry, "a fed rat in a familiar arena runs", 1, C_DIM)
+    ry = ry + 10
+    dr_text(c, x, ry, "near half its time in locomotion", 1, C_DIM)
+}
+
+# --- bout lengths -----------------------------------------------------------
+
+function draw_bouts(c: ptr<Canvas>, s: ptr<Sim>, x: i32, y: i32,
+                    w: i32) -> void {
+    let t: i32 = dr_text(c, x, y, "bout lengths", 1, C_LABEL)
+    dr_text_right(c, x + w, y, "log seconds", 1, C_DIM)
+    let mut ry: i32 = y + 13
+
+    # One row per state, bins across. The axis is log spaced because bouts
+    # run from a third of a second to half a minute, and a linear axis would
+    # put every rearing bout in the first bin.
+    let row_h: i32 = 16
+    for st in 0 to ST_COUNT {
+        dr_rect(c, x, ry + 4, 6, 6, state_colour(st))
+        dr_text(c, x + 10, ry + 3, state_name(st), 1, C_DIM)
+
+        let hx: i32 = x + 62
+        let hw: i32 = w - 62
+        dr_rect(c, hx, ry, hw, row_h - 2, rgb(16, 19, 28))
+        let mut peak: i32 = 1
+        for b in 0 to BOUT_BINS {
+            let v: i32 = ethogram_hist_at(&s.etho, st, b)
+            if v > peak { peak = v }
+        }
+        for b in 0 to BOUT_BINS {
+            let v: i32 = ethogram_hist_at(&s.etho, st, b)
+            if v > 0 {
+                let bx0: i32 = hx + (b * hw) / BOUT_BINS
+                let mut bx1: i32 = hx + ((b + 1) * hw) / BOUT_BINS
+                if bx1 <= bx0 { bx1 = bx0 + 1 }
+                let bh: i32 = ((v as f64) / (peak as f64)
+                               * ((row_h - 4) as f64)) as i32
+                if bh > 0 {
+                    dr_rect(c, bx0, ry + row_h - 2 - bh, bx1 - bx0 - 1, bh,
+                            state_colour(st))
+                }
+            }
+        }
+        ry = ry + row_h
+    }
+
+    # Axis ticks at the decade boundaries the bins span.
+    let hx: i32 = x + 62
+    let hw: i32 = w - 62
+    for b in 0 to BOUT_BINS {
+        let edge: f64 = bout_bin_edge(b)
+        if b % 4 == 0 {
+            let bx: i32 = hx + (b * hw) / BOUT_BINS
+            dr_vline(c, bx, ry, ry + 2, C_DIM)
+            let tw: i32 = dr_fixed(c, bx - 4, ry + 4, edge, 1, 1, C_DIM)
+        }
+    }
+}
+
+# --- what is happening right now --------------------------------------------
+
+function draw_now(c: ptr<Canvas>, s: ptr<Sim>, ed: ptr<Editor>,
+                  x: i32, y: i32, w: i32, lay: ptr<Layout>) -> void {
+    let t: i32 = dr_text(c, x, y, "right now", 1, C_LABEL)
+    dr_int_right(c, x + w, y, s.agents.n, 1, C_DIM)
+    let mut ry: i32 = y + 13
+
+    # How the batch divides at this instant, which moves while the budget
+    # above accumulates. A colony all doing one thing is worth noticing.
+    let bar_h: i32 = 12
+    dr_rect(c, x, ry, w, bar_h, rgb(16, 19, 28))
+    if s.agents.n > 0 {
+        let mut px: i32 = x
+        for st in 0 to ST_COUNT {
+            let n: i32 = agents_count_state(&s.agents, st)
+            let seg: i32 = (w * n) / s.agents.n
+            if seg > 0 {
+                dr_rect(c, px, ry, seg, bar_h, state_colour(st))
+                px = px + seg
+            }
+        }
+    }
+    dr_frame(c, x, ry, w, bar_h, C_EDGE)
+    ry = ry + bar_h + 8
+
+    for st in 0 to ST_COUNT {
+        let n: i32 = agents_count_state(&s.agents, st)
+        let mut col: i32 = C_TEXT
+        if n == 0 { col = C_DIM }
+        dr_rect(c, x, ry + 1, 6, 6, state_colour(st))
+        dr_text(c, x + 10, ry, state_name(st), 1, col)
+        dr_int_right(c, x + w, ry, n, 1, col)
+        ry = ry + 11
+    }
+    ry = ry + 10
+
+    let i: i32 = sim_selected(s)
+    if s.agents.n == 0 { return }
+    let sh: i32 = dr_text(c, x, ry, "the selected rat", 1, C_LABEL)
+    ry = ry + 13
+    let st: i32 = s.agents.state[i]
+    dr_rect(c, x, ry + 1, 6, 6, state_colour(st))
+    dr_text(c, x + 10, ry, "doing", 1, C_LABEL)
+    dr_text_right(c, x + w, ry, state_name(st), 1, state_colour(st))
+    ry = ry + 12
+    ui_kv_fixed(c, x, ry, w, "for", s.agents.state_elapsed[i], 2, C_TEXT)
+    ry = ry + 11
+    if s.agents.state_timer[i] > 0.0 {
+        ui_kv_fixed(c, x, ry, w, "bout has left", s.agents.state_timer[i], 2,
+                    C_TEXT)
+    } else {
+        ui_kv_text(c, x, ry, w, "bout has left", "until something changes",
+                   C_DIM)
+    }
+    ry = ry + 11
+    ui_kv_fixed(c, x, ry, w, "hunger", s.agents.hunger[i], 3, C_TEXT)
+    ry = ry + 11
+    if s.agents.food_target[i] >= 0 {
+        ui_kv_int(c, x, ry, w, "patch in mind", s.agents.food_target[i],
+                  C_TEXT)
+    } else {
+        ui_kv_text(c, x, ry, w, "patch in mind", "none", C_DIM)
+    }
+}
+
+# --- what the rat knows that it cannot see ----------------------------------
+
+# Two readouts that answer different questions. The notes say what the rat
+# remembers about food and how sure it still is. The home vector says where it
+# thinks the nest is, and next to it the truth, so the drift is a number on
+# the screen rather than a claim in a comment.
+function draw_knowledge(c: ptr<Canvas>, s: ptr<Sim>, i: i32, x: i32, y: i32,
+                        w: i32) -> void {
+    let hd: i32 = dr_text(c, x, y, "what it knows", 1, C_LABEL)
+    let mut ry: i32 = y + 13
+
+    if !s.memory.enabled {
+        dr_text(c, x, ry, "memory is off, so it only knows", 1, C_DIM)
+        dr_text(c, x, ry + 10, "what it can see right now", 1, C_DIM)
+        return
+    }
+
+    let held: i32 = memory_count(&s.agents, i)
+    ui_kv_int(c, x, ry, w, "patches remembered", held, C_TEXT)
+    ry = ry + 12
+
+    for k in 0 to MEM_SLOTS {
+        let patch: i32 = memory_patch_at(&s.agents, i, k)
+        if patch < 0 {
+            dr_text(c, x, ry, "-", 1, C_DIM)
+            dr_text_right(c, x + w, ry, "empty", 1, C_DIM)
+        } else {
+            let conf: f64 = memory_conf_at(&s.agents, i, k)
+            # The bar is the confidence, so a note fading is visible without
+            # reading the number off it.
+            let bw: i32 = ((w as f64) * 0.45) as i32
+            let bx: i32 = x + w - bw
+            dr_rect(c, bx, ry + 1, bw, 6, rgb(16, 19, 28))
+            let fillw: i32 = ((bw as f64) * conf) as i32
+            if fillw > 0 {
+                dr_rect(c, bx, ry + 1, fillw, 6, state_colour(ST_FORAGE))
+            }
+            dr_frame(c, bx, ry + 1, bw, 6, C_EDGE)
+            let t2: i32 = dr_text(c, x, ry, "patch", 1, C_TEXT)
+            let t3: i32 = dr_int(c, x + 32, ry, patch, 1, C_TEXT)
+            dr_fixed_right(c, bx - 6, ry, conf, 2, 1, C_TEXT)
+        }
+        ry = ry + 10
+    }
+
+    ry = ry + 6
+    let hh: i32 = dr_text(c, x, ry, "the way home", 1, C_LABEL)
+    ry = ry + 13
+    ui_kv_fixed(c, x, ry, w, "reckoned distance",
+                homing_distance(&s.agents, i), 3, C_TEXT)
+    ry = ry + 11
+    ui_kv_fixed(c, x, ry, w, "reckoned bearing",
+                homing_bearing(&s.agents, i), 3, C_TEXT)
+    ry = ry + 11
+
+    let mut nx: f64 = 0.0
+    let mut ny: f64 = 0.0
+    if sim_nest(s, &nx, &ny) {
+        let truth: f64 = dist(s.agents.x[i], s.agents.y[i], nx, ny)
+        ui_kv_fixed(c, x, ry, w, "true distance", truth, 3, C_DIM)
+        ry = ry + 11
+        let err: f64 = homing_error(&s.agents, i, nx, ny)
+        # Coloured by how wrong it is against the radius within which the rat
+        # accepts that it is home. Beyond that the estimate has stopped being
+        # good enough to walk on.
+        let mut col: i32 = C_TEXT
+        if err > nest_reach(&s.env, &s.memory) { col = rgb(226, 138, 110) }
+        ui_kv_fixed(c, x, ry, w, "drift", err, 3, col)
+        ry = ry + 11
+        ui_kv_fixed(c, x, ry, w, "distance walked",
+                    s.agents.distance[i], 2, C_DIM)
+    } else {
+        ui_kv_text(c, x, ry, w, "true distance", "no nest in this arena",
+                   C_DIM)
+    }
+}
+
+# How tall the bout histogram is, so what goes under it knows where to start.
+const BOUTS_H: i32 = 13 + ST_COUNT * 16 + 18
+
+# --- the other rats ---------------------------------------------------------
+
+function draw_social(c: ptr<Canvas>, u: ptr<Ui>, s: ptr<Sim>,
+                     d: ptr<Defaults>, x: i32, y: i32, w: i32) -> void {
+    let mut ry: i32 = y
+    # Other rats. With the push at zero the batch goes back to being that
+    # many independent simulations walking through each other, which is the
+    # control condition and also what FlowRat did until the spatial grid
+    # existed.
+    let oh: i32 = dr_text(c, x, ry, "other rats", 1, C_LABEL)
+    dr_text_right(c, x + w - 26, ry, "crowded", 1, C_DIM)
+    dr_int_right(c, x + w, ry,
+                 grid_touching(&s.near, s.motion.social_range), 1, C_DIM)
+    ry = ry + 14
+    let ch: bool = ui_slider(u, c, x, ry, w, 14, "personal space m",
+                   &s.motion.social_range, 0.0, 0.25,
+                   d.motion.social_range, 3)
+    ry = ry + 17
+    ch = ui_slider(u, c, x, ry, w, 14, "keeps its distance",
+                   &s.motion.social_push, 0.0, 5.0,
+                   d.motion.social_push, 1)
+    ry = ry + 17
+    ch = ui_slider(u, c, x, ry, w, 14, "follows the crowd",
+                   &s.motion.follow_gain, 0.0, 3.0,
+                   d.motion.follow_gain, 2)
+    ry = ry + 17
+    ch = ui_slider(u, c, x, ry, w, 14, "crowding at a patch",
+                   &s.motion.crowd_share, 0.0, 1.0,
+                   d.motion.crowd_share, 2)
+    ry = ry + 17
+
+}

@@ -1,0 +1,342 @@
+# The analysis tab: what the run measured, rather than what the model was told.
+#
+# Every other panel in FlowRat draws the model's own state. This one draws a
+# measurement made from a recording: bin the arena, count spikes and
+# occupancy, divide, and score what comes out. The numbers here can disagree
+# with the parameters that produced them, and when they agree that agreement
+# is evidence rather than tautology.
+#
+# Recording is live. Press record and the session samples every frame while
+# the simulation runs, exactly as it would in an experiment, so the map fills
+# in in front of you and its coverage is visible as it goes.
+
+import "draw.flow"
+import "widgets.flow"
+import "layout.flow"
+
+extern {
+    function sqrt(x: f64) -> f64
+    function fabs(x: f64) -> f64
+    function cos(x: f64) -> f64
+    function sin(x: f64) -> f64
+}
+
+# Dark blue through cyan and yellow to white. A perceptually ordered ramp
+# rather than a rainbow, so a brighter bin is unambiguously a busier one.
+export function heat_colour(t: f64) -> i32 {
+    let mut v: f64 = t
+    if v < 0.0 { v = 0.0 }
+    if v > 1.0 { v = 1.0 }
+    if v < 0.34 {
+        let f: f64 = v / 0.34
+        return rgb((20.0 + f * 20.0) as i32, (30.0 + f * 90.0) as i32,
+                   (70.0 + f * 130.0) as i32)
+    }
+    if v < 0.67 {
+        let f: f64 = (v - 0.34) / 0.33
+        return rgb((40.0 + f * 190.0) as i32, (120.0 + f * 90.0) as i32,
+                   (200.0 - f * 130.0) as i32)
+    }
+    let f: f64 = (v - 0.67) / 0.33
+    return rgb((230.0 + f * 25.0) as i32, (210.0 + f * 45.0) as i32,
+               (70.0 + f * 185.0) as i32)
+}
+
+export function view_analysis_draw(c: ptr<Canvas>, u: ptr<Ui>, s: ptr<Sim>,
+                                   an: ptr<Session>, ed: ptr<Editor>,
+                                   lay: ptr<Layout>) -> void {
+    ui_panel(c, lay.ana_x, lay.ana_y, lay.ana_w, lay.ana_h,
+             "measured from the run")
+    let x0: i32 = lay.ana_x + PAD
+    let top: i32 = ui_panel_body_y(lay.ana_y)
+    let w: i32 = COLW
+
+    if !session_ready(an) {
+        dr_text_center(c, lay.ana_x + lay.ana_w / 2,
+                       lay.ana_y + lay.ana_h / 2,
+                       "the recording session could not be allocated", 1,
+                       C_BAD)
+        return
+    }
+
+    # The two square plots are sized by what is left after the numbers under
+    # them, not by the column width. Sizing them to the width overflowed the
+    # panel by fifty pixels and hid the readouts they were labelled with.
+    let bottom: i32 = lay.ana_y + lay.ana_h - PAD
+    let mut sq: i32 = bottom - (top + 13) - 84
+    if sq > w { sq = w }
+    if sq < 40 { sq = 40 }
+
+    draw_measured_map(c, an, x0, top, w, sq)
+    draw_correlogram(c, an, ui_col(x0, 1), top, w, sq)
+    draw_scores(c, s, an, ui_col(x0, 2), top, w)
+    let cx: i32 = ui_col(x0, 3)
+    if cx + w <= lay.ana_x + lay.ana_w - PAD {
+        draw_analysis_controls(c, u, s, an, ed, cx, top, w)
+    }
+}
+
+# --- the rate map -----------------------------------------------------------
+
+function draw_measured_map(c: ptr<Canvas>, an: ptr<Session>, x: i32, y: i32,
+                           w: i32, side: i32) -> void {
+    let t: i32 = dr_text(c, x, y, "rate map", 1, C_LABEL)
+    dr_text_right(c, x + w, y, "spikes over occupancy", 1, C_DIM)
+    let mut ry: i32 = y + 13
+
+    let m: ptr<RateMap> = &an.map
+    let mut cell: i32 = side / m.nx
+    if cell < 1 { cell = 1 }
+    let px: i32 = cell * m.nx
+    dr_rect(c, x, ry, px, px, rgb(10, 12, 18))
+    let peak: f64 = ratemap_peak(m)
+    for by in 0 to m.ny {
+        for bx in 0 to m.nx {
+            let b: i32 = by * m.nx + bx
+            # An unvisited bin is drawn as a hole rather than as a zero. A
+            # rate map with the gaps painted in as silence is the commonest
+            # way to make a field look cleaner than the run supports.
+            if ratemap_visited(m, b) {
+                let mut f: f64 = 0.0
+                if peak > 0.0 { f = m.rate[b] / peak }
+                dr_rect(c, x + bx * cell, ry + (m.ny - 1 - by) * cell,
+                        cell, cell, heat_colour(f))
+            }
+        }
+    }
+    dr_frame(c, x, ry, px, px, C_EDGE)
+    ry = ry + px + 6
+
+    ui_kv_fixed(c, x, ry, w, "peak Hz", peak, 2, C_TEXT)
+    ry = ry + 11
+    ui_kv_fixed(c, x, ry, w, "mean Hz", ratemap_mean(m), 2, C_TEXT)
+    ry = ry + 11
+    let cov: f64 = ratemap_coverage(m)
+    let mut cc: i32 = C_GOOD
+    if cov < 0.5 { cc = C_WARN }
+    if cov < 0.25 { cc = C_BAD }
+    ui_kv_fixed(c, x, ry, w, "arena visited", cov, 2, cc)
+    ry = ry + 11
+    ui_kv_fixed(c, x, ry, w, "seconds recorded", an.seconds, 1, C_TEXT)
+    ry = ry + 11
+    ui_kv_fixed(c, x, ry, w, "spikes counted", m.total_spikes, 0, C_TEXT)
+    ry = ry + 13
+    if cov < 0.5 {
+        dr_text(c, x, ry, "too little of the arena seen for", 1, C_WARN)
+        dr_text(c, x, ry + 10, "the scores to mean much yet", 1, C_WARN)
+    }
+}
+
+# --- the autocorrelogram ----------------------------------------------------
+
+function draw_correlogram(c: ptr<Canvas>, an: ptr<Session>, x: i32, y: i32,
+                          w: i32, box: i32) -> void {
+    let t: i32 = dr_text(c, x, y, "autocorrelogram", 1, C_LABEL)
+    dr_text_right(c, x + w, y, "six peaks means a lattice", 1, C_DIM)
+    let mut ry: i32 = y + 13
+
+    let side: i32 = an.corr_side
+    let mut cell: i32 = box / side
+    if cell < 1 { cell = 1 }
+    let px: i32 = cell * side
+    dr_rect(c, x, ry, px, px, rgb(10, 12, 18))
+    if !an.map.finished {
+        # Left dark rather than filled with the colour zero maps to, which
+        # is mid-ramp and reads as a uniform block of signal.
+        dr_frame(c, x, ry, px, px, C_EDGE)
+        dr_text_center(c, x + px / 2, ry + px / 2, "nothing recorded", 1,
+                       C_DIM)
+    }
+    if an.map.finished {
+        for cy in 0 to side {
+            for cx in 0 to side {
+                let v: f64 = session_corr_at(an, cx, cy)
+                # Correlation runs from -1 to 1, so it is mapped through the
+                # middle of the ramp rather than from its bottom. A lag with
+                # too little overlap to correlate is left dark.
+                if !corr_is_none(v) {
+                    dr_rect(c, x + cx * cell, ry + (side - 1 - cy) * cell,
+                            cell, cell, heat_colour((v + 1.0) * 0.5))
+                }
+            }
+        }
+    }
+    dr_frame(c, x, ry, px, px, C_EDGE)
+    ry = ry + px + 6
+    dr_text(c, x, ry, "warm is where the map looks like itself", 1, C_DIM)
+    ry = ry + 10
+    dr_text(c, x, ry, "when shifted by that much", 1, C_DIM)
+}
+
+# --- the scores -------------------------------------------------------------
+
+function draw_scores(c: ptr<Canvas>, s: ptr<Sim>, an: ptr<Session>, x: i32,
+                     y: i32, w: i32) -> void {
+    let t: i32 = dr_text(c, x, y, "scores", 1, C_LABEL)
+    dr_text_right(c, x + w, y, pop_kind_name(an.pop_kind), 1, C_ACCENT)
+    let mut ry: i32 = y + 13
+
+    if !an.map.finished {
+        dr_text(c, x, ry, "nothing recorded yet", 1, C_DIM)
+        dr_text(c, x, ry + 10, "press record and let it run", 1, C_DIM)
+        return
+    }
+
+    let info: f64 = session_information(an)
+    ui_kv_fixed(c, x, ry, w, "bits per spike", info, 2, C_TEXT)
+    ry = ry + 11
+    ui_kv_fixed(c, x, ry, w, "sparsity", session_sparsity(an), 3, C_TEXT)
+    ry = ry + 11
+    let g: f64 = session_gridness(an)
+    ui_kv_fixed(c, x, ry, w, "gridness", g, 3, C_TEXT)
+    ry = ry + 11
+    ui_kv_fixed(c, x, ry, w, "lattice spacing m",
+                session_grid_spacing(an), 3, C_DIM)
+    ry = ry + 11
+    let f: FieldStats = session_fields(an, 0.4, 3)
+    ui_kv_int(c, x, ry, w, "fields", f.count, C_TEXT)
+    ry = ry + 11
+    ui_kv_fixed(c, x, ry, w, "largest field m2", f.largest_area, 4, C_TEXT)
+    ry = ry + 11
+    ui_kv_fixed(c, x, ry, w, "field centre x", f.peak_x, 3, C_DIM)
+    ry = ry + 11
+    ui_kv_fixed(c, x, ry, w, "field centre y", f.peak_y, 3, C_DIM)
+    ry = ry + 16
+
+    let hh: i32 = dr_text(c, x, ry, "head direction", 1, C_LABEL)
+    ry = ry + 13
+    let hd: TuningStats = session_tuning(an)
+    draw_tuning_dial(c, an, hd, x, ry, 96)
+    let dx: i32 = x + 104
+    let dw: i32 = w - 104
+    ui_kv_fixed(c, dx, ry, dw, "prefers rad", hd.preferred, 3, C_TEXT)
+    ui_kv_fixed(c, dx, ry + 11, dw, "vector length", hd.vector_length, 3,
+                C_TEXT)
+    ui_kv_fixed(c, dx, ry + 22, dw, "peak Hz", hd.peak_rate, 2, C_TEXT)
+    ui_kv_fixed(c, dx, ry + 33, dw, "Rayleigh z", hd.rayleigh_z, 1, C_TEXT)
+    let mut pc: i32 = C_DIM
+    if hd.rayleigh_p < 0.01 { pc = C_GOOD }
+    ui_kv_fixed(c, dx, ry + 44, dw, "Rayleigh p", hd.rayleigh_p, 4, pc)
+    ui_kv_text(c, dx, ry + 55, dw, "directional",
+               bool_word(hd.rayleigh_p < 0.01), pc)
+}
+
+# The measured tuning curve as a polar plot, with the resultant drawn as a
+# needle. Radius is the measured rate in each heading bin.
+function draw_tuning_dial(c: ptr<Canvas>, an: ptr<Session>,
+                          hd: TuningStats, x: i32, y: i32, d: i32) -> void {
+    let r: i32 = d / 2
+    let cx: i32 = x + r
+    let cy: i32 = y + r
+    dr_rect(c, x, y, d, d, rgb(10, 12, 18))
+    dr_circle(c, cx, cy, r - 1, C_EDGE)
+    if hd.peak_rate <= 0.0 {
+        dr_frame(c, x, y, d, d, C_EDGE)
+        return
+    }
+    let step: f64 = 6.283185307179586 / (HD_BINS as f64)
+    for b in 0 to HD_BINS {
+        if an.hd_occ[b] > 0.0 {
+            let rate: f64 = an.hd_spikes[b] / an.hd_occ[b]
+            let f: f64 = rate / hd.peak_rate
+            let ang: f64 = ((b as f64) + 0.5) * step
+            let ex: i32 = cx + ((cos(ang) * f * ((r - 3) as f64)) as i32)
+            let ey: i32 = cy - ((sin(ang) * f * ((r - 3) as f64)) as i32)
+            dr_line(c, cx, cy, ex, ey, rgb(90, 150, 190))
+        }
+    }
+    let nx: i32 = cx + ((cos(hd.preferred) * hd.vector_length
+                         * ((r - 3) as f64)) as i32)
+    let ny: i32 = cy - ((sin(hd.preferred) * hd.vector_length
+                         * ((r - 3) as f64)) as i32)
+    dr_line_thick(c, cx, cy, nx, ny, rgb(240, 200, 120), 2)
+    dr_frame(c, x, y, d, d, C_EDGE)
+}
+
+# --- controls, and the behavioural transition matrix ------------------------
+
+function draw_analysis_controls(c: ptr<Canvas>, u: ptr<Ui>, s: ptr<Sim>,
+                                an: ptr<Session>, ed: ptr<Editor>, x: i32,
+                                y: i32, w: i32) -> void {
+    let t: i32 = dr_text(c, x, y, "recording", 1, C_LABEL)
+    let mut ry: i32 = y + 14
+
+    let mut lab: string = "record"
+    if an.running { lab = "stop and score" }
+    if ui_button(u, c, x, ry, w, 16, lab) {
+        if an.running {
+            session_end(an, 0.25)
+        } else {
+            # Recording counts spikes, so pressing record turns them on.
+            # Leaving that to the reader means a session that runs for five
+            # minutes and measures nothing, and the only clue is a warning in
+            # a different tab.
+            s.spiking = true
+            session_begin(an, s, ed.ana_pop, ed.ana_cell, sim_selected(s))
+        }
+    }
+    ry = ry + 20
+    let hw: i32 = (w - 4) / 2
+    let mut pop: i32 = ed.ana_pop
+    if ui_slider_int(u, c, x, ry, w, 14, "population", &pop, 0,
+                     SIM_POP_COUNT - 1, POP_PLACE) {
+        ed.ana_pop = pop
+    }
+    ry = ry + 17
+    let p: ptr<Pop> = sim_pop(s, ed.ana_pop)
+    let mut cell: i32 = ed.ana_cell
+    let mut hi: i32 = p.n - 1
+    if hi < 0 { hi = 0 }
+    if ui_slider_int(u, c, x, ry, w, 14, "cell", &cell, 0, hi, 0) {
+        ed.ana_cell = cell
+    }
+    ry = ry + 17
+    if ui_button(u, c, x, ry, w, 15, "pick the cell firing hardest now") {
+        ed.ana_cell = pop_strongest(p, sim_selected(s))
+    }
+    ry = ry + 19
+    ui_kv_text(c, x, ry, w, "recording", pop_kind_name(ed.ana_pop), C_ACCENT)
+    ry = ry + 11
+    if !s.spiking {
+        dr_text(c, x, ry, "spikes are off; record turns them on", 1, C_DIM)
+        ry = ry + 12
+    }
+    ry = ry + 6
+
+    if ui_button(u, c, x, ry, w, 16, "write the scores to data/out") {
+        let ok: bool = analysis_export(an, s, "data/out/analysis.csv")
+    }
+    ry = ry + 22
+
+    # The transition matrix. Which behaviour follows which is the other half
+    # of an ethogram: the time budget says what an animal does and this says
+    # in what order.
+    let th: i32 = dr_text(c, x, ry, "what follows what", 1, C_LABEL)
+    ry = ry + 13
+    let cw: i32 = 22
+    let lw: i32 = 44
+    for to in 0 to ST_COUNT {
+        dr_text(c, x + lw + to * cw, ry, state_short(to), 1, C_DIM)
+    }
+    ry = ry + 10
+    for from in 0 to ST_COUNT {
+        dr_text(c, x, ry, state_short(from), 1, C_DIM)
+        # Row normalised, because what matters is which state usually
+        # follows this one and not how often this one happened.
+        let mut row: i32 = 0
+        for to in 0 to ST_COUNT {
+            row = row + session_transitions(an, from, to)
+        }
+        for to in 0 to ST_COUNT {
+            let n: i32 = session_transitions(an, from, to)
+            let bx: i32 = x + lw + to * cw
+            if row > 0 and n > 0 {
+                let f: f64 = (n as f64) / (row as f64)
+                dr_rect(c, bx, ry, cw - 2, 9, heat_colour(f))
+            } else {
+                dr_rect(c, bx, ry, cw - 2, 9, rgb(16, 19, 28))
+            }
+        }
+        ry = ry + 11
+    }
+}

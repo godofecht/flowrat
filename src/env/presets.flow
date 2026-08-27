@@ -1,0 +1,256 @@
+# Built-in arenas.
+#
+# Each preset is a plain sequence of calls against the editing API in
+# environment.flow, so anything a preset does the user can also do by hand in
+# the editor, and anything built in the editor can be saved and reloaded.
+# There is no separate preset format.
+#
+# To add an arena: write the builder, give it an index, and add it to
+# env_preset_apply and env_preset_name. Nothing else needs to change.
+
+import "geometry.flow"
+import "environment.flow"
+
+export const PRESET_OPEN_FIELD: i32 = 0
+export const PRESET_CIRCLE: i32 = 1
+export const PRESET_TWO_ROOMS: i32 = 2
+export const PRESET_FOUR_ROOMS: i32 = 3
+export const PRESET_T_MAZE: i32 = 4
+export const PRESET_LINEAR_TRACK: i32 = 5
+export const PRESET_OBSTACLES: i32 = 6
+export const PRESET_PLUS_MAZE: i32 = 7
+export const PRESET_COUNT: i32 = 8
+
+# A 2 x 2 m box. The default: no internal structure, so place fields tile
+# cleanly and any boundary response comes from the outer wall alone.
+# Water in every arena, placed away from the food so that the two drives
+# compete over distance rather than sharing a spot. A rat that could eat and
+# drink in the same place would never have to choose, and choosing is the
+# whole point of having two drives.
+#
+# The puddles are generous and refill quickly, which makes them a cage water
+# bottle rather than a scarce resource. Deprivation is worth studying, but it
+# should be something a run is set up for rather than something every arena
+# does by accident: with a puddle that runs dry, thirst pins at maximum, every
+# maintenance behaviour is suppressed, and the time budget of every preset
+# becomes a measurement of drought.
+const WATER_AMOUNT: f64 = 30.0
+const WATER_REGROW: f64 = 3.0
+
+function add_water(e: ptr<Env>, x: f64, y: f64, r: f64) -> i32 {
+    return env_add_zone_food(e, ZONE_WATER, SHAPE_CIRCLE, x, y, r, 0.0,
+                             WATER_AMOUNT, WATER_REGROW)
+}
+
+export function preset_open_field(e: ptr<Env>) -> void {
+    env_set_rect(e, 0.0, 0.0, 2.0, 2.0)
+    let c: i32 = env_add_cue(e, 1.0, 1.9, 1.0)
+    # Two patches that regrow, enough that the default batch of two dozen
+    # can live here rather than starve. A colony pinned at maximum hunger
+    # spends all its time walking, which makes the time budget a measurement
+    # of scarcity rather than of behaviour. Scarcity is worth seeing, and
+    # data/configs/scarcity.flowrat is where to see it.
+    # Two dozen rats at the current metabolism need about three units a
+    # second between them. At half a unit per patch they got one, and the
+    # default arena quietly starved its own default batch: a hundred seconds
+    # in, the food was gone and a quarter of the colony was in real need.
+    let z: i32 = env_add_zone_food(e, ZONE_REWARD, SHAPE_CIRCLE,
+                                   1.7, 0.3, 0.16, 0.0, 18.0, 1.6)
+    let z2: i32 = env_add_zone_food(e, ZONE_REWARD, SHAPE_CIRCLE,
+                                    0.35, 1.65, 0.16, 0.0, 18.0, 1.6)
+    # The far corner from both patches, so drinking costs a walk.
+    let w: i32 = add_water(e, 1.65, 1.65, 0.14)
+    let s: i32 = env_add_zone(e, ZONE_START, SHAPE_CIRCLE, 0.3, 0.3, 0.16, 0.0)
+    e.preset = PRESET_OPEN_FIELD
+}
+
+# A 1 m radius disc. Every boundary normal points at the centre, which makes
+# the boundary-cell response rotationally symmetric and is the clearest way
+# to see that wall distance is being computed and not faked from the box.
+export function preset_circle(e: ptr<Env>) -> void {
+    env_set_circle(e, 1.0, 1.0, 1.0)
+    let c: i32 = env_add_cue(e, 1.0, 1.85, 1.0)
+    # One patch that comes back slowly, so a single rat can live here.
+    let z: i32 = env_add_zone_food(e, ZONE_REWARD, SHAPE_CIRCLE,
+                                   1.55, 1.0, 0.15, 0.0, 10.0, 0.25)
+    # Opposite the patch across the disc.
+    let w: i32 = add_water(e, 1.0, 0.35, 0.13)
+    let s: i32 = env_add_zone(e, ZONE_START, SHAPE_CIRCLE, 0.45, 1.0, 0.15, 0.0)
+    e.preset = PRESET_CIRCLE
+}
+
+# Two compartments joined by a doorway. The classic test for whether a place
+# field remaps between rooms and whether a barrier blocks line of sight.
+export function preset_two_rooms(e: ptr<Env>) -> void {
+    env_set_rect(e, 0.0, 0.0, 2.0, 1.2)
+    # Dividing wall at x = 1.0 with a 0.3 m gap centred vertically.
+    let a: i32 = env_add_wall(e, 1.0, 0.0, 1.0, 0.45)
+    let b: i32 = env_add_wall(e, 1.0, 0.75, 1.0, 1.2)
+    let c1: i32 = env_add_cue(e, 0.2, 1.05, 1.0)
+    let c2: i32 = env_add_cue(e, 1.8, 0.15, 1.0)
+    # A patch in each room, so getting the second one means going through
+    # the doorway. With line of sight required, a rat in one room cannot see
+    # the other patch until it is in the gap.
+    let z: i32 = env_add_zone_food(e, ZONE_REWARD, SHAPE_CIRCLE,
+                                   1.75, 0.9, 0.14, 0.0, 10.0, 0.0)
+    let z2: i32 = env_add_zone_food(e, ZONE_REWARD, SHAPE_CIRCLE,
+                                    0.25, 0.9, 0.14, 0.0, 10.0, 0.0)
+    # Water in the far room and food in both, so a thirsty rat has to cross
+    # the doorway whichever room it is standing in.
+    let w: i32 = add_water(e, 1.75, 0.25, 0.13)
+    let s: i32 = env_add_zone(e, ZONE_START, SHAPE_CIRCLE, 0.25, 0.3, 0.14, 0.0)
+    e.preset = PRESET_TWO_ROOMS
+}
+
+# Four rooms around a cross of walls, each pair joined by one doorway.
+export function preset_four_rooms(e: ptr<Env>) -> void {
+    env_set_rect(e, 0.0, 0.0, 2.0, 2.0)
+    let gap: f64 = 0.28
+    let mid: f64 = 1.0
+    # Vertical divider, doorways at y = 0.5 and y = 1.5.
+    let v1: i32 = env_add_wall(e, mid, 0.0, mid, 0.5 - gap * 0.5)
+    let v2: i32 = env_add_wall(e, mid, 0.5 + gap * 0.5, mid, 1.5 - gap * 0.5)
+    let v3: i32 = env_add_wall(e, mid, 1.5 + gap * 0.5, mid, 2.0)
+    # Horizontal divider, doorways at x = 0.5 and x = 1.5.
+    let h1: i32 = env_add_wall(e, 0.0, mid, 0.5 - gap * 0.5, mid)
+    let h2: i32 = env_add_wall(e, 0.5 + gap * 0.5, mid, 1.5 - gap * 0.5, mid)
+    let h3: i32 = env_add_wall(e, 1.5 + gap * 0.5, mid, 2.0, mid)
+    let c1: i32 = env_add_cue(e, 0.25, 1.75, 1.0)
+    let c2: i32 = env_add_cue(e, 1.75, 1.75, 1.0)
+    let c3: i32 = env_add_cue(e, 0.25, 0.25, 1.0)
+    let c4: i32 = env_add_cue(e, 1.75, 0.25, 1.0)
+    # One patch, three rooms away from the nest.
+    let z: i32 = env_add_zone_food(e, ZONE_REWARD, SHAPE_CIRCLE,
+                                   1.75, 1.75, 0.13, 0.0, 16.0, 0.15)
+    # The food is in the far corner room and the water in another, so the
+    # two drives pull the animal into different rooms.
+    let w: i32 = add_water(e, 0.25, 1.75, 0.13)
+    let s: i32 = env_add_zone(e, ZONE_START, SHAPE_CIRCLE, 0.25, 0.25, 0.13, 0.0)
+    e.preset = PRESET_FOUR_ROOMS
+}
+
+# A T of corridors, built by filling a box arena with two solid blocks. The
+# blocks carry both their outline segments and a solid record, so a rat can
+# neither walk through them nor be spawned inside one.
+export function preset_t_maze(e: ptr<Env>) -> void {
+    env_set_rect(e, 0.0, 0.0, 2.0, 1.4)
+    let arm: f64 = 0.3
+    let stem_x0: f64 = 1.0 - arm * 0.5
+    # Left and right filler blocks, leaving a stem up the middle and a
+    # cross-arm along the top.
+    env_add_box(e, 0.0, 0.0, stem_x0, 1.4 - arm)
+    env_add_box(e, stem_x0 + arm, 0.0, 2.0 - stem_x0 - arm, 1.4 - arm)
+    let c1: i32 = env_add_cue(e, 0.1, 1.3, 1.0)
+    let c2: i32 = env_add_cue(e, 1.9, 1.3, 1.0)
+    # The classic asymmetric choice: one arm holds four times the other, and
+    # both come back slowly, so which way is worth going changes over a run.
+    let zl: i32 = env_add_zone_food(e, ZONE_REWARD, SHAPE_CIRCLE,
+                                    0.12, 1.25, 0.1, 0.0, 16.0, 0.2)
+    let zr: i32 = env_add_zone_food(e, ZONE_REWARD, SHAPE_CIRCLE,
+                                    1.88, 1.25, 0.1, 0.0, 4.0, 0.2)
+    # At the foot of the stem, by the nest, so the choice at the junction
+    # stays a choice between the two baited arms.
+    let w: i32 = add_water(e, 1.0, 0.35, 0.09)
+    let s: i32 = env_add_zone(e, ZONE_START, SHAPE_CIRCLE, 1.0, 0.12, 0.1, 0.0)
+    e.preset = PRESET_T_MAZE
+}
+
+# A long thin corridor. One spatial dimension dominates, which is the setting
+# where place fields become directional and grid cells collapse to a stripe.
+export function preset_linear_track(e: ptr<Env>) -> void {
+    env_set_rect(e, 0.0, 0.0, 2.4, 0.24)
+    let c1: i32 = env_add_cue(e, 0.05, 0.12, 1.0)
+    let c2: i32 = env_add_cue(e, 2.35, 0.12, 1.0)
+    # Food at both ends that regrows, which is the shuttling task: eat one
+    # end out, walk to the other, and by the time you are back the first has
+    # come partway back.
+    let zl: i32 = env_add_zone_food(e, ZONE_REWARD, SHAPE_CIRCLE,
+                                    0.1, 0.12, 0.08, 0.0, 6.0, 0.35)
+    let zr: i32 = env_add_zone_food(e, ZONE_REWARD, SHAPE_CIRCLE,
+                                    2.3, 0.12, 0.08, 0.0, 6.0, 0.35)
+    # Mid track, so a shuttling rat passes it on every run.
+    let w: i32 = add_water(e, 1.6, 0.12, 0.07)
+    let s: i32 = env_add_zone(e, ZONE_START, SHAPE_CIRCLE, 1.2, 0.12, 0.08, 0.0)
+    e.preset = PRESET_LINEAR_TRACK
+}
+
+# Scattered pillars in an open field. Wall distance stops being a function of
+# the boundary alone, so boundary-cell responses gain internal structure.
+export function preset_obstacles(e: ptr<Env>) -> void {
+    env_set_rect(e, 0.0, 0.0, 2.0, 2.0)
+    env_add_box(e, 0.35, 0.35, 0.26, 0.26)
+    env_add_box(e, 1.35, 0.5, 0.3, 0.18)
+    env_add_box(e, 0.5, 1.35, 0.18, 0.3)
+    env_add_box(e, 1.25, 1.25, 0.34, 0.34)
+    env_add_box(e, 0.9, 0.85, 0.16, 0.16)
+    let c1: i32 = env_add_cue(e, 1.0, 1.95, 1.0)
+    let c2: i32 = env_add_cue(e, 0.05, 1.0, 0.7)
+    # Several small patches among the pillars, so foraging is a route rather
+    # than a straight line, and line of sight decides what is worth going to.
+    let z: i32 = env_add_zone_food(e, ZONE_REWARD, SHAPE_CIRCLE,
+                                   1.85, 1.85, 0.12, 0.0, 6.0, 0.1)
+    let z2: i32 = env_add_zone_food(e, ZONE_REWARD, SHAPE_CIRCLE,
+                                    0.2, 1.7, 0.1, 0.0, 5.0, 0.1)
+    let z3: i32 = env_add_zone_food(e, ZONE_REWARD, SHAPE_CIRCLE,
+                                    1.05, 1.75, 0.1, 0.0, 5.0, 0.1)
+    let z4: i32 = env_add_zone_food(e, ZONE_REWARD, SHAPE_CIRCLE,
+                                    1.8, 0.25, 0.1, 0.0, 5.0, 0.1)
+    # Behind the pillars, so reaching it is a route rather than a line.
+    let w: i32 = add_water(e, 0.75, 0.2, 0.11)
+    let s: i32 = env_add_zone(e, ZONE_START, SHAPE_CIRCLE, 0.15, 0.15, 0.12, 0.0)
+    e.preset = PRESET_OBSTACLES
+}
+
+# Four arms from a centre. Same filling trick as the T maze, with a block in
+# each corner.
+export function preset_plus_maze(e: ptr<Env>) -> void {
+    env_set_rect(e, 0.0, 0.0, 2.0, 2.0)
+    let arm: f64 = 0.28
+    let lo: f64 = 1.0 - arm * 0.5
+    let hi: f64 = 1.0 + arm * 0.5
+    env_add_box(e, 0.0, 0.0, lo, lo)
+    env_add_box(e, hi, 0.0, 2.0 - hi, lo)
+    env_add_box(e, 0.0, hi, lo, 2.0 - hi)
+    env_add_box(e, hi, hi, 2.0 - hi, 2.0 - hi)
+    let c1: i32 = env_add_cue(e, 1.0, 1.95, 1.0)
+    let c2: i32 = env_add_cue(e, 1.95, 1.0, 0.8)
+    # Two of the four arms baited, the nest at the crossing.
+    let z1: i32 = env_add_zone_food(e, ZONE_REWARD, SHAPE_CIRCLE,
+                                    1.0, 1.9, 0.09, 0.0, 8.0, 0.15)
+    let z2: i32 = env_add_zone_food(e, ZONE_REWARD, SHAPE_CIRCLE,
+                                    1.9, 1.0, 0.09, 0.0, 8.0, 0.15)
+    # A third arm, so the plus maze offers food, food and water and the
+    # junction has three reasons to hesitate rather than two.
+    let w: i32 = add_water(e, 1.0, 0.1, 0.08)
+    let s: i32 = env_add_zone(e, ZONE_START, SHAPE_CIRCLE, 1.0, 1.0, 0.09, 0.0)
+    e.preset = PRESET_PLUS_MAZE
+}
+
+export function env_preset_apply(e: ptr<Env>, which: i32) -> void {
+    if which == PRESET_CIRCLE { preset_circle(e)
+                                return }
+    if which == PRESET_TWO_ROOMS { preset_two_rooms(e)
+                                   return }
+    if which == PRESET_FOUR_ROOMS { preset_four_rooms(e)
+                                    return }
+    if which == PRESET_T_MAZE { preset_t_maze(e)
+                                return }
+    if which == PRESET_LINEAR_TRACK { preset_linear_track(e)
+                                      return }
+    if which == PRESET_OBSTACLES { preset_obstacles(e)
+                                   return }
+    if which == PRESET_PLUS_MAZE { preset_plus_maze(e)
+                                   return }
+    preset_open_field(e)
+}
+
+export function env_preset_name(which: i32) -> string {
+    if which == PRESET_CIRCLE { return "circle" }
+    if which == PRESET_TWO_ROOMS { return "two rooms" }
+    if which == PRESET_FOUR_ROOMS { return "four rooms" }
+    if which == PRESET_T_MAZE { return "t maze" }
+    if which == PRESET_LINEAR_TRACK { return "linear track" }
+    if which == PRESET_OBSTACLES { return "obstacles" }
+    if which == PRESET_PLUS_MAZE { return "plus maze" }
+    return "open field"
+}

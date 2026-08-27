@@ -1,0 +1,142 @@
+# A fixed-slot profiler.
+#
+# Every timed stage owns a slot index. A slot keeps the last sample, an
+# exponential moving average for a readable on-screen number, a running peak,
+# and a call count. There is no allocation and no string handling on the
+# timing path, so the profiler itself stays out of the measurement.
+#
+# Usage:
+#   let t: i64 = prof_begin()
+#   ... work ...
+#   prof_end(PROF_AGENTS, t)
+
+import "clock.flow"
+
+export const PROF_FRAME: i32 = 0
+export const PROF_SIM: i32 = 1
+export const PROF_AGENTS: i32 = 2
+export const PROF_ENVQ: i32 = 3
+export const PROF_PLACE: i32 = 4
+export const PROF_HD: i32 = 5
+export const PROF_VEL: i32 = 6
+export const PROF_GRID: i32 = 7
+export const PROF_BVC: i32 = 8
+export const PROF_CAN: i32 = 9
+export const PROF_RENDER: i32 = 10
+export const PROF_RECORD: i32 = 11
+# The uniform spatial grid over the rats. Distinct from PROF_GRID, which is
+# the grid-cell population: one is a neural tuning curve and the other is a
+# bucket of rat indices, and they share a word by accident.
+export const PROF_NEIGH: i32 = 12
+export const PROF_SLOTS: i32 = 13
+
+# Smoothing for the displayed average. 0.1 settles in roughly 30 frames,
+# fast enough to react to a parameter change and slow enough to read.
+const PROF_ALPHA: f64 = 0.1
+
+# These four have to be exactly PROF_SLOTS long, and the length has to be
+# written out as a literal, because Flow will not take a constant as an array
+# size. So it is duplicated, and the duplicate is the hazard: adding a slot
+# without widening these writes one past the end of four static arrays, which
+# corrupts whatever the linker put next and shows up much later as a malloc
+# abort somewhere unrelated. That is exactly what adding the neighbour slot
+# did. validate.flow writes and reads back every slot, which catches it at
+# the point of the mistake rather than three test sections later.
+let mut prof_last: array<f64, 13> = [0.0]
+let mut prof_avg: array<f64, 13> = [0.0]
+let mut prof_peak: array<f64, 13> = [0.0]
+let mut prof_calls: array<i32, 13> = [0]
+let mut prof_enabled: bool = true
+
+export function prof_reset() -> void {
+    for i in 0 to PROF_SLOTS {
+        prof_last[i] = 0.0
+        prof_avg[i] = 0.0
+        prof_peak[i] = 0.0
+        prof_calls[i] = 0
+    }
+}
+
+export function prof_set_enabled(on: bool) -> void {
+    prof_enabled = on
+}
+
+export function prof_is_enabled() -> bool {
+    return prof_enabled
+}
+
+export function prof_begin() -> i64 {
+    if !prof_enabled { return 0 }
+    return clock_ns()
+}
+
+export function prof_end(slot: i32, start_ns: i64) -> void {
+    if !prof_enabled { return }
+    if slot < 0 or slot >= PROF_SLOTS { return }
+    let ms: f64 = ((clock_ns() - start_ns) as f64) / 1000000.0
+    prof_last[slot] = ms
+    if prof_calls[slot] == 0 {
+        prof_avg[slot] = ms
+    } else {
+        prof_avg[slot] = prof_avg[slot] + PROF_ALPHA * (ms - prof_avg[slot])
+    }
+    if ms > prof_peak[slot] { prof_peak[slot] = ms }
+    prof_calls[slot] = prof_calls[slot] + 1
+}
+
+# Record a duration measured elsewhere.
+export function prof_add_ms(slot: i32, ms: f64) -> void {
+    if !prof_enabled { return }
+    if slot < 0 or slot >= PROF_SLOTS { return }
+    prof_last[slot] = ms
+    if prof_calls[slot] == 0 {
+        prof_avg[slot] = ms
+    } else {
+        prof_avg[slot] = prof_avg[slot] + PROF_ALPHA * (ms - prof_avg[slot])
+    }
+    if ms > prof_peak[slot] { prof_peak[slot] = ms }
+    prof_calls[slot] = prof_calls[slot] + 1
+}
+
+export function prof_last_ms(slot: i32) -> f64 {
+    if slot < 0 or slot >= PROF_SLOTS { return 0.0 }
+    return prof_last[slot]
+}
+
+export function prof_avg_ms(slot: i32) -> f64 {
+    if slot < 0 or slot >= PROF_SLOTS { return 0.0 }
+    return prof_avg[slot]
+}
+
+export function prof_peak_ms(slot: i32) -> f64 {
+    if slot < 0 or slot >= PROF_SLOTS { return 0.0 }
+    return prof_peak[slot]
+}
+
+export function prof_calls_of(slot: i32) -> i32 {
+    if slot < 0 or slot >= PROF_SLOTS { return 0 }
+    return prof_calls[slot]
+}
+
+export function prof_clear_peaks() -> void {
+    for i in 0 to PROF_SLOTS {
+        prof_peak[i] = 0.0
+    }
+}
+
+export function prof_slot_name(slot: i32) -> string {
+    if slot == PROF_FRAME { return "frame" }
+    if slot == PROF_SIM { return "sim total" }
+    if slot == PROF_AGENTS { return "agents" }
+    if slot == PROF_ENVQ { return "env queries" }
+    if slot == PROF_PLACE { return "place" }
+    if slot == PROF_HD { return "head dir" }
+    if slot == PROF_VEL { return "velocity" }
+    if slot == PROF_GRID { return "grid" }
+    if slot == PROF_BVC { return "boundary" }
+    if slot == PROF_CAN { return "attractor" }
+    if slot == PROF_RENDER { return "render" }
+    if slot == PROF_RECORD { return "record" }
+    if slot == PROF_NEIGH { return "neighbours" }
+    return "?"
+}

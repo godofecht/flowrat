@@ -1,0 +1,93 @@
+# Counter-based random numbers.
+#
+# WHY NOT A RUNNING SEED
+#   FlowRat updates agents and cells inside `parallel for`. A single mutable
+#   generator state would make the stream order depend on which thread got
+#   which index, so two runs of the same seed would diverge. Every draw here
+#   is a pure function of (seed, stream, counter), so index i always gets the
+#   same number whatever order the loop runs in, and a 1-rat run and a
+#   1000-rat run agree on rat 0.
+#
+#   stream  separates independent uses (heading noise, speed noise, cue jitter)
+#   counter is normally the step index, or the cell index for static draws
+#
+# The mixer is the finaliser from MurmurHash3, which passes the usual
+# avalanche checks and costs four multiplies.
+
+# Odd constants: large primes, so the stream/counter fold stays injective.
+const RNG_STREAM_ODD: u32 = 2654435761
+const RNG_COUNT_ODD: u32 = 1013904223
+const RNG_INDEX_ODD: u32 = 2246822519
+
+const TWO_PI: f64 = 6.283185307179586
+
+extern {
+    function sqrt(x: f64) -> f64
+    function log(x: f64) -> f64
+    function cos(x: f64) -> f64
+    function sin(x: f64) -> f64
+}
+
+# MurmurHash3 finaliser.
+export function rng_mix(x: u32) -> u32 {
+    let mut h: u32 = x
+    h = h ^ (h >> 16)
+    h = h * 2246822519
+    h = h ^ (h >> 13)
+    h = h * 3266489917
+    h = h ^ (h >> 16)
+    return h
+}
+
+# One 32-bit draw from the (seed, stream, counter) coordinate.
+export function rng_bits(seed: u32, stream: u32, counter: u32) -> u32 {
+    let a: u32 = seed ^ (stream * RNG_STREAM_ODD)
+    let b: u32 = a ^ (counter * RNG_COUNT_ODD)
+    return rng_mix(b)
+}
+
+# Uniform on [0, 1). Uses the top 24 bits, which is all an f64 mantissa
+# needs for this and avoids the low bits of a multiply-shift mixer.
+export function rng_u01(seed: u32, stream: u32, counter: u32) -> f64 {
+    return ((rng_bits(seed, stream, counter) >> 8) as f64) / 16777216.0
+}
+
+# Uniform on [lo, hi).
+export function rng_range(seed: u32, stream: u32, counter: u32,
+                          lo: f64, hi: f64) -> f64 {
+    return lo + (hi - lo) * rng_u01(seed, stream, counter)
+}
+
+# Symmetric uniform on [-half, half].
+export function rng_sym(seed: u32, stream: u32, counter: u32,
+                        half: f64) -> f64 {
+    return (rng_u01(seed, stream, counter) * 2.0 - 1.0) * half
+}
+
+# Standard normal by Box-Muller. Two independent uniforms come from the same
+# coordinate on two neighbouring streams, so the pair stays reproducible.
+export function rng_normal(seed: u32, stream: u32, counter: u32) -> f64 {
+    let mut u1: f64 = rng_u01(seed, stream, counter)
+    let u2: f64 = rng_u01(seed, stream + 7919, counter)
+    # log(0) is -inf; nudge off the boundary rather than branch in the caller.
+    if u1 < 0.0000000001 { u1 = 0.0000000001 }
+    return sqrt(-2.0 * log(u1)) * cos(TWO_PI * u2)
+}
+
+# Normal with mean and standard deviation.
+export function rng_gauss(seed: u32, stream: u32, counter: u32,
+                          mean: f64, sd: f64) -> f64 {
+    return mean + sd * rng_normal(seed, stream, counter)
+}
+
+# Integer in [0, n). n must be positive.
+export function rng_int(seed: u32, stream: u32, counter: u32, n: i32) -> i32 {
+    if n <= 1 { return 0 }
+    return ((rng_bits(seed, stream, counter) >> 8) % (n as u32)) as i32
+}
+
+# Fold a 2-D coordinate into one counter, for per-cell static draws such as
+# place-field centres.
+export function rng_index2(i: i32, j: i32) -> u32 {
+    return (i as u32) * RNG_INDEX_ODD + (j as u32)
+}

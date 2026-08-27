@@ -1,0 +1,211 @@
+# Window layout and the world-to-screen transform.
+#
+# Every panel rectangle is computed once per frame into a Layout, and both
+# drawing and hit testing read from it. Nothing recomputes a panel's position
+# from constants at the point of use, so a control can never end up drawn in
+# one place and clickable in another.
+#
+# The layout follows the window. Panel widths are fractions of it, clamped so
+# nothing collapses, and the two rows always add up to the full width because
+# the environment view and the editor panel take the remainder. Below a
+# minimum size the layout stops shrinking and the backend scales the whole
+# frame down instead, which keeps the panels in proportion rather than
+# squeezing controls until they stop working.
+
+import "draw.flow"
+import "widgets.flow"
+
+extern {
+    function floor(x: f64) -> f64
+    function sqrt(x: f64) -> f64
+}
+
+# Starting window size, and the smallest the cockpit is laid out at. Below
+# the minimum the layout stops shrinking and the backend scales the whole
+# frame down to fit instead, which keeps the panels in proportion rather than
+# collapsing them.
+export const WIN_W: i32 = 1440
+export const WIN_H: i32 = 900
+export const MIN_W: i32 = 1180
+export const MIN_H: i32 = 740
+# A ceiling on the framebuffer, so a very large display does not turn into a
+# very large allocation redrawn every frame.
+export const MAX_W: i32 = 3840
+export const MAX_H: i32 = 2400
+
+export const HEADER_H: i32 = 26
+export const M: i32 = 8
+
+export struct Layout {
+    # The size this layout was built for. Panels read these rather than the
+    # starting constants, so everything follows a resize.
+    w: i32,
+    h: i32,
+
+    # Row one.
+    env_x: i32, env_y: i32, env_w: i32, env_h: i32,
+    pop_x: i32, pop_y: i32, pop_w: i32, pop_h: i32,
+    ctl_x: i32, ctl_y: i32, ctl_w: i32, ctl_h: i32,
+    # Row two is a single tabbed area. One panel at a time gets the whole
+    # width, which is what makes room for a readable network diagram and
+    # stops the inspector and the profiler from each being a narrow column.
+    # The per-panel rectangles below are all the same rectangle; the panels
+    # were written against their own names and did not have to change.
+    tabbar_x: i32, tabbar_y: i32, tabbar_w: i32, tabbar_h: i32,
+    rat_x: i32, rat_y: i32, rat_w: i32, rat_h: i32,
+    can_x: i32, can_y: i32, can_w: i32, can_h: i32,
+    prf_x: i32, prf_y: i32, prf_w: i32, prf_h: i32,
+    edt_x: i32, edt_y: i32, edt_w: i32, edt_h: i32,
+    net_x: i32, net_y: i32, net_w: i32, net_h: i32,
+    etho_x: i32, etho_y: i32, etho_w: i32, etho_h: i32,
+    ana_x: i32, ana_y: i32, ana_w: i32, ana_h: i32,
+}
+
+export const TABBAR_H: i32 = 18
+
+function clamp_i(v: i32, lo: i32, hi: i32) -> i32 {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+# Panel widths are fractions of the window, clamped so a control panel never
+# gets too narrow to hold a slider and never grows so wide it wastes the
+# space the arena wants. The environment view and the editor panel take
+# whatever is left over, so the rows always add up exactly.
+export function layout_build(win_w: i32, win_h: i32) -> Layout {
+    let w: i32 = clamp_i(win_w, MIN_W, MAX_W)
+    let h: i32 = clamp_i(win_h, MIN_H, MAX_H)
+
+    let y0: i32 = HEADER_H + M
+    let avail: i32 = h - y0 - M * 2
+    # Row one gets the larger share: it holds the arena, which is the panel
+    # that benefits most from space.
+    let row1_h: i32 = (avail * 59) / 100
+    let y1: i32 = y0 + row1_h + M
+    let row2_h: i32 = h - y1 - M
+
+    let ctl_w: i32 = clamp_i((w * 19) / 100, 236, 340)
+    let pop_w: i32 = clamp_i((w * 32) / 100, 340, 640)
+    let env_w: i32 = w - M * 4 - ctl_w - pop_w
+
+    let tab_x: i32 = M
+    let tab_w: i32 = w - M * 2
+    let tab_y: i32 = y1 + TABBAR_H + 2
+    let tab_h: i32 = row2_h - TABBAR_H - 2
+
+    return Layout {
+        w: w, h: h,
+        env_x: M, env_y: y0, env_w: env_w, env_h: row1_h,
+        pop_x: M * 2 + env_w, pop_y: y0, pop_w: pop_w, pop_h: row1_h,
+        ctl_x: M * 3 + env_w + pop_w, ctl_y: y0,
+        ctl_w: ctl_w, ctl_h: row1_h,
+
+        tabbar_x: tab_x, tabbar_y: y1, tabbar_w: tab_w, tabbar_h: TABBAR_H,
+        rat_x: tab_x, rat_y: tab_y, rat_w: tab_w, rat_h: tab_h,
+        can_x: tab_x, can_y: tab_y, can_w: tab_w, can_h: tab_h,
+        prf_x: tab_x, prf_y: tab_y, prf_w: tab_w, prf_h: tab_h,
+        edt_x: tab_x, edt_y: tab_y, edt_w: tab_w, edt_h: tab_h,
+        net_x: tab_x, net_y: tab_y, net_w: tab_w, net_h: tab_h,
+        etho_x: tab_x, etho_y: tab_y, etho_w: tab_w, etho_h: tab_h,
+        ana_x: tab_x, ana_y: tab_y, ana_w: tab_w, ana_h: tab_h
+    }
+}
+
+# The framebuffer size for a given window size and interface scale.
+#
+# Dividing by the scale is what makes the interface bigger: a smaller buffer
+# stretched over the same window means every glyph covers more of the screen.
+# The backend scales by whole pixels, so a doubled interface is blocky rather
+# than blurred, which for a five-by-seven font is the better of the two.
+export function layout_buffer_size(view_w: i32, view_h: i32, scale: i32,
+                                   w_out: ptr<i32>, h_out: ptr<i32>) -> void {
+    let mut s: i32 = scale
+    if s < 1 { s = 1 }
+    if s > 3 { s = 3 }
+    w_out[0] = clamp_i(view_w / s, MIN_W, MAX_W)
+    h_out[0] = clamp_i(view_h / s, MIN_H, MAX_H)
+}
+
+# --- world view ------------------------------------------------------------
+
+# A window onto the arena. `zoom` is pixels per metre and (ox, oy) is the
+# world point at the centre of the rectangle, which is the pair that makes
+# zooming about the cursor a two-line operation.
+export struct View {
+    x: i32, y: i32, w: i32, h: i32,
+    ox: f64, oy: f64,
+    zoom: f64,
+}
+
+export function view_new(x: i32, y: i32, w: i32, h: i32) -> View {
+    return View { x: x, y: y, w: w, h: h, ox: 1.0, oy: 1.0, zoom: 200.0 }
+}
+
+export function view_set_rect(v: ptr<View>, x: i32, y: i32,
+                              w: i32, h: i32) -> void {
+    v.x = x
+    v.y = y
+    v.w = w
+    v.h = h
+}
+
+# Frame the whole arena with a margin.
+export function view_fit(v: ptr<View>, x0: f64, y0: f64,
+                         x1: f64, y1: f64) -> void {
+    let ww: f64 = x1 - x0
+    let wh: f64 = y1 - y0
+    if ww <= 0.0 or wh <= 0.0 { return }
+    let zx: f64 = ((v.w - 24) as f64) / ww
+    let zy: f64 = ((v.h - 24) as f64) / wh
+    let mut z: f64 = zx
+    if zy < z { z = zy }
+    v.zoom = z
+    v.ox = (x0 + x1) * 0.5
+    v.oy = (y0 + y1) * 0.5
+}
+
+# World +y is up; screen +y is down, so the y term is negated. Getting this
+# backwards silently mirrors every heading in the display.
+export function view_sx(v: ptr<View>, wx: f64) -> i32 {
+    return v.x + v.w / 2 + ((wx - v.ox) * v.zoom) as i32
+}
+
+export function view_sy(v: ptr<View>, wy: f64) -> i32 {
+    return v.y + v.h / 2 - ((wy - v.oy) * v.zoom) as i32
+}
+
+export function view_wx(v: ptr<View>, sx: i32) -> f64 {
+    return v.ox + ((sx - v.x - v.w / 2) as f64) / v.zoom
+}
+
+export function view_wy(v: ptr<View>, sy: i32) -> f64 {
+    return v.oy - ((sy - v.y - v.h / 2) as f64) / v.zoom
+}
+
+# Metres to pixels, for radii and line widths.
+export function view_px(v: ptr<View>, metres: f64) -> i32 {
+    let p: i32 = (metres * v.zoom) as i32
+    if p < 1 { return 1 }
+    return p
+}
+
+# Zoom about a screen point, so the world position under the cursor stays
+# under the cursor.
+export function view_zoom_at(v: ptr<View>, sx: i32, sy: i32,
+                             factor: f64) -> void {
+    let wx: f64 = view_wx(v, sx)
+    let wy: f64 = view_wy(v, sy)
+    let mut z: f64 = v.zoom * factor
+    if z < 20.0 { z = 20.0 }
+    if z > 4000.0 { z = 4000.0 }
+    v.zoom = z
+    # Solve for the origin that puts (wx, wy) back under (sx, sy).
+    v.ox = wx - ((sx - v.x - v.w / 2) as f64) / z
+    v.oy = wy + ((sy - v.y - v.h / 2) as f64) / z
+}
+
+export function view_pan(v: ptr<View>, dx_px: i32, dy_px: i32) -> void {
+    v.ox = v.ox - (dx_px as f64) / v.zoom
+    v.oy = v.oy + (dy_px as f64) / v.zoom
+}

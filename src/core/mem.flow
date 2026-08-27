@@ -1,0 +1,168 @@
+# Checked allocation, and a running total.
+#
+# WHY
+#   Every buffer in FlowRat came from a bare malloc whose result was used
+#   without being looked at. At four thousand rats the simulation asks for
+#   something over sixty megabytes across a hundred or so blocks, and a
+#   refusal anywhere in that produced a null pointer that was written to
+#   immediately. The result is a crash with no message, at a place unrelated
+#   to the allocation that failed.
+#
+#   Failing here instead costs one comparison per allocation, all of which
+#   happen at construction rather than per step, and says which buffer ran
+#   out. A simulator that cannot allocate its state cannot run, so stopping
+#   is the honest response; there is nothing to degrade to.
+#
+# THE TOTAL
+#   Every allocation and release passes through here, so the running total is
+#   exact rather than sampled, and the performance panel can report what the
+#   configuration currently costs. That number is the one that decides
+#   whether a rat count is reachable on a given machine.
+
+extern {
+    function malloc(size: i64) -> ptr<void>
+    function free(p: ptr<void>) -> void
+    function exit(code: i32) -> void
+}
+
+function mem_table_init() -> void {
+    if mem_ptrs != null { return }
+    mem_ptrs = malloc((MEM_TABLE_MAX as i64) * 8) as ptr<i64>
+    mem_sizes = malloc((MEM_TABLE_MAX as i64) * 8) as ptr<i64>
+    if mem_ptrs == null or mem_sizes == null {
+        printf("flowrat: cannot reserve the allocation table\n")
+        exit(1)
+    }
+}
+
+function mem_table_add(p: ptr<void>, bytes: i64) -> void {
+    mem_table_init()
+    if mem_n >= MEM_TABLE_MAX {
+        # More live blocks than the table holds. The program still runs; the
+        # total stops being exact, and says so rather than drifting quietly.
+        mem_overflowed = true
+        return
+    }
+    mem_ptrs[mem_n] = p as i64
+    mem_sizes[mem_n] = bytes
+    mem_n = mem_n + 1
+}
+
+# Remove a pointer from the table and return how large it was, or zero when
+# it was never recorded.
+function mem_table_take(p: ptr<void>) -> i64 {
+    let key: i64 = p as i64
+    let mut i: i32 = mem_n - 1
+    while i >= 0 {
+        if mem_ptrs[i] == key {
+            let bytes: i64 = mem_sizes[i]
+            let last: i32 = mem_n - 1
+            mem_ptrs[i] = mem_ptrs[last]
+            mem_sizes[i] = mem_sizes[last]
+            mem_n = last
+            return bytes
+        }
+        i = i - 1
+    }
+    return 0
+}
+
+# Every live block, so a release can subtract the right number.
+#
+# libc will not say how large a block was, and the destroy paths do not all
+# know either: a population frees six buffers whose sizes were derived from
+# counts that have since changed. Without this the total only ever grew, and
+# the panel that reported it was reporting the sum of everything ever
+# allocated rather than what is held now.
+#
+# Linear search, because allocation and release happen at construction and
+# teardown rather than per step, and the table is a few thousand entries at
+# most. The search runs backwards: the common pattern is a destroy freeing
+# the buffers a create allocated together, and those are at the end.
+const MEM_TABLE_MAX: i32 = 16384
+let mut mem_ptrs: ptr<i64> = null
+let mut mem_sizes: ptr<i64> = null
+let mut mem_n: i32 = 0
+let mut mem_overflowed: bool = false
+
+let mut mem_live: i64 = 0
+let mut mem_peak: i64 = 0
+let mut mem_blocks: i32 = 0
+let mut mem_calls: i32 = 0
+
+# Allocate or stop. `what` names the buffer in the failure message, which is
+# the only thing that makes the message worth printing.
+export function mem_alloc(bytes: i64, what: string) -> ptr<void> {
+    mem_calls = mem_calls + 1
+    if bytes <= 0 {
+        # A zero-length buffer is a caller bug rather than an allocation
+        # failure, and returning null for it would be indistinguishable from
+        # one. Give it a byte so the pointer is valid and unique.
+        let tiny: ptr<void> = malloc(1)
+        if tiny == null {
+            printf("flowrat: out of memory reserving %s\n", what)
+            exit(1)
+        }
+        mem_blocks = mem_blocks + 1
+        mem_table_add(tiny, 1)
+        mem_live = mem_live + 1
+        if mem_live > mem_peak { mem_peak = mem_live }
+        return tiny
+    }
+    let p: ptr<void> = malloc(bytes)
+    if p == null {
+        printf("flowrat: out of memory allocating %s, %.1f MB requested\n",
+               what, (bytes as f64) / 1048576.0)
+        printf("flowrat: %.1f MB already held across %d blocks\n",
+               (mem_live as f64) / 1048576.0, mem_blocks)
+        exit(1)
+    }
+    mem_live = mem_live + bytes
+    if mem_live > mem_peak { mem_peak = mem_live }
+    mem_blocks = mem_blocks + 1
+    mem_table_add(p, bytes)
+    return p
+}
+
+export function mem_alloc_f64(count: i64, what: string) -> ptr<f64> {
+    return mem_alloc(count * 8, what) as ptr<f64>
+}
+
+export function mem_alloc_i32(count: i64, what: string) -> ptr<i32> {
+    return mem_alloc(count * 4, what) as ptr<i32>
+}
+
+export function mem_alloc_u8(count: i64, what: string) -> ptr<u8> {
+    return mem_alloc(count, what) as ptr<u8>
+}
+
+# Release a block and take its size back off the total. The size comes from
+# the table rather than from the caller, so no destroy path has to remember
+# how large a buffer was when it was made.
+export function mem_release(p: ptr<void>) -> void {
+    if p == null { return }
+    let bytes: i64 = mem_table_take(p)
+    free(p)
+    mem_live = mem_live - bytes
+    if mem_live < 0 { mem_live = 0 }
+    mem_blocks = mem_blocks - 1
+    if mem_blocks < 0 { mem_blocks = 0 }
+}
+
+export function mem_live_bytes() -> i64 { return mem_live }
+export function mem_peak_bytes() -> i64 { return mem_peak }
+export function mem_block_count() -> i32 { return mem_blocks }
+
+export function mem_live_mb() -> f64 {
+    return (mem_live as f64) / 1048576.0
+}
+
+export function mem_peak_mb() -> f64 {
+    return (mem_peak as f64) / 1048576.0
+}
+
+# True when more blocks were live at once than the table can hold, at which
+# point the total is a lower bound rather than a measurement.
+export function mem_total_exact() -> bool {
+    return !mem_overflowed
+}

@@ -1,0 +1,565 @@
+# Theme and immediate-mode widgets.
+#
+# Widgets hold no state of their own. Each call draws the control from the
+# value it is handed and reports whether the mouse changed it, so there is
+# never a copy of a parameter living in the UI that can drift from the
+# simulation's copy. A slider writes straight through a pointer into the
+# parameter struct it is editing.
+#
+# The one piece of state is which control the mouse captured on press.
+# Without it, dragging a slider and passing over another one would hand the
+# drag to whichever control the cursor happened to be above.
+
+import "draw.flow"
+
+extern {
+    function floor(x: f64) -> f64
+}
+
+# --- theme -----------------------------------------------------------------
+
+# Packed 0xRRGGBB. A cool near-black ground with one warm accent, so the
+# thing the eye should go to (the selected rat, the active control, a bump)
+# is the only warm colour on screen.
+export const C_BG: i32 = 1053468        # 10131c  window ground
+export const C_PANEL: i32 = 1448486     # 161a26  panel fill
+export const C_PANEL_HI: i32 = 2041140  # 1f2534  title bar, control ground
+export const C_EDGE: i32 = 2765381      # 2a3245  panel border
+export const C_TEXT: i32 = 14870255     # e2e6ef  primary text
+export const C_LABEL: i32 = 10002612    # 98a0b4  field labels
+export const C_DIM: i32 = 7042184       # 6b7488  axis ticks, hints
+export const C_ACCENT: i32 = 15771733   # f0a855  selection, active control
+export const C_ACCENT2: i32 = 4095912   # 3e7fa8  filled control track
+export const C_GOOD: i32 = 7981182      # 79c87e  within tolerance
+export const C_WARN: i32 = 15251531     # e8b84b  near a limit
+export const C_BAD: i32 = 14706783      # e0685f  over a limit
+
+# Column width for the tabbed panels.
+#
+# Row two is the full window wide, so a panel that lays out against its own
+# width puts a label at the left edge and its number fourteen hundred pixels
+# away. Everything in there is laid out in fixed columns instead, and reads
+# at any window size.
+export const COLW: i32 = 300
+export const COLGAP: i32 = 22
+
+export function ui_col(base: i32, i: i32) -> i32 {
+    return base + i * (COLW + COLGAP)
+}
+
+export const PAD: i32 = 8
+export const ROW_H: i32 = 16
+export const TITLE_H: i32 = 18
+
+# --- interaction state -----------------------------------------------------
+
+export struct Ui {
+    mx: i32,
+    my: i32,
+    down: bool,
+    prev_down: bool,
+    pressed: bool,
+    released: bool,
+    # Per-frame wheel delta. The backend reports a cumulative total that never
+    # resets, so it is differenced here. Passing the raw total straight
+    # through leaves it permanently non-zero after the first scroll, and
+    # anything driven by it runs away every frame.
+    wheel: i32,
+    wheel_total: i32,
+    # Secondary button, used to pan the arena view whatever tool is active.
+    right: bool,
+    prev_right: bool,
+    right_pressed: bool,
+    # Double click. A widget compares the current press against the last one:
+    # same control, close enough in time and place, and it is a double click.
+    # The convention throughout is that a double click restores a default.
+    now_ms: f64,
+    last_click_ms: f64,
+    last_click_id: i32,
+    last_click_x: i32,
+    last_click_y: i32,
+    double_click: bool,
+    # Id of the control that captured the current drag, 0 for none.
+    active: i32,
+    next_id: i32,
+    # Set by any widget that consumed this frame's click, so the view
+    # underneath does not also act on it.
+    consumed: bool,
+}
+
+export function ui_create() -> Ui {
+    return Ui {
+        mx: 0, my: 0, down: false, prev_down: false,
+        pressed: false, released: false, wheel: 0, wheel_total: 0,
+        right: false, prev_right: false, right_pressed: false,
+        now_ms: 0.0, last_click_ms: -10000.0, last_click_id: -1,
+        last_click_x: 0, last_click_y: 0, double_click: false,
+        active: 0, next_id: 0, consumed: false
+    }
+}
+
+# `wheel_total` is the backend's cumulative scroll count.
+export function ui_begin(u: ptr<Ui>, mx: i32, my: i32, down: bool,
+                         wheel_total: i32) -> void {
+    ui_begin_full(u, mx, my, down, false, wheel_total, clock_ms())
+}
+
+# The full form. `now` is milliseconds on any monotonic clock; it exists as a
+# parameter rather than being read here so a test can drive the double-click
+# window without waiting for real time to pass.
+export function ui_begin_full(u: ptr<Ui>, mx: i32, my: i32, down: bool,
+                              right: bool, wheel_total: i32,
+                              now: f64) -> void {
+    u.mx = mx
+    u.my = my
+    u.prev_down = u.down
+    u.down = down
+    u.pressed = down and !u.prev_down
+    u.released = !down and u.prev_down
+    u.prev_right = u.right
+    u.right = right
+    u.right_pressed = right and !u.prev_right
+    u.wheel = wheel_total - u.wheel_total
+    u.wheel_total = wheel_total
+    u.now_ms = now
+    u.next_id = 1
+    u.consumed = false
+    u.double_click = false
+    if !down { u.active = 0 }
+}
+
+# Time within which a second press on the same control counts as a double
+# click, and how far the pointer may drift between the two.
+const DOUBLE_MS: f64 = 380.0
+const DOUBLE_SLOP: i32 = 6
+
+# Call once per widget, on the frame it was pressed. Records the click so the
+# next one can be compared against it.
+export function ui_is_double_at(u: ptr<Ui>, id: i32) -> bool {
+    return ui_is_double(u, id)
+}
+
+function ui_is_double(u: ptr<Ui>, id: i32) -> bool {
+    let dt: f64 = u.now_ms - u.last_click_ms
+    let dx: i32 = u.mx - u.last_click_x
+    let dy: i32 = u.my - u.last_click_y
+    let near: bool = dx < DOUBLE_SLOP and dx > -DOUBLE_SLOP
+                     and dy < DOUBLE_SLOP and dy > -DOUBLE_SLOP
+    let same: bool = u.last_click_id == id
+    let quick: bool = dt >= 0.0 and dt < DOUBLE_MS
+    let is_double: bool = same and quick and near
+    # A double click consumes its own history, so a third press starts a new
+    # pair rather than firing again.
+    if is_double {
+        u.last_click_ms = -10000.0
+        u.last_click_id = -1
+    } else {
+        u.last_click_ms = u.now_ms
+        u.last_click_id = id
+        u.last_click_x = u.mx
+        u.last_click_y = u.my
+    }
+    return is_double
+}
+
+function ui_id(u: ptr<Ui>) -> i32 {
+    let id: i32 = u.next_id
+    u.next_id = id + 1
+    return id
+}
+
+export function ui_hit(u: ptr<Ui>, x: i32, y: i32, w: i32, h: i32) -> bool {
+    if u.mx < x or u.mx >= x + w { return false }
+    if u.my < y or u.my >= y + h { return false }
+    return true
+}
+
+# --- containers ------------------------------------------------------------
+
+export function ui_panel(c: ptr<Canvas>, x: i32, y: i32, w: i32, h: i32,
+                         title: string) -> void {
+    dr_rect(c, x, y, w, h, C_PANEL)
+    dr_frame(c, x, y, w, h, C_EDGE)
+    if dr_text_width(title, 1) > 0 {
+        dr_rect(c, x + 1, y + 1, w - 2, TITLE_H - 2, C_PANEL_HI)
+        let t: i32 = dr_text(c, x + PAD, y + 6, title, 1, C_LABEL)
+    }
+}
+
+export function ui_panel_body_y(y: i32) -> i32 {
+    return y + TITLE_H + 4
+}
+
+# A label on the left, a value on the right, one row high. The commonest
+# thing in the whole interface.
+export function ui_kv(c: ptr<Canvas>, x: i32, y: i32, w: i32,
+                      label: string, col: i32) -> void {
+    let t: i32 = dr_text(c, x, y, label, 1, C_LABEL)
+}
+
+export function ui_kv_fixed(c: ptr<Canvas>, x: i32, y: i32, w: i32,
+                            label: string, v: f64, decimals: i32,
+                            col: i32) -> void {
+    let t: i32 = dr_text(c, x, y, label, 1, C_LABEL)
+    dr_fixed_right(c, x + w, y, v, decimals, 1, col)
+}
+
+export function ui_kv_int(c: ptr<Canvas>, x: i32, y: i32, w: i32,
+                          label: string, v: i32, col: i32) -> void {
+    let t: i32 = dr_text(c, x, y, label, 1, C_LABEL)
+    dr_int_right(c, x + w, y, v, 1, col)
+}
+
+export function ui_kv_text(c: ptr<Canvas>, x: i32, y: i32, w: i32,
+                           label: string, v: string, col: i32) -> void {
+    let t: i32 = dr_text(c, x, y, label, 1, C_LABEL)
+    dr_text_right(c, x + w, y, v, 1, col)
+}
+
+# --- controls --------------------------------------------------------------
+
+export function ui_button(u: ptr<Ui>, c: ptr<Canvas>, x: i32, y: i32,
+                          w: i32, h: i32, label: string) -> bool {
+    let id: i32 = ui_id(u)
+    let over: bool = ui_hit(u, x, y, w, h)
+    let mut bg: i32 = C_PANEL_HI
+    if over { bg = col_scale(C_PANEL_HI, 1.5) }
+    if over and u.down { bg = C_ACCENT2 }
+    dr_rect(c, x, y, w, h, bg)
+    dr_frame(c, x, y, w, h, C_EDGE)
+    dr_text_center(c, x + w / 2, y + (h - CHAR_H) / 2, label, 1, C_TEXT)
+    if over and u.pressed {
+        u.consumed = true
+        return true
+    }
+    return false
+}
+
+export function ui_toggle(u: ptr<Ui>, c: ptr<Canvas>, x: i32, y: i32,
+                          w: i32, h: i32, label: string,
+                          on: bool) -> bool {
+    let id: i32 = ui_id(u)
+    let over: bool = ui_hit(u, x, y, w, h)
+    let mut bg: i32 = C_PANEL_HI
+    if on { bg = C_ACCENT2 }
+    if over { bg = col_scale(bg, 1.4) }
+    dr_rect(c, x, y, w, h, bg)
+    dr_frame(c, x, y, w, h, C_EDGE)
+    # A filled pip on the left says which way the toggle is set without
+    # relying on the fill colour alone.
+    let pip: i32 = h - 8
+    if on {
+        dr_rect(c, x + 4, y + 4, pip, pip, C_TEXT)
+    } else {
+        dr_frame(c, x + 4, y + 4, pip, pip, C_LABEL)
+    }
+    let mut tc: i32 = C_LABEL
+    if on { tc = C_TEXT }
+    let t: i32 = dr_text(c, x + pip + 10, y + (h - CHAR_H) / 2, label, 1, tc)
+    if over and u.pressed {
+        u.consumed = true
+        return true
+    }
+    return false
+}
+
+# Horizontal slider over a float. Writes through `value` and returns true on
+# any change, so the caller can rebuild whatever the parameter feeds.
+#
+# A double click restores `def`. That is the only way back to a known state
+# once a slider has been dragged, and it is the same gesture on every control
+# here, so the default is passed in rather than remembered somewhere else.
+# The default is also drawn as a tick on the track, so it can be found by eye
+# before the double click rather than only after it.
+export function ui_slider(u: ptr<Ui>, c: ptr<Canvas>, x: i32, y: i32,
+                          w: i32, h: i32, label: string,
+                          value: ptr<f64>, lo: f64, hi: f64,
+                          def: f64, decimals: i32) -> bool {
+    let id: i32 = ui_id(u)
+    let over: bool = ui_hit(u, x, y, w, h)
+    let mut changed: bool = false
+    if over and u.pressed {
+        u.active = id
+        if ui_is_double(u, id) {
+            value[0] = def
+            u.active = 0
+            u.consumed = true
+            changed = true
+        }
+    }
+    let dragging: bool = u.active == id and u.down
+
+    let span: f64 = hi - lo
+    let mut v: f64 = value[0]
+    if dragging {
+        u.consumed = true
+        let mut f: f64 = ((u.mx - x - 2) as f64) / ((w - 4) as f64)
+        if f < 0.0 { f = 0.0 }
+        if f > 1.0 { f = 1.0 }
+        let nv: f64 = lo + f * span
+        if nv != v {
+            v = nv
+            value[0] = nv
+            changed = true
+        }
+    }
+
+    let mut frac: f64 = 0.0
+    if span > 0.0 { frac = (v - lo) / span }
+    if frac < 0.0 { frac = 0.0 }
+    if frac > 1.0 { frac = 1.0 }
+
+    dr_rect(c, x, y, w, h, C_PANEL_HI)
+    let fill: i32 = ((w - 4) as f64 * frac) as i32
+    let mut fc: i32 = C_ACCENT2
+    if over or dragging { fc = C_ACCENT }
+    dr_rect(c, x + 2, y + 2, fill, h - 4, fc)
+    ui_default_tick(c, x, y, w, h, def, lo, hi)
+    dr_frame(c, x, y, w, h, C_EDGE)
+    let t: i32 = dr_text(c, x + 6, y + (h - CHAR_H) / 2, label, 1, C_TEXT)
+    dr_fixed_right(c, x + w - 6, y + (h - CHAR_H) / 2, v, decimals, 1, C_TEXT)
+    return changed
+}
+
+# A notch on the track showing where the default sits, so it can be found by
+# eye before the double click rather than only after it. The fraction is
+# passed in rather than derived, because the exponential slider does not map
+# its value to its track linearly and a linear tick would sit in the wrong
+# place by a factor of sixty at the low end.
+function ui_default_tick_frac(c: ptr<Canvas>, x: i32, y: i32, w: i32, h: i32,
+                              frac: f64) -> void {
+    let mut f: f64 = frac
+    if f < 0.0 { f = 0.0 }
+    if f > 1.0 { f = 1.0 }
+    let tx: i32 = x + 2 + (((w - 4) as f64) * f) as i32
+    dr_vline(c, tx, y + 1, y + 2, C_DIM)
+    dr_vline(c, tx, y + h - 3, y + h - 2, C_DIM)
+}
+
+function ui_default_tick(c: ptr<Canvas>, x: i32, y: i32, w: i32, h: i32,
+                         def: f64, lo: f64, hi: f64) -> void {
+    if hi <= lo { return }
+    ui_default_tick_frac(c, x, y, w, h, (def - lo) / (hi - lo))
+}
+
+# Integer slider. Rounds to whole steps so the label never shows a value the
+# simulation cannot actually take.
+export function ui_slider_int(u: ptr<Ui>, c: ptr<Canvas>, x: i32, y: i32,
+                              w: i32, h: i32, label: string,
+                              value: ptr<i32>, lo: i32, hi: i32,
+                              def: i32) -> bool {
+    let id: i32 = ui_id(u)
+    let over: bool = ui_hit(u, x, y, w, h)
+    let mut changed: bool = false
+    if over and u.pressed {
+        u.active = id
+        if ui_is_double(u, id) {
+            value[0] = def
+            u.active = 0
+            u.consumed = true
+            changed = true
+        }
+    }
+    let dragging: bool = u.active == id and u.down
+
+    let mut v: i32 = value[0]
+    if dragging {
+        u.consumed = true
+        let mut f: f64 = ((u.mx - x - 2) as f64) / ((w - 4) as f64)
+        if f < 0.0 { f = 0.0 }
+        if f > 1.0 { f = 1.0 }
+        let nv: i32 = lo + (floor(f * ((hi - lo) as f64) + 0.5) as i32)
+        if nv != v {
+            v = nv
+            value[0] = nv
+            changed = true
+        }
+    }
+
+    let mut frac: f64 = 0.0
+    if hi > lo { frac = ((v - lo) as f64) / ((hi - lo) as f64) }
+    if frac < 0.0 { frac = 0.0 }
+    if frac > 1.0 { frac = 1.0 }
+
+    dr_rect(c, x, y, w, h, C_PANEL_HI)
+    let fill: i32 = ((w - 4) as f64 * frac) as i32
+    let mut fc: i32 = C_ACCENT2
+    if over or dragging { fc = C_ACCENT }
+    dr_rect(c, x + 2, y + 2, fill, h - 4, fc)
+    ui_default_tick(c, x, y, w, h, def as f64, lo as f64, hi as f64)
+    dr_frame(c, x, y, w, h, C_EDGE)
+    let t: i32 = dr_text(c, x + 6, y + (h - CHAR_H) / 2, label, 1, C_TEXT)
+    dr_int_right(c, x + w - 6, y + (h - CHAR_H) / 2, v, 1, C_TEXT)
+    return changed
+}
+
+# Exponential slider, for quantities spanning decades such as the rat count.
+# A linear control over one to four thousand would spend nine tenths of its
+# travel above a thousand.
+export function ui_slider_exp(u: ptr<Ui>, c: ptr<Canvas>, x: i32, y: i32,
+                              w: i32, h: i32, label: string,
+                              value: ptr<i32>, lo: i32, hi: i32,
+                              def: i32) -> bool {
+    let id: i32 = ui_id(u)
+    let over: bool = ui_hit(u, x, y, w, h)
+    let mut changed: bool = false
+    if over and u.pressed {
+        u.active = id
+        if ui_is_double(u, id) {
+            value[0] = def
+            u.active = 0
+            u.consumed = true
+            changed = true
+        }
+    }
+    let dragging: bool = u.active == id and u.down
+
+    let llo: f64 = log2_of(lo as f64)
+    let lhi: f64 = log2_of(hi as f64)
+    let mut v: i32 = value[0]
+    if dragging {
+        u.consumed = true
+        let mut f: f64 = ((u.mx - x - 2) as f64) / ((w - 4) as f64)
+        if f < 0.0 { f = 0.0 }
+        if f > 1.0 { f = 1.0 }
+        let nv: i32 = pow2_of(llo + f * (lhi - llo)) as i32
+        if nv != v {
+            v = nv
+            value[0] = nv
+            changed = true
+        }
+    }
+
+    let mut frac: f64 = 0.0
+    if lhi > llo { frac = (log2_of(v as f64) - llo) / (lhi - llo) }
+    if frac < 0.0 { frac = 0.0 }
+    if frac > 1.0 { frac = 1.0 }
+
+    dr_rect(c, x, y, w, h, C_PANEL_HI)
+    let fill: i32 = ((w - 4) as f64 * frac) as i32
+    let mut fc: i32 = C_ACCENT2
+    if over or dragging { fc = C_ACCENT }
+    dr_rect(c, x + 2, y + 2, fill, h - 4, fc)
+    let mut dfrac: f64 = 0.0
+    if lhi > llo { dfrac = (log2_of(def as f64) - llo) / (lhi - llo) }
+    ui_default_tick_frac(c, x, y, w, h, dfrac)
+    dr_frame(c, x, y, w, h, C_EDGE)
+    let t: i32 = dr_text(c, x + 6, y + (h - CHAR_H) / 2, label, 1, C_TEXT)
+    dr_int_right(c, x + w - 6, y + (h - CHAR_H) / 2, v, 1, C_TEXT)
+    return changed
+}
+
+extern {
+    function log(x: f64) -> f64
+    function exp(x: f64) -> f64
+}
+
+function log2_of(v: f64) -> f64 {
+    if v < 1.0 { return 0.0 }
+    return log(v) / 0.6931471805599453
+}
+
+function pow2_of(v: f64) -> f64 {
+    return exp(v * 0.6931471805599453)
+}
+
+# --- tabs ------------------------------------------------------------------
+
+# One tab in a row of them. The caller lays them out and decides what the
+# labels are, which keeps this free of any table of names.
+export function ui_tab(u: ptr<Ui>, c: ptr<Canvas>, x: i32, y: i32,
+                       w: i32, h: i32, label: string,
+                       active: bool) -> bool {
+    let id: i32 = ui_id(u)
+    let over: bool = ui_hit(u, x, y, w, h)
+    let mut bg: i32 = C_PANEL
+    if over { bg = C_PANEL_HI }
+    if active { bg = C_PANEL_HI }
+    dr_rect(c, x, y, w, h, bg)
+    # The active tab is marked by a bar along its top edge, so which one is
+    # selected survives being read in a hurry.
+    if active {
+        dr_rect(c, x, y, w, 2, C_ACCENT)
+    } else {
+        dr_rect(c, x, y + h - 1, w, 1, C_EDGE)
+    }
+    dr_vline(c, x + w - 1, y + 2, y + h - 3, C_EDGE)
+    let mut tc: i32 = C_LABEL
+    if active { tc = C_TEXT }
+    dr_text_center(c, x + w / 2, y + (h - CHAR_H) / 2, label, 1, tc)
+    if over and u.pressed {
+        u.consumed = true
+        return true
+    }
+    return false
+}
+
+# --- plots -----------------------------------------------------------------
+
+# Horizontal bar, filled from the left. `frac` above one is clamped and the
+# bar turns to the warning colour rather than silently sitting full.
+export function ui_bar(c: ptr<Canvas>, x: i32, y: i32, w: i32, h: i32,
+                       frac: f64, col: i32) -> void {
+    dr_rect(c, x, y, w, h, C_PANEL_HI)
+    let mut f: f64 = frac
+    let mut cc: i32 = col
+    if f > 1.0 {
+        f = 1.0
+        cc = C_WARN
+    }
+    if f < 0.0 { f = 0.0 }
+    dr_rect(c, x, y, ((w as f64) * f) as i32, h, cc)
+}
+
+# Vertical bars over a value array. The workhorse for showing a population
+# vector: one bar per cell, scaled to a shared maximum so two populations
+# drawn side by side are comparable.
+export function ui_bars(c: ptr<Canvas>, x: i32, y: i32, w: i32, h: i32,
+                        values: ptr<f64>, base: i32, n: i32,
+                        vmax: f64, col: i32) -> void {
+    if n <= 0 { return }
+    let mut m: f64 = vmax
+    if m <= 0.0 { m = 1.0 }
+    # Sub-pixel bar widths are handled by mapping cell index to a pixel span
+    # rather than by rounding a width, so no column is ever dropped.
+    for i in 0 to n {
+        let x0: i32 = x + (i * w) / n
+        let mut x1: i32 = x + ((i + 1) * w) / n
+        if x1 <= x0 { x1 = x0 + 1 }
+        let mut f: f64 = values[base + i] / m
+        if f < 0.0 { f = 0.0 }
+        if f > 1.0 { f = 1.0 }
+        let bh: i32 = ((h as f64) * f) as i32
+        if bh > 0 {
+            dr_rect(c, x0, y + h - bh, x1 - x0, bh, col)
+        }
+    }
+}
+
+# Line plot of a series, oldest on the left.
+export function ui_sparkline(c: ptr<Canvas>, x: i32, y: i32, w: i32, h: i32,
+                             values: ptr<f64>, n: i32, vmin: f64,
+                             vmax: f64, col: i32) -> void {
+    if n < 2 { return }
+    let span: f64 = vmax - vmin
+    if span <= 0.0 { return }
+    let mut px: i32 = x
+    let mut py: i32 = y + h - 1
+    for i in 0 to n {
+        let mut f: f64 = (values[i] - vmin) / span
+        if f < 0.0 { f = 0.0 }
+        if f > 1.0 { f = 1.0 }
+        let cx: i32 = x + (i * (w - 1)) / (n - 1)
+        let cy: i32 = y + h - 1 - ((f * ((h - 1) as f64)) as i32)
+        if i > 0 { dr_line(c, px, py, cx, cy, col) }
+        px = cx
+        py = cy
+    }
+}
+
+# Axis-style tick label row under a plot.
+export function ui_axis(c: ptr<Canvas>, x: i32, y: i32, w: i32,
+                        left: string, right: string) -> void {
+    let t: i32 = dr_text(c, x, y, left, 1, C_DIM)
+    dr_text_right(c, x + w, y, right, 1, C_DIM)
+}

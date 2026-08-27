@@ -1,0 +1,439 @@
+# FlowRat benchmarks.
+#
+# Run:  ./bench.sh
+#
+# Every figure is wall-clock time on the monotonic clock, taken over enough
+# repetitions that the clock's resolution stops mattering, after a warm-up
+# pass. Results are reported per step and per element so the scaling is
+# readable without arithmetic, and a result that is used is always consumed
+# by a printed number so the optimiser cannot delete the work.
+#
+# The rendering benchmark draws the real panels into a real framebuffer.
+# Nothing here opens a window, so it measures drawing rather than the
+# display's refresh.
+
+import "src/core/mem.flow"
+import "src/core/rng.flow"
+import "src/core/clock.flow"
+import "src/core/profile.flow"
+
+import "src/env/geometry.flow"
+import "src/env/environment.flow"
+import "src/env/queries.flow"
+import "src/env/presets.flow"
+
+import "src/sim/agents.flow"
+import "src/sim/integrate.flow"
+import "src/sim/behaviour.flow"
+import "src/sim/memory.flow"
+import "src/sim/spatial.flow"
+import "src/sim/novelty.flow"
+import "src/sim/motion.flow"
+
+import "src/neural/population.flow"
+import "src/neural/place.flow"
+import "src/neural/head_direction.flow"
+import "src/neural/velocity.flow"
+import "src/neural/grid.flow"
+import "src/neural/boundary.flow"
+import "src/neural/attractor.flow"
+import "src/neural/circuit.flow"
+
+import "src/sim/simulation.flow"
+import "src/analysis/ratemap.flow"
+import "src/analysis/scores.flow"
+import "src/analysis/session.flow"
+
+import "src/ui/draw.flow"
+import "src/ui/widgets.flow"
+import "src/ui/layout.flow"
+import "src/ui/view_env.flow"
+import "src/ui/view_pop.flow"
+import "src/ui/view_sys.flow"
+import "src/ui/view_net.flow"
+import "src/ui/view_etho.flow"
+
+import "src/io/record.flow"
+import "src/io/config.flow"
+
+extern {
+    function fabs(x: f64) -> f64
+    function malloc(size: i64) -> ptr<void>
+    function free(p: ptr<void>) -> void
+}
+
+# Reps chosen so each measurement runs for a few tens of milliseconds at
+# least. Below that the clock and the loop overhead start to show up in the
+# answer.
+function reps_for(work: i32) -> i32 {
+    if work <= 64 { return 400 }
+    if work <= 512 { return 200 }
+    if work <= 4096 { return 60 }
+    return 20
+}
+
+function head(title: string) -> void {
+    printf("\n%s\n", title)
+}
+
+# --- agent stepping --------------------------------------------------------
+
+function bench_agents() -> void {
+    head("agent stepping: motion plus the sensory sweep, per step")
+    printf("  %6s  %10s  %12s  %10s\n", "rats", "ms/step", "us/rat", "steps/s")
+    let counts: array<i32, 7> = [1, 16, 64, 256, 1024, 2048, 4096]
+    for k in 0 to 7 {
+        let n: i32 = counts[k]
+        let mut s: Sim = sim_create(n, PRESET_OBSTACLES, 4242)
+        s.can_enabled = false
+        for j in 0 to SIM_POP_COUNT {
+            let p: ptr<Pop> = sim_pop(&s, j)
+            p.enabled = false
+        }
+        # Warm up: first touch of the arrays pays for the page faults.
+        for j in 0 to 20 {
+            sim_step(&s)
+        }
+        let reps: i32 = reps_for(n)
+        let t0: i64 = clock_ns()
+        for j in 0 to reps {
+            sim_step(&s)
+        }
+        let ms: f64 = clock_since_ms(t0) / (reps as f64)
+        printf("  %6d  %10.4f  %12.4f  %10.0f\n",
+               n, ms, ms * 1000.0 / (n as f64), 1000.0 / ms)
+        # Consume the result so nothing above can be optimised away.
+        if s.agents.x[0] > 1000000.0 { printf("unreachable\n") }
+        sim_destroy(&s)
+    }
+}
+
+# --- population scaling ----------------------------------------------------
+
+function bench_population(kind: i32, label: string) -> void {
+    printf("\n  %s\n", label)
+    printf("  %6s  %6s  %10s  %12s\n", "rats", "cells", "ms/update",
+           "ns/cell-rat")
+    let cells: array<i32, 4> = [64, 256, 1024, 4096]
+    let rats: array<i32, 3> = [16, 256, 1024]
+    for ri in 0 to 3 {
+        for ci in 0 to 4 {
+            let nr: i32 = rats[ri]
+            let nc: i32 = cells[ci]
+            let mut s: Sim = sim_create(nr, PRESET_OPEN_FIELD, 11)
+            s.can_enabled = false
+            # Replace the population under test at the requested size.
+            let old: ptr<Pop> = sim_pop(&s, kind)
+            pop_destroy(old)
+            let fresh: Pop = pop_create(pop_kind_of(kind), nc, MAX_RATS, 8)
+            copy_pop(old, &fresh)
+            sim_configure_populations(&s)
+
+            for j in 0 to 5 {
+                update_one(&s, kind)
+            }
+            let work: i32 = nr * nc / 64
+            let reps: i32 = reps_for(work)
+            let t0: i64 = clock_ns()
+            for j in 0 to reps {
+                update_one(&s, kind)
+            }
+            let ms: f64 = clock_since_ms(t0) / (reps as f64)
+            let per: f64 = ms * 1000000.0 / ((nr as f64) * (nc as f64))
+            printf("  %6d  %6d  %10.4f  %12.2f\n", nr, nc, ms, per)
+            let p: ptr<Pop> = sim_pop(&s, kind)
+            if p.rates[0] > 100000.0 { printf("unreachable\n") }
+            sim_destroy(&s)
+        }
+    }
+}
+
+function pop_kind_of(index: i32) -> i32 {
+    if index == 1 { return POP_HEAD_DIR }
+    if index == 2 { return POP_VELOCITY }
+    if index == 3 { return POP_GRID }
+    if index == 4 { return POP_BOUNDARY }
+    return POP_PLACE
+}
+
+# Move a freshly allocated population into the slot the simulation holds.
+# Sim owns its populations by value, so the arrays are handed over rather
+# than the struct being reassigned.
+function copy_pop(dst: ptr<Pop>, src: ptr<Pop>) -> void {
+    dst.kind = src.kind
+    dst.n = src.n
+    dst.cap_rats = src.cap_rats
+    dst.enabled = true
+    dst.revision = 0
+    dst.rates = src.rates
+    dst.spikes = src.spikes
+    dst.p0 = src.p0
+    dst.p1 = src.p1
+    dst.p2 = src.p2
+    dst.p3 = src.p3
+    dst.p4 = src.p4
+    dst.hist_len = src.hist_len
+    dst.hist_head = 0
+    dst.hist_fill = 0
+    dst.hist_rat = 0
+    dst.hist = src.hist
+    dst.last_max = 0.0
+    dst.last_mean = 0.0
+    dst.last_argmax = 0
+}
+
+function update_one(s: ptr<Sim>, kind: i32) -> void {
+    if kind == 0 { place_update(&s.place, &s.agents, &s.env, &s.place_p) }
+    if kind == 1 { hd_update(&s.hd, &s.agents, &s.hd_p) }
+    if kind == 2 { velocity_update(&s.vel, &s.agents) }
+    if kind == 3 { grid_update(&s.grid, &s.agents, &s.grid_p) }
+    if kind == 4 { boundary_update(&s.bvc, &s.agents, &s.bvc_p) }
+}
+
+# --- recurrent scaling -----------------------------------------------------
+
+function bench_attractor_regime(label: string, sigma_div: f64) -> void {
+    printf("\n  %s\n", label)
+    printf("  %9s  %6s  %6s  %7s  %12s  %12s  %8s\n",
+           "sheet", "cells", "taps", "lam 2nd", "structured ms",
+           "dense ms", "speedup")
+    let sizes: array<i32, 5> = [16, 24, 32, 48, 64]
+    let dt: f64 = 1.0 / 60.0
+    for k in 0 to 5 {
+        let nx: i32 = sizes[k]
+        let mut c: Can = can_params_sheet(nx, nx)
+        can_set_sigma(&c, (nx as f64) / sigma_div, dt)
+        can_reset(&c, 7)
+        can_set_input_sheet(&c, 1.0, 0.5, 0.0, 0.0, false)
+
+        for j in 0 to 10 {
+            can_step(&c, dt)
+        }
+        let reps: i32 = reps_for(c.n / 4)
+        let t0: i64 = clock_ns()
+        for j in 0 to reps {
+            can_step(&c, dt)
+        }
+        let ms_struct: f64 = clock_since_ms(t0) / (reps as f64)
+
+        # The dense reference is only built when it fits. Above the limit the
+        # matrix alone would be hundreds of megabytes, which is the point the
+        # structured form is making.
+        let mut ms_dense: f64 = 0.0
+        if can_build_dense(&c) {
+            c.use_dense = true
+            for j in 0 to 5 {
+                can_step(&c, dt)
+            }
+            let dreps: i32 = reps_for(c.n)
+            let t1: i64 = clock_ns()
+            for j in 0 to dreps {
+                can_step(&c, dt)
+            }
+            ms_dense = clock_since_ms(t1) / (dreps as f64)
+            c.use_dense = false
+        }
+
+        if ms_dense > 0.0 {
+            printf("  %4dx%-4d  %6d  %6d  %7.3f  %12.4f  %12.4f  %7.1fx\n",
+                   nx, nx, c.n, can_taps(&c), c.lambda_second,
+                   ms_struct, ms_dense, ms_dense / ms_struct)
+        } else {
+            printf("  %4dx%-4d  %6d  %6d  %7.3f  %12.4f  %12s  %8s\n",
+                   nx, nx, c.n, can_taps(&c), c.lambda_second, ms_struct,
+                   "over limit", "-")
+        }
+        if c.r[0] > 1000000.0 { printf("unreachable\n") }
+        can_destroy(&c)
+    }
+}
+
+function bench_attractor() -> void {
+    head("recurrent update: structured local kernel against a dense matrix")
+    # Two regimes, because they answer different questions. A single-bump
+    # position sheet needs a kernel almost as wide as itself, so the
+    # structured form saves memory and little arithmetic. A lattice sheet has
+    # a genuinely local kernel, and there the arithmetic saving is the point.
+    bench_attractor_regime("position regime, sigma = n/5, one bump", 5.0)
+    bench_attractor_regime("lattice regime, sigma = n/16, several bumps",
+                           16.0)
+
+    head("recurrent memory: kernel against the equivalent dense matrix")
+    printf("  %9s  %6s  %14s  %14s\n", "sheet", "cells", "kernel bytes",
+           "dense bytes")
+    let sizes: array<i32, 5> = [16, 24, 32, 48, 64]
+    for k in 0 to 5 {
+        let nx: i32 = sizes[k]
+        let mut c: Can = can_params_sheet(nx, nx)
+        let kern: i64 = (c.kern_size as i64) * (c.n_dirs as i64) * 8
+        let dense: i64 = (c.n as i64) * (c.n as i64) * 8
+        printf("  %4dx%-4d  %6d  %14.0f  %14.0f\n",
+               nx, nx, c.n, kern as f64, dense as f64)
+        can_destroy(&c)
+    }
+}
+
+# --- environment queries ---------------------------------------------------
+
+function bench_queries() -> void {
+    head("environment queries: cost against arena complexity")
+    printf("  %14s  %6s  %14s  %14s\n", "arena", "walls", "us/ray-fan",
+           "us/nearest-wall")
+    for p in 0 to PRESET_COUNT {
+        let mut e: Env = env_create()
+        env_preset_apply(&e, p)
+        let fan: ptr<f64> = malloc((RAY_COUNT as i64) * 8) as ptr<f64>
+        let mut acc: f64 = 0.0
+
+        # Sample inside free space. A point in the bounding box but outside
+        # a circular arena casts rays that escape, and averaging those in
+        # would measure the miss path rather than the query.
+        let reps: i32 = 4000
+        let t0: i64 = clock_ns()
+        for j in 0 to reps {
+            let mut x: f64 = 0.0
+            let mut y: f64 = 0.0
+            let ok: bool = env_sample_free(&e, 1, 1, j as u32, 32, &x, &y)
+            env_ray_fan(&e, x, y, 0.0, RAY_COUNT, fan)
+            acc = acc + fan[0]
+        }
+        let us_fan: f64 = clock_since_ms(t0) * 1000.0 / (reps as f64)
+
+        let mut idx: i32 = 0
+        let mut nx: f64 = 0.0
+        let mut ny: f64 = 0.0
+        let t1: i64 = clock_ns()
+        for j in 0 to reps {
+            let mut x: f64 = 0.0
+            let mut y: f64 = 0.0
+            let ok: bool = env_sample_free(&e, 1, 1, j as u32, 32, &x, &y)
+            acc = acc + env_nearest_wall(&e, x, y, &idx, &nx, &ny)
+        }
+        let us_wall: f64 = clock_since_ms(t1) * 1000.0 / (reps as f64)
+
+        printf("  %14s  %6d  %14.4f  %14.4f\n",
+               env_preset_name(p), e.n_walls, us_fan, us_wall)
+        if acc > 1000000000000.0 { printf("unreachable\n") }
+        free(fan as ptr<void>)
+        env_destroy(&e)
+    }
+}
+
+# --- full workloads --------------------------------------------------------
+
+function bench_full(name: string, rats: i32, preset: i32,
+                    with_ui: bool, cv: ptr<Canvas>, lay: ptr<Layout>) -> void {
+    let mut s: Sim = sim_create(rats, preset, 31337)
+    let mut u: Ui = ui_create()
+    let mut ed: Editor = editor_new()
+    let mut rec: Recorder = rec_new()
+    let mut defs: Defaults = defaults_new(s.sheet.nx)
+    let mut v: View = view_new(lay.env_x, lay.env_y, lay.env_w, lay.env_h)
+    view_fit(&v, s.env.x0, s.env.y0, s.env.x1, s.env.y1)
+
+    for j in 0 to 20 {
+        sim_step(&s)
+        if with_ui { draw_all(cv, &u, &s, &ed, &rec, &v, &defs, lay) }
+    }
+
+    let reps: i32 = 120
+    let t0: i64 = clock_ns()
+    for j in 0 to reps {
+        sim_step(&s)
+        if with_ui { draw_all(cv, &u, &s, &ed, &rec, &v, &defs, lay) }
+    }
+    let ms: f64 = clock_since_ms(t0) / (reps as f64)
+
+    let mut mode: string = "sim only"
+    if with_ui { mode = "sim + ui" }
+    printf("  %-14s  %6d  %6d  %-10s  %9.3f  %9.1f\n",
+           name, rats, sim_total_cells(&s), mode, ms, 1000.0 / ms)
+    if s.agents.x[0] > 1000000.0 { printf("unreachable\n") }
+    sim_destroy(&s)
+}
+
+function draw_all(cv: ptr<Canvas>, u: ptr<Ui>, s: ptr<Sim>, ed: ptr<Editor>,
+                  rec: ptr<Recorder>, v: ptr<View>, defs: ptr<Defaults>,
+                  lay: ptr<Layout>) -> void {
+    ui_begin(u, -100, -100, false, 0)
+    dr_clear(cv, C_BG)
+    view_header_draw(cv, s, ed, 16.7, lay)
+    let a: bool = view_control_draw(cv, u, s, ed, v, defs, lay)
+    let b: bool = view_editor_draw(cv, u, s, ed, rec, v, defs, lay)
+    view_pop_draw(cv, u, s, ed, lay)
+    view_tabs_draw(cv, u, ed, lay)
+    # One tab at a time, as the application does.
+    if ed.tab == TAB_RAT { view_rat_draw(cv, u, s, ed, lay) }
+    if ed.tab == TAB_ETHO { view_etho_draw(cv, u, s, defs, ed, lay) }
+    if ed.tab == TAB_CAN { view_can_draw(cv, u, s, defs, lay) }
+    if ed.tab == TAB_NET { view_net_draw(cv, u, s, defs, ed, lay) }
+    if ed.tab == TAB_PERF { view_perf_draw(cv, u, s, 16.7, lay) }
+    view_env_draw(cv, u, v, s, ed, lay)
+}
+
+function bench_workloads() -> void {
+    head("full workloads: everything on, at sixty simulated hertz")
+    printf("  %-14s  %6s  %6s  %-10s  %9s  %9s\n",
+           "workload", "rats", "cells", "mode", "ms/frame", "frames/s")
+    let mut cv: Canvas = canvas_create(WIN_W, WIN_H)
+    let mut lay: Layout = layout_build(WIN_W, WIN_H)
+
+    bench_full("small", 8, PRESET_OPEN_FIELD, false, &cv, &lay)
+    bench_full("small", 8, PRESET_OPEN_FIELD, true, &cv, &lay)
+    bench_full("medium", 128, PRESET_OBSTACLES, false, &cv, &lay)
+    bench_full("medium", 128, PRESET_OBSTACLES, true, &cv, &lay)
+    bench_full("large", 1024, PRESET_FOUR_ROOMS, false, &cv, &lay)
+    bench_full("large", 1024, PRESET_FOUR_ROOMS, true, &cv, &lay)
+    bench_full("huge", 4096, PRESET_OPEN_FIELD, false, &cv, &lay)
+    bench_full("huge", 4096, PRESET_OPEN_FIELD, true, &cv, &lay)
+
+    canvas_destroy(&cv)
+}
+
+# --- integrator cost -------------------------------------------------------
+
+function bench_integrators() -> void {
+    head("integrator cost, 1024 rats, motion only")
+    printf("  %-14s  %10s  %14s\n", "integrator", "ms/step", "one-step error")
+    for k in 0 to INT_COUNT {
+        let mut s: Sim = sim_create(1024, PRESET_OPEN_FIELD, 5)
+        s.can_enabled = false
+        for j in 0 to SIM_POP_COUNT {
+            let p: ptr<Pop> = sim_pop(&s, j)
+            p.enabled = false
+        }
+        s.integrator = k
+        for j in 0 to 20 {
+            sim_step(&s)
+        }
+        let reps: i32 = 200
+        let t0: i64 = clock_ns()
+        for j in 0 to reps {
+            sim_step(&s)
+        }
+        let ms: f64 = clock_since_ms(t0) / (reps as f64)
+        printf("  %-14s  %10.4f  %14.3e\n", integrator_name(k), ms,
+               kin_step_error(k, 0.3, 0.4, 2.0, 1.0 / 60.0))
+        if s.agents.x[0] > 1000000.0 { printf("unreachable\n") }
+        sim_destroy(&s)
+    }
+}
+
+function main() -> i32 {
+    printf("FlowRat benchmarks\n")
+    printf("wall-clock on the monotonic clock, after warm-up\n")
+    prof_set_enabled(false)
+
+    bench_agents()
+    head("population update cost")
+    bench_population(0, "place cells")
+    bench_population(3, "grid cells")
+    bench_population(4, "boundary cells")
+    bench_queries()
+    bench_attractor()
+    bench_integrators()
+    bench_workloads()
+
+    printf("\ndone\n")
+    return 0
+}

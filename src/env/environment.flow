@@ -1,0 +1,683 @@
+# The environment: arena boundary, internal walls, cues, and zones.
+#
+# LAYOUT
+#   Walls are line segments in four parallel f64 arrays rather than an array
+#   of a Wall struct. Every wall query sweeps all four coordinates of every
+#   wall in order, so four dense streams beat one strided walk over a struct.
+#   The same reasoning runs through the rest of FlowRat.
+#
+#   The arena boundary lives in the same arrays as the internal walls, in the
+#   first `n_boundary` slots. One loop then answers "distance to any wall"
+#   without special-casing the boundary, and a circular arena is 64 short
+#   segments rather than a second code path. Containment still uses the
+#   analytic shape, where a rectangle is two comparisons.
+#
+#   Capacities are fixed and allocated once at creation. The editor adds and
+#   removes walls every frame; a growing allocation there would put malloc on
+#   the interaction path for no benefit at these sizes.
+
+import "geometry.flow"
+
+extern {
+    function sin(x: f64) -> f64
+    function cos(x: f64) -> f64
+}
+
+export const ENV_RECT: i32 = 0
+export const ENV_CIRCLE: i32 = 1
+export const ENV_POLY: i32 = 2
+
+export const ZONE_REWARD: i32 = 0
+export const ZONE_START: i32 = 1
+export const ZONE_TEXTURE: i32 = 2
+export const ZONE_WATER: i32 = 3
+
+# Food and water are the same kind of thing to the arena: a finite pile in a
+# place, which empties as animals take from it and comes back at its own rate.
+# Everything below that deals with amounts is written once and told which kind
+# it is working on, rather than twice with the word food swapped for water.
+export function zone_is_consumable(kind: i32) -> bool {
+    return kind == ZONE_REWARD or kind == ZONE_WATER
+}
+
+export const SHAPE_RECT: i32 = 0
+export const SHAPE_CIRCLE: i32 = 1
+
+export const MAX_WALLS: i32 = 512
+export const MAX_CUES: i32 = 64
+export const MAX_ZONES: i32 = 64
+# Every pellet and every drop in the arena at once. Eight patches of forty is
+# three hundred and twenty, so this leaves room to fill an arena and still
+# have the editor drop more.
+export const MAX_ITEMS: i32 = 1024
+export const MAX_SOLIDS: i32 = 128
+
+# Segments used to approximate a circular boundary. 64 keeps the largest
+# chord error under 0.1% of the radius, below the width of a drawn line.
+export const CIRCLE_SEGMENTS: i32 = 64
+
+export struct Env {
+    kind: i32,
+    # Axis-aligned bounding box of the whole arena, always valid. Rendering,
+    # spatial binning, and the rectangular containment test all read it.
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    # Circle parameters, valid when kind == ENV_CIRCLE.
+    cx: f64,
+    cy: f64,
+    radius: f64,
+
+    n_boundary: i32,
+    n_walls: i32,
+    wx0: ptr<f64>,
+    wy0: ptr<f64>,
+    wx1: ptr<f64>,
+    wy1: ptr<f64>,
+
+    n_cues: i32,
+    cue_x: ptr<f64>,
+    cue_y: ptr<f64>,
+    cue_strength: ptr<f64>,
+
+    # Solid regions. A box obstacle contributes both its four segments (for
+    # wall distance and ray casting) and one entry here (for containment).
+    # A free-standing barrier contributes segments only, so it blocks
+    # movement and sight without enclosing anything. Parity tests over loose
+    # segments cannot make that distinction, which is why this list exists.
+    n_solids: i32,
+    solid_x: ptr<f64>,
+    solid_y: ptr<f64>,
+    solid_w: ptr<f64>,
+    solid_h: ptr<f64>,
+
+    n_zones: i32,
+    zone_kind: ptr<i32>,
+    zone_shape: ptr<i32>,
+    zone_x: ptr<f64>,
+    zone_y: ptr<f64>,
+    zone_a: ptr<f64>,
+    zone_b: ptr<f64>,
+    # Food. A reward zone is a patch holding a finite amount, which rats
+    # remove by eating and which regrows at its own rate, or does not.
+    # Non-reward zones carry these too and ignore them, which costs three
+    # doubles a zone and saves a second parallel table.
+    zone_amount: ptr<f64>,
+    zone_capacity: ptr<f64>,
+    zone_regrow: ptr<f64>,
+    # Fractional regrowth owed to a patch, carried between steps. Items are
+    # whole things, so a patch that grows at 1.6 a second cannot deliver 0.027
+    # of one per step: it banks the fraction and spawns when it is owed a
+    # whole item.
+    zone_owed: ptr<f64>,
+
+    # Every individual thing a rat can eat or drink, as objects with
+    # positions rather than as an amount per patch.
+    #
+    # A patch used to hold a number, drawn as a scatter of decorative pellets
+    # regenerated from a seed. Eating removed 0.1 of a unit and the picture
+    # did not change, so nothing a rat did to the world was legible: you
+    # could watch a rat feed for ten seconds and see the same pellets in the
+    # same places the whole time. Now a bite takes one item, that item is
+    # gone from that spot, and the interaction is something you can point at.
+    n_items: i32,
+    item_x: ptr<f64>,
+    item_y: ptr<f64>,
+    # The patch it belongs to, so regrowth and the memory of a place still
+    # work in terms of patches. -1 for a dead slot.
+    item_zone: ptr<i32>,
+    item_kind: ptr<i32>,
+
+    preset: i32,
+    # Bumped by every edit. Anything that caches a derived quantity, such as
+    # place-field centres sampled inside the arena, compares against this to
+    # know it must rebuild.
+    revision: i32,
+}
+
+export function env_create() -> Env {
+    let mut e: Env = Env {
+        kind: ENV_RECT,
+        x0: 0.0, y0: 0.0, x1: 2.0, y1: 2.0,
+        cx: 1.0, cy: 1.0, radius: 1.0,
+        n_boundary: 0, n_walls: 0,
+        wx0: null, wy0: null, wx1: null, wy1: null,
+        n_cues: 0, cue_x: null, cue_y: null, cue_strength: null,
+        n_solids: 0,
+        solid_x: null, solid_y: null, solid_w: null, solid_h: null,
+        n_zones: 0,
+        zone_kind: null, zone_shape: null,
+        zone_x: null, zone_y: null, zone_a: null, zone_b: null,
+        zone_amount: null, zone_capacity: null, zone_regrow: null,
+        zone_owed: null,
+        n_items: 0, item_x: null, item_y: null, item_zone: null,
+        item_kind: null,
+        preset: 0, revision: 0
+    }
+    let wb: i64 = (MAX_WALLS as i64) * 8
+    e.wx0 = mem_alloc(wb, "arena tables") as ptr<f64>
+    e.wy0 = mem_alloc(wb, "arena tables") as ptr<f64>
+    e.wx1 = mem_alloc(wb, "arena tables") as ptr<f64>
+    e.wy1 = mem_alloc(wb, "arena tables") as ptr<f64>
+    let cb: i64 = (MAX_CUES as i64) * 8
+    e.cue_x = mem_alloc(cb, "arena tables") as ptr<f64>
+    e.cue_y = mem_alloc(cb, "arena tables") as ptr<f64>
+    e.cue_strength = mem_alloc(cb, "arena tables") as ptr<f64>
+    let sb: i64 = (MAX_SOLIDS as i64) * 8
+    e.solid_x = mem_alloc(sb, "arena tables") as ptr<f64>
+    e.solid_y = mem_alloc(sb, "arena tables") as ptr<f64>
+    e.solid_w = mem_alloc(sb, "arena tables") as ptr<f64>
+    e.solid_h = mem_alloc(sb, "arena tables") as ptr<f64>
+    let zb: i64 = (MAX_ZONES as i64) * 8
+    let zi: i64 = (MAX_ZONES as i64) * 4
+    e.zone_kind = mem_alloc(zi, "arena tables") as ptr<i32>
+    e.zone_shape = mem_alloc(zi, "arena tables") as ptr<i32>
+    e.zone_x = mem_alloc(zb, "arena tables") as ptr<f64>
+    e.zone_y = mem_alloc(zb, "arena tables") as ptr<f64>
+    e.zone_a = mem_alloc(zb, "arena tables") as ptr<f64>
+    e.zone_b = mem_alloc(zb, "arena tables") as ptr<f64>
+    e.zone_amount = mem_alloc(zb, "arena tables") as ptr<f64>
+    e.zone_capacity = mem_alloc(zb, "arena tables") as ptr<f64>
+    e.zone_owed = mem_alloc(zb, "arena tables") as ptr<f64>
+    let ib: i64 = (MAX_ITEMS as i64) * 8
+    let ii: i64 = (MAX_ITEMS as i64) * 4
+    e.item_x = mem_alloc(ib, "arena items") as ptr<f64>
+    e.item_y = mem_alloc(ib, "arena items") as ptr<f64>
+    e.item_zone = mem_alloc(ii, "arena items") as ptr<i32>
+    e.item_kind = mem_alloc(ii, "arena items") as ptr<i32>
+    e.zone_regrow = mem_alloc(zb, "arena tables") as ptr<f64>
+    return e
+}
+
+export function env_destroy(e: ptr<Env>) -> void {
+    mem_release(e.wx0 as ptr<void>)
+    mem_release(e.wy0 as ptr<void>)
+    mem_release(e.wx1 as ptr<void>)
+    mem_release(e.wy1 as ptr<void>)
+    mem_release(e.cue_x as ptr<void>)
+    mem_release(e.cue_y as ptr<void>)
+    mem_release(e.cue_strength as ptr<void>)
+    mem_release(e.solid_x as ptr<void>)
+    mem_release(e.solid_y as ptr<void>)
+    mem_release(e.solid_w as ptr<void>)
+    mem_release(e.solid_h as ptr<void>)
+    mem_release(e.zone_kind as ptr<void>)
+    mem_release(e.zone_shape as ptr<void>)
+    mem_release(e.zone_x as ptr<void>)
+    mem_release(e.zone_y as ptr<void>)
+    mem_release(e.zone_a as ptr<void>)
+    mem_release(e.zone_b as ptr<void>)
+    mem_release(e.zone_amount as ptr<void>)
+    mem_release(e.zone_capacity as ptr<void>)
+    mem_release(e.zone_owed as ptr<void>)
+    mem_release(e.item_x as ptr<void>)
+    mem_release(e.item_y as ptr<void>)
+    mem_release(e.item_zone as ptr<void>)
+    mem_release(e.item_kind as ptr<void>)
+    mem_release(e.zone_regrow as ptr<void>)
+}
+
+export function env_touch(e: ptr<Env>) -> void {
+    e.revision = e.revision + 1
+}
+
+export function env_clear(e: ptr<Env>) -> void {
+    e.n_boundary = 0
+    e.n_walls = 0
+    e.n_cues = 0
+    e.n_solids = 0
+    e.n_zones = 0
+    e.n_items = 0
+    env_touch(e)
+}
+
+# --- individual things to eat and drink -------------------------------------
+
+# Put one item somewhere inside a patch. The position is drawn from the zone
+# index and the item's own slot, so a given pellet sits in a given place and
+# stays there until something eats it.
+export function env_spawn_item(e: ptr<Env>, zone: i32) -> i32 {
+    if zone < 0 or zone >= e.n_zones { return -1 }
+    if e.n_items >= MAX_ITEMS { return -1 }
+    if !zone_is_consumable(e.zone_kind[zone]) { return -1 }
+    let i: i32 = e.n_items
+    let seed: u32 = (zone as u32) * 7919 + 13
+    let counter: u32 = (i as u32) + 1
+    let mut px: f64 = 0.0
+    let mut py: f64 = 0.0
+    if e.zone_shape[zone] == SHAPE_CIRCLE {
+        let ang: f64 = rng_u01(seed, 3, counter) * TAU
+        # Square-rooted so items spread evenly over the disc rather than
+        # bunching at the middle, which is what a uniform radius does.
+        let rr: f64 = sqrt(rng_u01(seed, 4, counter)) * e.zone_a[zone] * 0.82
+        px = e.zone_x[zone] + cos(ang) * rr
+        py = e.zone_y[zone] + sin(ang) * rr
+    } else {
+        px = e.zone_x[zone] + rng_u01(seed, 3, counter) * e.zone_a[zone]
+        py = e.zone_y[zone] + rng_u01(seed, 4, counter) * e.zone_b[zone]
+    }
+    e.item_x[i] = px
+    e.item_y[i] = py
+    e.item_zone[i] = zone
+    e.item_kind[i] = e.zone_kind[zone]
+    e.n_items = i + 1
+    e.zone_amount[zone] = e.zone_amount[zone] + 1.0
+    return i
+}
+
+# Remove one item. The last item moves into the hole, which keeps the array
+# dense and costs one swap.
+export function env_take_item(e: ptr<Env>, idx: i32) -> bool {
+    if idx < 0 or idx >= e.n_items { return false }
+    let z: i32 = e.item_zone[idx]
+    if z >= 0 and z < e.n_zones {
+        e.zone_amount[z] = e.zone_amount[z] - 1.0
+        if e.zone_amount[z] < 0.0 { e.zone_amount[z] = 0.0 }
+    }
+    let last: i32 = e.n_items - 1
+    e.item_x[idx] = e.item_x[last]
+    e.item_y[idx] = e.item_y[last]
+    e.item_zone[idx] = e.item_zone[last]
+    e.item_kind[idx] = e.item_kind[last]
+    e.n_items = last
+    return true
+}
+
+# Drop every item and repopulate each patch to its capacity. Called on reset,
+# so a run starts with the arena as it was drawn.
+export function env_refill_food(e: ptr<Env>) -> void {
+    e.n_items = 0
+    for z in 0 to e.n_zones {
+        e.zone_amount[z] = 0.0
+        e.zone_owed[z] = 0.0
+        if zone_is_consumable(e.zone_kind[z]) {
+            let want: i32 = (e.zone_capacity[z] + 0.5) as i32
+            for k in 0 to want {
+                let idx: i32 = env_spawn_item(e, z)
+            }
+        }
+    }
+}
+
+export function env_item_count(e: ptr<Env>, kind: i32) -> i32 {
+    let mut n: i32 = 0
+    for i in 0 to e.n_items {
+        if e.item_kind[i] == kind { n = n + 1 }
+    }
+    return n
+}
+
+# --- walls -----------------------------------------------------------------
+
+# Append a segment. Returns its index, or -1 when the arena is full.
+export function env_add_wall(e: ptr<Env>, ax: f64, ay: f64,
+                             bx: f64, by: f64) -> i32 {
+    if e.n_walls >= MAX_WALLS { return -1 }
+    let i: i32 = e.n_walls
+    e.wx0[i] = ax
+    e.wy0[i] = ay
+    e.wx1[i] = bx
+    e.wy1[i] = by
+    e.n_walls = i + 1
+    env_touch(e)
+    return i
+}
+
+# Remove an internal wall by index. Boundary segments are refused: deleting
+# one would open the arena and let a rat leave through the gap.
+export function env_remove_wall(e: ptr<Env>, idx: i32) -> bool {
+    if idx < e.n_boundary or idx >= e.n_walls { return false }
+    let last: i32 = e.n_walls - 1
+    # Order of internal walls carries no meaning, so fill the hole from the
+    # end rather than shifting the tail.
+    e.wx0[idx] = e.wx0[last]
+    e.wy0[idx] = e.wy0[last]
+    e.wx1[idx] = e.wx1[last]
+    e.wy1[idx] = e.wy1[last]
+    e.n_walls = last
+    env_touch(e)
+    return true
+}
+
+export function env_move_wall(e: ptr<Env>, idx: i32,
+                              dx: f64, dy: f64) -> bool {
+    if idx < e.n_boundary or idx >= e.n_walls { return false }
+    e.wx0[idx] = e.wx0[idx] + dx
+    e.wy0[idx] = e.wy0[idx] + dy
+    e.wx1[idx] = e.wx1[idx] + dx
+    e.wy1[idx] = e.wy1[idx] + dy
+    env_touch(e)
+    return true
+}
+
+# Four segments of an axis-aligned box, the usual way to add an obstacle.
+export function env_add_box(e: ptr<Env>, x: f64, y: f64,
+                            w: f64, h: f64) -> void {
+    let a: i32 = env_add_wall(e, x, y, x + w, y)
+    let b: i32 = env_add_wall(e, x + w, y, x + w, y + h)
+    let c: i32 = env_add_wall(e, x + w, y + h, x, y + h)
+    let d: i32 = env_add_wall(e, x, y + h, x, y)
+    if e.n_solids < MAX_SOLIDS {
+        let i: i32 = e.n_solids
+        e.solid_x[i] = x
+        e.solid_y[i] = y
+        e.solid_w[i] = w
+        e.solid_h[i] = h
+        e.n_solids = i + 1
+    }
+}
+
+# Remove the solid record whose box contains (px, py), and the four segments
+# that bound it. Used by the editor's delete tool.
+export function env_remove_solid_at(e: ptr<Env>, px: f64, py: f64) -> bool {
+    let mut found: i32 = -1
+    for i in 0 to e.n_solids {
+        if point_in_rect(px, py, e.solid_x[i], e.solid_y[i],
+                         e.solid_w[i], e.solid_h[i]) {
+            found = i
+        }
+    }
+    if found < 0 { return false }
+    let sx: f64 = e.solid_x[found]
+    let sy: f64 = e.solid_y[found]
+    let sw: f64 = e.solid_w[found]
+    let sh: f64 = e.solid_h[found]
+    let last: i32 = e.n_solids - 1
+    e.solid_x[found] = e.solid_x[last]
+    e.solid_y[found] = e.solid_y[last]
+    e.solid_w[found] = e.solid_w[last]
+    e.solid_h[found] = e.solid_h[last]
+    e.n_solids = last
+    # Drop every internal segment lying on this box's outline. Walking
+    # downwards keeps the swap-with-last removal from skipping an entry.
+    let mut i: i32 = e.n_walls - 1
+    while i >= e.n_boundary {
+        let on_x: bool = e.wx0[i] >= sx - 0.0001 and e.wx1[i] <= sx + sw + 0.0001
+        let on_y: bool = e.wy0[i] >= sy - 0.0001 and e.wy1[i] <= sy + sh + 0.0001
+        let rx: bool = e.wx1[i] >= sx - 0.0001 and e.wx0[i] <= sx + sw + 0.0001
+        let ry: bool = e.wy1[i] >= sy - 0.0001 and e.wy0[i] <= sy + sh + 0.0001
+        if on_x and on_y and rx and ry {
+            let ok: bool = env_remove_wall(e, i)
+        }
+        i = i - 1
+    }
+    env_touch(e)
+    return true
+}
+
+# Record a solid region without emitting segments. For presets that build an
+# outline themselves and only need the containment record.
+export function env_add_solid(e: ptr<Env>, x: f64, y: f64,
+                              w: f64, h: f64) -> void {
+    if e.n_solids >= MAX_SOLIDS { return }
+    let i: i32 = e.n_solids
+    e.solid_x[i] = x
+    e.solid_y[i] = y
+    e.solid_w[i] = w
+    e.solid_h[i] = h
+    e.n_solids = i + 1
+    env_touch(e)
+}
+
+# --- boundary --------------------------------------------------------------
+
+# Rectangular arena. Call before adding internal walls: the boundary must
+# occupy the first slots for env_remove_wall's protection to hold.
+export function env_set_rect(e: ptr<Env>, x0: f64, y0: f64,
+                             x1: f64, y1: f64) -> void {
+    env_clear(e)
+    e.kind = ENV_RECT
+    e.x0 = x0
+    e.y0 = y0
+    e.x1 = x1
+    e.y1 = y1
+    e.cx = (x0 + x1) * 0.5
+    e.cy = (y0 + y1) * 0.5
+    let hw: f64 = (x1 - x0) * 0.5
+    let hh: f64 = (y1 - y0) * 0.5
+    e.radius = geo_min(hw, hh)
+    let a: i32 = env_add_wall(e, x0, y0, x1, y0)
+    let b: i32 = env_add_wall(e, x1, y0, x1, y1)
+    let c: i32 = env_add_wall(e, x1, y1, x0, y1)
+    let d: i32 = env_add_wall(e, x0, y1, x0, y0)
+    e.n_boundary = 4
+    env_touch(e)
+}
+
+export function env_set_circle(e: ptr<Env>, cx: f64, cy: f64,
+                               r: f64) -> void {
+    env_clear(e)
+    e.kind = ENV_CIRCLE
+    e.cx = cx
+    e.cy = cy
+    e.radius = r
+    e.x0 = cx - r
+    e.y0 = cy - r
+    e.x1 = cx + r
+    e.y1 = cy + r
+    let step: f64 = TAU / (CIRCLE_SEGMENTS as f64)
+    for i in 0 to CIRCLE_SEGMENTS {
+        let a0: f64 = (i as f64) * step
+        let a1: f64 = ((i + 1) as f64) * step
+        let idx: i32 = env_add_wall(e,
+            cx + r * cos(a0), cy + r * sin(a0),
+            cx + r * cos(a1), cy + r * sin(a1))
+    }
+    e.n_boundary = CIRCLE_SEGMENTS
+    env_touch(e)
+}
+
+# Freeze however many walls exist as the protected boundary. Presets that
+# build a non-rectangular outer shell out of individual segments use this.
+export function env_seal_boundary(e: ptr<Env>) -> void {
+    e.n_boundary = e.n_walls
+    env_touch(e)
+}
+
+# --- cues ------------------------------------------------------------------
+
+export function env_add_cue(e: ptr<Env>, x: f64, y: f64,
+                            strength: f64) -> i32 {
+    if e.n_cues >= MAX_CUES { return -1 }
+    let i: i32 = e.n_cues
+    e.cue_x[i] = x
+    e.cue_y[i] = y
+    e.cue_strength[i] = strength
+    e.n_cues = i + 1
+    env_touch(e)
+    return i
+}
+
+export function env_remove_cue(e: ptr<Env>, idx: i32) -> bool {
+    if idx < 0 or idx >= e.n_cues { return false }
+    let last: i32 = e.n_cues - 1
+    e.cue_x[idx] = e.cue_x[last]
+    e.cue_y[idx] = e.cue_y[last]
+    e.cue_strength[idx] = e.cue_strength[last]
+    e.n_cues = last
+    env_touch(e)
+    return true
+}
+
+export function env_move_cue(e: ptr<Env>, idx: i32,
+                             x: f64, y: f64) -> bool {
+    if idx < 0 or idx >= e.n_cues { return false }
+    e.cue_x[idx] = x
+    e.cue_y[idx] = y
+    env_touch(e)
+    return true
+}
+
+# --- zones -----------------------------------------------------------------
+
+# A rectangular zone is stored as origin plus (a, b) = (width, height); a
+# circular zone as centre plus a = radius, with b unused.
+export function env_add_zone(e: ptr<Env>, kind: i32, shape: i32,
+                             x: f64, y: f64, a: f64, b: f64) -> i32 {
+    return env_add_zone_food(e, kind, shape, x, y, a, b,
+                             DEFAULT_FOOD, DEFAULT_REGROW)
+}
+
+# How much a reward zone holds when placed, and how fast it comes back.
+# One unit is roughly a pellet: at the default eating rate a rat clears one
+# in a couple of seconds, so a patch of twelve is a meal for one rat or a
+# brief squabble between several.
+export const DEFAULT_FOOD: f64 = 12.0
+export const DEFAULT_REGROW: f64 = 0.0
+
+export function env_add_zone_food(e: ptr<Env>, kind: i32, shape: i32,
+                                  x: f64, y: f64, a: f64, b: f64,
+                                  amount: f64, regrow: f64) -> i32 {
+    if e.n_zones >= MAX_ZONES { return -1 }
+    let i: i32 = e.n_zones
+    e.zone_kind[i] = kind
+    e.zone_shape[i] = shape
+    e.zone_x[i] = x
+    e.zone_y[i] = y
+    e.zone_a[i] = a
+    e.zone_b[i] = b
+    e.zone_amount[i] = 0.0
+    e.zone_capacity[i] = amount
+    e.zone_regrow[i] = regrow
+    e.zone_owed[i] = 0.0
+    e.n_zones = i + 1
+    # A patch placed with food in it has food in it. The amount is not a
+    # number the zone carries any more, it is however many items are sitting
+    # inside it, so stocking one means creating them.
+    if zone_is_consumable(kind) {
+        let want: i32 = (amount + 0.5) as i32
+        for k in 0 to want {
+            let idx: i32 = env_spawn_item(e, i)
+        }
+    }
+    env_touch(e)
+    return i
+}
+
+# How much of one kind is present, and what the arena holds when full.
+export function env_supply_remaining(e: ptr<Env>, kind: i32) -> f64 {
+    let mut t: f64 = 0.0
+    for i in 0 to e.n_zones {
+        if e.zone_kind[i] == kind { t = t + e.zone_amount[i] }
+    }
+    return t
+}
+
+export function env_supply_capacity(e: ptr<Env>, kind: i32) -> f64 {
+    let mut t: f64 = 0.0
+    for i in 0 to e.n_zones {
+        if e.zone_kind[i] == kind { t = t + e.zone_capacity[i] }
+    }
+    return t
+}
+
+export function env_food_remaining(e: ptr<Env>) -> f64 {
+    return env_supply_remaining(e, ZONE_REWARD)
+}
+
+export function env_food_capacity(e: ptr<Env>) -> f64 {
+    return env_supply_capacity(e, ZONE_REWARD)
+}
+
+export function env_water_remaining(e: ptr<Env>) -> f64 {
+    return env_supply_remaining(e, ZONE_WATER)
+}
+
+export function env_water_capacity(e: ptr<Env>) -> f64 {
+    return env_supply_capacity(e, ZONE_WATER)
+}
+
+# Regrowth, once per step, for both kinds. Serial, because several rats may
+# be drinking from the same puddle and the whole point is that they share one
+# number.
+export function env_regrow_food(e: ptr<Env>, dt: f64) -> void {
+    for i in 0 to e.n_zones {
+        if zone_is_consumable(e.zone_kind[i]) and e.zone_regrow[i] > 0.0 {
+            if e.zone_amount[i] < e.zone_capacity[i] {
+                e.zone_owed[i] = e.zone_owed[i] + e.zone_regrow[i] * dt
+                while e.zone_owed[i] >= 1.0
+                      and e.zone_amount[i] < e.zone_capacity[i] {
+                    e.zone_owed[i] = e.zone_owed[i] - 1.0
+                    let idx: i32 = env_spawn_item(e, i)
+                    if idx < 0 { e.zone_owed[i] = 0.0 }
+                }
+            } else {
+                e.zone_owed[i] = 0.0
+            }
+        }
+    }
+}
+
+# Remove up to `want` from a patch and return what was actually there. The
+# caller gets less than it asked for when the patch is nearly empty, which is
+# how competition resolves: whoever asks first that step gets fed.
+# Take one item from a patch, whichever is nearest the given point, and say
+# which it was. Returns -1 when the patch has nothing left.
+export function env_take_from_zone(e: ptr<Env>, zone: i32, x: f64,
+                                   y: f64) -> i32 {
+    let mut best: f64 = GEO_FAR
+    let mut best_i: i32 = -1
+    for i in 0 to e.n_items {
+        if e.item_zone[i] == zone {
+            let d: f64 = dist2(x, y, e.item_x[i], e.item_y[i])
+            if d < best {
+                best = d
+                best_i = i
+            }
+        }
+    }
+    if best_i < 0 { return -1 }
+    let ok: bool = env_take_item(e, best_i)
+    return best_i
+}
+
+export function env_remove_zone(e: ptr<Env>, idx: i32) -> bool {
+    if idx < 0 or idx >= e.n_zones { return false }
+    let last: i32 = e.n_zones - 1
+
+    # Items belong to a patch by index, and the swap below moves the last
+    # patch into this slot. So the items in the patch being removed have to
+    # go with it, and the ones belonging to the patch that is about to move
+    # have to be told where it went. Skipping either leaves pellets on the
+    # floor that belong to nothing, or worse, that belong to the wrong thing
+    # and are eaten out of a patch that never grew them.
+    let mut k: i32 = e.n_items - 1
+    while k >= 0 {
+        if e.item_zone[k] == idx {
+            let gone: bool = env_take_item(e, k)
+        }
+        k = k - 1
+    }
+    for j in 0 to e.n_items {
+        if e.item_zone[j] == last { e.item_zone[j] = idx }
+    }
+
+    e.zone_kind[idx] = e.zone_kind[last]
+    e.zone_shape[idx] = e.zone_shape[last]
+    e.zone_x[idx] = e.zone_x[last]
+    e.zone_y[idx] = e.zone_y[last]
+    e.zone_a[idx] = e.zone_a[last]
+    e.zone_b[idx] = e.zone_b[last]
+    e.zone_amount[idx] = e.zone_amount[last]
+    e.zone_capacity[idx] = e.zone_capacity[last]
+    e.zone_regrow[idx] = e.zone_regrow[last]
+    e.zone_owed[idx] = e.zone_owed[last]
+    e.n_zones = last
+    env_touch(e)
+    return true
+}
+
+export function env_width(e: ptr<Env>) -> f64 {
+    return e.x1 - e.x0
+}
+
+export function env_height(e: ptr<Env>) -> f64 {
+    return e.y1 - e.y0
+}
+
+export function env_kind_name(e: ptr<Env>) -> string {
+    if e.kind == ENV_CIRCLE { return "circle" }
+    if e.kind == ENV_POLY { return "polygon" }
+    return "rect"
+}

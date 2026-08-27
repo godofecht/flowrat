@@ -1,0 +1,865 @@
+# How a rat decides where to go.
+#
+# Two models, sharing one set of parameters and one wall-handling rule.
+#
+# MOTION_WALK
+#   Constant target speed, heading performs a random walk. Two parameters,
+#   completely predictable, and useful as a control: any structure that shows
+#   up in the neural populations under this model came from the geometry of
+#   the arena rather than from the behaviour.
+#
+# MOTION_FORAGE
+#   Speed and turn rate are each an Ornstein-Uhlenbeck process: they decay
+#   toward a mean at a fixed rate and are kicked by noise. That gives
+#   correlated, smoothly varying motion with a realistic speed distribution
+#   and bouts of turning, instead of white noise on the heading. On top of
+#   that sit three behavioural terms:
+#
+#     wall avoidance    the ray fan is read as a set of repulsive forces, so
+#                       the rat turns away before it arrives rather than
+#                       bouncing off
+#     thigmotaxis       a bias toward keeping a wall at a preferred distance,
+#                       which is why real rats hug the edge of an open arena
+#     cue attraction    an optional pull toward the nearest visible landmark
+#
+#   Noise is drawn from the counter-based generator keyed on (rat, step), so
+#   the batch is reproducible whatever order `parallel for` runs it in.
+#
+# WALLS
+#   Turning away is a soft term and can fail. The hard guarantee is applied
+#   after integration: any rat that ended up outside free space is pushed
+#   back to the nearest legal point and its heading is reflected off the wall
+#   it crossed. Without that a fast rat at a large dt would tunnel out of the
+#   arena, and every spatial population downstream would be reading positions
+#   that do not exist.
+
+import "behaviour.flow"
+import "memory.flow"
+
+extern {
+    function sin(x: f64) -> f64
+    function cos(x: f64) -> f64
+    function atan2(y: f64, x: f64) -> f64
+    function fabs(x: f64) -> f64
+    function sqrt(x: f64) -> f64
+    function exp(x: f64) -> f64
+}
+
+export const MOTION_WALK: i32 = 0
+export const MOTION_FORAGE: i32 = 1
+export const MOTION_COUNT: i32 = 2
+
+# Independent noise streams. Distinct large values so that two streams never
+# collide for small (rat, step) coordinates.
+const STREAM_HEADING: u32 = 1013
+const STREAM_SPEED: u32 = 2027
+const STREAM_TURN: u32 = 3041
+const STREAM_RESPAWN: u32 = 4057
+const STREAM_HEAD: u32 = 5081
+
+# Smallest relaxation time an Ornstein-Uhlenbeck process is allowed. A tenth
+# of a millisecond is far below any timestep the simulation runs at, so this
+# never bites a sane configuration.
+const TAU_FLOOR: f64 = 0.0001
+
+function relax_floor(tau: f64) -> f64 {
+    if tau < TAU_FLOOR { return TAU_FLOOR }
+    return tau
+}
+
+export struct MotionParams {
+    model: i32,
+
+    # Target speed in m/s. A foraging rat averages around 0.15 m/s with
+    # excursions well past that, which is what the OU process reproduces.
+    speed_mean: f64,
+    speed_sigma: f64,
+    # Relaxation time in seconds. Small means the speed forgets its history
+    # quickly and the walk looks jittery.
+    speed_tau: f64,
+    speed_max: f64,
+
+    # Angular velocity, same shape: mean zero, so the rat turns as much one
+    # way as the other over a long run.
+    turn_sigma: f64,
+    turn_tau: f64,
+    turn_max: f64,
+
+    # Wall avoidance. `wall_range` is how far ahead the rat reacts to a
+    # surface; `wall_gain` how hard it turns away.
+    wall_range: f64,
+    wall_gain: f64,
+    # Preferred distance from a wall. Positive values make the rat follow
+    # edges, zero switches the behaviour off.
+    thigmotaxis: f64,
+
+    # Pull toward the nearest visible cue.
+    cue_gain: f64,
+    cue_require_sight: bool,
+
+    # Chance per second of stopping to rest, and how long a rest lasts.
+    rest_rate: f64,
+    rest_duration: f64,
+
+    # Distance kept from any surface when a position is corrected.
+    margin: f64,
+
+    # The head. It relaxes toward the body axis and is kicked by noise, the
+    # same Ornstein-Uhlenbeck shape as the speed and the turn rate, and it is
+    # bounded because a rat cannot look behind itself without turning.
+    head_sigma: f64,
+    head_tau: f64,
+    head_max: f64,
+
+    # --- foraging ----------------------------------------------------------
+    #
+    # Hunger rises on its own and is what makes food worth walking to. With
+    # metabolism at zero the rat never gets hungry and everything below is
+    # inert, which is the old behaviour.
+    #
+    # The rate is set against how long it takes to cross the arena. A rat
+    # covers two metres in about twenty seconds, so at the old 0.035 it went
+    # from fed to starving in less time than one traverse and could never get
+    # ahead of its own stomach. That passed the time budget while hunger was
+    # the only drive, because a rat could camp on a patch and eat as fast as
+    # it emptied. Adding thirst put the food and the water in different
+    # corners, made camping impossible, and the colony spent ninety-three per
+    # cent of the run walking with no leisure at all. At 0.012 a drive takes
+    # four traverses to become urgent, which leaves the animal some slack.
+    metabolism: f64,
+    # Thirst rises the same way and a little faster, because a rat drinks
+    # more often than it eats. Zero switches water off entirely, which is the
+    # arena as it was before there was any.
+    thirst_rate: f64,
+    # --- other rats ---
+    #
+    # How close another rat has to be before this one steers away, and how
+    # hard. Rats are social and will huddle, so this is collision avoidance
+    # rather than dislike: the range is a body length or two and the turn is
+    # gentle. With the range at zero the batch goes back to being independent
+    # simulations that walk through each other.
+    # A rat is about five centimetres across, so personal space is roughly a
+    # body length. Two body lengths and a push as strong as hunger, which is
+    # where this started, costs the colony six points of its leisure without
+    # changing how much it eats: the rats spend the difference steering round
+    # each other.
+    social_range: f64,
+    social_push: f64,
+    # How strongly a rat turns to match the heading of the ones around it.
+    # Zero is the default: following is a real behaviour but it is not one
+    # every rat does all the time, and leaving it on quietly turns the colony
+    # into a flock.
+    follow_gain: f64,
+    # How much a crowd at a patch slows each animal down. With five rats at
+    # one patch and a half share, each eats at a fifth of the rate plus the
+    # half that is not shared, which is the physical fact that only so many
+    # heads fit round a pile of seeds.
+    crowd_share: f64,
+    # Units eaten per second, and how much hunger one unit removes. A rat
+    # that is eating does not move.
+    eat_rate: f64,
+    sate_per_unit: f64,
+    # How much thirst one unit of water removes. Separate from the food
+    # figure because a mouthful of water goes further than a pellet.
+    slake_per_unit: f64,
+    # How close the nose has to be, and how long one mouthful takes.
+    eat_reach: f64,
+    bite_seconds: f64,
+    # How hard hunger steers toward the nearest patch it can see. The turn is
+    # scaled by hunger, so a fed rat wanders and a starving one makes a line
+    # for the food.
+    forage_gain: f64,
+    # Hunger below which a rat stops bothering to eat.
+    eat_threshold: f64,
+    # Carrying food back to the nest before eating it, which is what a rat
+    # with a burrow actually does. The nest is the start zone.
+    hoard: bool,
+    carry_capacity: f64,
+}
+
+export function motion_params_default() -> MotionParams {
+    return MotionParams {
+        model: MOTION_FORAGE,
+        speed_mean: 0.16,
+        speed_sigma: 0.08,
+        speed_tau: 0.7,
+        speed_max: 0.8,
+        turn_sigma: 3.0,
+        turn_tau: 0.35,
+        turn_max: 6.0,
+        wall_range: 0.22,
+        wall_gain: 6.0,
+        thigmotaxis: 0.0,
+        cue_gain: 0.0,
+        cue_require_sight: true,
+        rest_rate: 0.0,
+        rest_duration: 0.6,
+        margin: 0.012,
+        head_sigma: 0.45,
+        head_tau: 0.30,
+        head_max: 1.75,
+        metabolism: 0.012,
+        thirst_rate: 0.010,
+        social_range: 0.055,
+        social_push: 1.2,
+        follow_gain: 0.0,
+        crowd_share: 0.5,
+        eat_rate: 6.0,
+        sate_per_unit: 0.10,
+        slake_per_unit: 0.16,
+        eat_reach: 0.07,
+        bite_seconds: 0.25,
+        forage_gain: 2.6,
+        eat_threshold: 0.15,
+        hoard: false,
+        carry_capacity: 3.0
+    }
+}
+
+# How the head moves.
+#
+# Ordinarily it drifts about the body axis under the same relaxing-and-kicked
+# process the speed and turn rate use, bounded so the animal cannot look
+# behind itself without turning. During a scan it is driven instead: a
+# deliberate sweep across most of its range, which is what a rat at a fork
+# actually does and what makes the behaviour visible on screen.
+function head_update(a: ptr<Agents>, p: ptr<MotionParams>,
+                     bp: ptr<BehaviourParams>, i: i32, dt: f64,
+                     seed: u32, counter: u32, rat: u32) -> void {
+    if a.state[i] == ST_SCAN and bp.vte_enabled {
+        # Elapsed time drives the sweep, so its phase does not depend on the
+        # timestep and the sweep is the same shape at any simulation rate.
+        let phase: f64 = a.state_elapsed[i] * bp.scan_hz * TAU
+        a.head_angle[i] = p.head_max * bp.scan_extent * sin(phase)
+        return
+    }
+    let htau: f64 = relax_floor(p.head_tau)
+    let k: f64 = dt / htau
+    let n: f64 = p.head_sigma * sqrt(2.0 * dt / htau)
+    let mut h: f64 = a.head_angle[i] - a.head_angle[i] * k
+                     + n * rng_normal(seed, STREAM_HEAD + rat, counter)
+    if h > p.head_max { h = p.head_max }
+    if h < -p.head_max { h = -p.head_max }
+    if h != h { h = 0.0 }
+    a.head_angle[i] = h
+}
+
+# How many separate open directions there are around the rat.
+#
+# The cached ray fan is walked once, grouping neighbouring rays that reach
+# further than `open` into runs. A corridor gives two runs, ahead and behind;
+# a T junction gives three; an open arena gives one, because every direction
+# is open and they form a single run all the way round. Three or more is a
+# fork, which is where a rat stops and looks.
+export function open_sectors(rays: ptr<f64>, base: i32, open: f64) -> i32 {
+    # Count the transitions from blocked to open going round the circle. That
+    # is the number of runs, and it handles the wrap without a special case.
+    let mut runs: i32 = 0
+    let mut any_open: bool = false
+    let mut any_blocked: bool = false
+    for r in 0 to RAY_COUNT {
+        let prev: i32 = (r + RAY_COUNT - 1) % RAY_COUNT
+        let is_open: bool = rays[base + r] > open
+        let was_open: bool = rays[base + prev] > open
+        if is_open { any_open = true } else { any_blocked = true }
+        if is_open and !was_open { runs = runs + 1 }
+    }
+    # Open in every direction: one sector, not zero.
+    if any_open and !any_blocked { return 1 }
+    return runs
+}
+
+# Turn rate that steers away from nearby surfaces.
+#
+# Each ray contributes a torque proportional to how close its wall is and to
+# how far to one side it lies. Rays behind the rat contribute nothing: a wall
+# you have already passed should not steer you. The result is a single
+# angular velocity to add, so this stays a scalar function of the cached ray
+# fan and costs one pass over 16 numbers.
+function wall_torque(rays: ptr<f64>, base: i32, head_offset: f64,
+                     range: f64, gain: f64) -> f64 {
+    let step: f64 = 6.283185307179586 / (RAY_COUNT as f64)
+    let mut torque: f64 = 0.0
+    for r in 0 to RAY_COUNT {
+        let d: f64 = rays[base + r]
+        if d < range {
+            # Ray r was cast at head direction + r * step, and the head is
+            # `head_offset` from the body axis. Steering is about the body,
+            # so the offset has to come back out here. Leaving it in steers
+            # the rat away from where it happens to be looking rather than
+            # from what is in front of it.
+            let off: f64 = wrap_pi((r as f64) * step + head_offset)
+            let ahead: f64 = cos(off)
+            if ahead > 0.0 {
+                # Closeness rises from 0 at `range` to 1 at the wall.
+                let close: f64 = (range - d) / range
+                # sin(off) is the sideways component: a wall to the left
+                # pushes the turn rate negative, and a wall dead ahead gets
+                # no preferred side from this term alone.
+                torque = torque - gain * close * close * ahead * sin(off)
+            }
+        }
+    }
+    # A wall exactly ahead leaves the sine sum at zero and the rat would walk
+    # straight into it. Break the tie with the shortest ray's side.
+    if fabs(torque) < 0.0001 {
+        let mut nearest: f64 = range
+        let mut nearest_r: i32 = -1
+        for r in 0 to RAY_COUNT {
+            let d: f64 = rays[base + r]
+            let off: f64 = wrap_pi((r as f64) * step + head_offset)
+            if d < nearest and cos(off) > 0.5 {
+                nearest = d
+                nearest_r = r
+            }
+        }
+        if nearest_r >= 0 {
+            let close: f64 = (range - nearest) / range
+            torque = gain * close * close
+        }
+    }
+    return torque
+}
+
+# Keep a wall at `preferred` metres: turn toward it when too far, away when
+# too close. Zero preferred distance disables the term.
+function thigmotaxis_torque(wall_dist: f64, nx: f64, ny: f64,
+                            heading: f64, preferred: f64,
+                            gain: f64) -> f64 {
+    if preferred <= 0.0 { return 0.0 }
+    if wall_dist >= GEO_FAR { return 0.0 }
+    # nx, ny points from the wall toward the rat, so the direction back to
+    # the wall is its negation.
+    let to_wall: f64 = atan2(-ny, -nx)
+    let err: f64 = wall_dist - preferred
+    let want: f64 = angle_delta(heading, to_wall)
+    # Beyond the preferred distance, steer toward the wall; inside it, away.
+    return gain * want * err
+}
+
+# One rat, one step. Everything it reads is either its own slot or the shared
+# read-only environment, which is what allows the caller's loop to be
+# `parallel for`.
+export function motion_step_one(a: ptr<Agents>, e: ptr<Env>,
+                                p: ptr<MotionParams>,
+                                bp: ptr<BehaviourParams>,
+                                mp: ptr<MemoryParams>,
+                                np: ptr<NoveltyParams>,
+                                g: ptr<Grid>,
+                                i: i32, step_index: i32, seed: u32,
+                                dt: f64, integrator: i32) -> void {
+    let counter: u32 = (step_index as u32) * 65536 + (i as u32)
+    let rat: u32 = (i as u32) * 2654435761
+
+    # Hunger first, because everything below reads it. It rises whatever the
+    # rat is doing; eating is the only thing that brings it down.
+    a.eat_request[i] = 0.0
+    if p.metabolism > 0.0 {
+        let mut hg: f64 = a.hunger[i] + p.metabolism * dt
+        if hg > 1.0 { hg = 1.0 }
+        a.hunger[i] = hg
+    }
+    if p.thirst_rate > 0.0 {
+        let mut th: f64 = a.thirst[i] + p.thirst_rate * dt
+        if th > 1.0 { th = 1.0 }
+        a.thirst[i] = th
+    }
+
+    # Where the rat is standing becomes familiar, and everywhere fades. Both
+    # happen whatever the animal is doing, including standing still: a rat
+    # that spends a minute grooming in one spot knows that spot.
+    if np.enabled {
+        novelty_visit(a, np, e, i, dt)
+        if np.decay_every > 0 and np.decay > 0.0 {
+            if step_index % np.decay_every == 0 {
+                novelty_fade(a, np, i, dt * (np.decay_every as f64))
+            }
+        }
+    }
+
+    # The head moves whatever the body is doing, so it is updated before the
+    # state is chosen and before the early return the stationary states take.
+    head_update(a, p, bp, i, dt, seed, counter, rat)
+
+    # Decide what the rat is doing before working out how it moves. The two
+    # food queries the machine needs are made once here and handed to it, so
+    # the ray casts are not repeated.
+    let mut food_here: i32 = -1
+    let mut food_seen: i32 = -1
+    let mut water_here: i32 = -1
+    let mut water_seen: i32 = -1
+    if p.metabolism > 0.0 and bp.enabled {
+        food_here = env_food_within(e, a.x[i], a.y[i], p.eat_reach)
+        if food_here < 0 and a.hunger[i] > p.eat_threshold {
+            let mut fd: f64 = 0.0
+            food_seen = env_nearest_food(e, a.x[i], a.y[i],
+                                         p.cue_require_sight, &fd)
+        }
+    }
+    if p.thirst_rate > 0.0 and bp.enabled {
+        water_here = env_water_within(e, a.x[i], a.y[i], p.eat_reach)
+        if water_here < 0 and a.thirst[i] > p.eat_threshold {
+            let mut wd: f64 = 0.0
+            water_seen = env_nearest_water(e, a.x[i], a.y[i],
+                                           p.cue_require_sight, &wd)
+        }
+    }
+
+    # Note anything in sight, whether hungry or not: a rat that walks past
+    # food while full still knows it is there.
+    if mp.enabled {
+        memory_decay(a, mp, i, dt)
+        let mut vx: f64 = 0.0
+        let mut vy: f64 = 0.0
+        let mut vd: f64 = 0.0
+        # Water is remembered exactly as food is. The notes hold zone
+        # indices, and a zone knows its own kind, so one table serves both.
+        let visible: i32 = env_nearest_food(e, a.x[i], a.y[i],
+                                            p.cue_require_sight, &vd)
+        if visible >= 0 {
+            env_zone_center(e, visible, &vx, &vy)
+            memory_see(a, i, visible, vx, vy)
+        }
+        let seen_water: i32 = env_nearest_water(e, a.x[i], a.y[i],
+                                                p.cue_require_sight, &vd)
+        if seen_water >= 0 {
+            env_zone_center(e, seen_water, &vx, &vy)
+            memory_see(a, i, seen_water, vx, vy)
+        }
+        # Nothing in sight, but somewhere worth trying is remembered. This is
+        # what makes an arena with a wall across it solvable rather than
+        # merely difficult.
+        if food_seen < 0 and a.hunger[i] > p.eat_threshold {
+            let mut mx: f64 = 0.0
+            let mut my: f64 = 0.0
+            let remembered: i32 = memory_best_kind(a, mp, e, i, ZONE_REWARD,
+                                                   &mx, &my)
+            if remembered >= 0 { food_seen = remembered }
+        }
+        if water_seen < 0 and a.thirst[i] > p.eat_threshold {
+            let mut wx: f64 = 0.0
+            let mut wy: f64 = 0.0
+            let rw: i32 = memory_best_kind(a, mp, e, i, ZONE_WATER, &wx, &wy)
+            if rw >= 0 { water_seen = rw }
+        }
+    }
+    let full: bool = p.hoard and a.carrying[i] >= p.carry_capacity
+    let junction: bool = open_sectors(a.rays, i * RAY_COUNT,
+                                      bp.junction_open) >= 3
+    # Where the nest is, which the machine needs to decide whether a rat that
+    # wants to rest should walk home first, and which the reckoning below
+    # needs anyway.
+    let mut nest_x: f64 = 0.0
+    let mut nest_y: f64 = 0.0
+    let has_nest: bool = nest_position(e, &nest_x, &nest_y)
+    # Arriving means being in the nest, which is a tighter test than being
+    # able to smell it. The two were the same number at first, and the rats
+    # stopped the moment they could sense the place: the reckoning re-zeroed,
+    # every rat decided it was home a quarter of a metre short, and almost
+    # none of the twenty-seven trips in a five-minute run ended in a rest.
+    let mut at_nest: bool = false
+    if has_nest {
+        at_nest = dist(a.x[i], a.y[i], nest_x, nest_y) < nest_radius(e)
+    }
+    # How many other rats are close enough to be in the way, which lengthens
+    # a mouthful. Read before the machine chooses, because the length of a
+    # bite is decided when the bite begins.
+    let mut jostling: i32 = 0
+    if p.crowd_share > 0.0 {
+        # Counted around this rat rather than around the patch: what slows an
+        # animal down is the ones in arm's reach, not the ones on the far
+        # side of the pile. A grid query rather than a sweep of the batch.
+        let mut jx: f64 = 0.0
+        let mut jy: f64 = 0.0
+        jostling = grid_neighbours(g, i, p.eat_reach, &jx, &jy)
+    }
+    a.crowd[i] = jostling
+    let bite: f64 = p.bite_seconds
+                    * (1.0 + p.crowd_share * (jostling as f64))
+    behaviour_tick(a, bp, i, dt, seed, step_index, p.eat_threshold,
+                   food_here, food_seen, water_here, water_seen, full,
+                   bite, junction, has_nest, at_nest)
+
+    # The stationary states do not move the animal and share one exit.
+    if state_is_still(a.state[i]) {
+        a.speed[i] = 0.0
+        a.ang_vel[i] = 0.0
+        a.accel[i] = 0.0
+        a.ang_accel[i] = 0.0
+        # What an eating rat would like to take this step. Whether it gets it
+        # is settled afterwards, serially, against everyone else at the same
+        # patch.
+        if a.food_target[i] >= 0 {
+            if a.state[i] == ST_EAT or a.state[i] == ST_DRINK {
+                # Only so many heads fit round a pile of seeds. The rats at
+                # the patch share part of the rate between them and keep the
+                # rest, so a crowd slows everyone without any one animal
+                # being excluded. Counted from positions rather than from
+                # who is currently eating, because a rat waiting its turn is
+                # still in the way.
+                # One mouthful, one item, asked for once. Crowding is no
+                # longer a smaller mouthful but a longer wait for the same
+                # one, which is what jostling for a spot at a pile actually
+                # costs: see the bite length passed to the machine above.
+                if a.bite_pending[i] == 1 {
+                    a.eat_request[i] = 1.0
+                    a.bite_pending[i] = 0
+                }
+            }
+        }
+        return
+    }
+
+    let mut speed: f64 = a.speed[i]
+    let mut omega: f64 = a.ang_vel[i]
+    let prev_speed: f64 = speed
+    let prev_omega: f64 = omega
+
+    if p.model == MOTION_WALK {
+        # Fixed speed, heading diffuses. turn_sigma is read as radians per
+        # sqrt(second) so the walk's spread is independent of the timestep.
+        speed = p.speed_mean
+        # A timestep of zero would divide by zero here. It is reachable from
+        # a configuration file, and means "do not advance", so the turn is
+        # simply zero.
+        let mut kick: f64 = 0.0
+        if dt > 0.0 {
+            kick = rng_normal(seed, STREAM_HEADING + rat, counter)
+                   * p.turn_sigma / sqrt(dt)
+        }
+        omega = kick
+        # The random walk has no wall term of its own, so it relies entirely
+        # on the reflection below. Clamp the turn so a single huge draw
+        # cannot spin the rat through a full turn inside one step.
+        if omega > p.turn_max { omega = p.turn_max }
+        if omega < -p.turn_max { omega = -p.turn_max }
+    } else {
+        # Ornstein-Uhlenbeck on speed. The sqrt(2 dt / tau) factor is what
+        # keeps the stationary standard deviation at speed_sigma whatever
+        # timestep is chosen, so changing dt does not change the behaviour.
+        #
+        # The relaxation times are floored rather than trusted. A tau of zero
+        # is reachable from a configuration file and divides straight to a
+        # non-number, which then spreads through the position into every
+        # population that reads it, with nothing to say where it came from.
+        let stau: f64 = relax_floor(p.speed_tau)
+        let ks: f64 = dt / stau
+        let ns: f64 = p.speed_sigma * sqrt(2.0 * dt / stau)
+        speed = speed + (p.speed_mean - speed) * ks
+                + ns * rng_normal(seed, STREAM_SPEED + rat, counter)
+        if speed < 0.0 { speed = 0.0 }
+        if speed > p.speed_max { speed = p.speed_max }
+
+        # Same process on the turn rate, mean zero.
+        let ttau: f64 = relax_floor(p.turn_tau)
+        let kt: f64 = dt / ttau
+        let nt: f64 = p.turn_sigma * sqrt(2.0 * dt / ttau)
+        omega = omega - omega * kt
+                + nt * rng_normal(seed, STREAM_TURN + rat, counter)
+
+        let base: i32 = i * RAY_COUNT
+        omega = omega + wall_torque(a.rays, base, a.head_angle[i],
+                                    p.wall_range, p.wall_gain)
+        # Wall hugging is a constant plus however much the ground underfoot
+        # is still new. The constant is what is left once the room is known;
+        # the rest fades as the animal learns the place is safe, which is
+        # what a real rat does over the first few minutes in a new arena.
+        let hug: f64 = p.thigmotaxis + novelty_thigmotaxis(a, np, e, i)
+        omega = omega + thigmotaxis_torque(a.wall_dist[i], a.wall_nx[i],
+                                           a.wall_ny[i], a.heading[i],
+                                           hug, 1.5)
+
+        if p.cue_gain > 0.0 and a.cue_idx[i] >= 0 {
+            let ci: i32 = a.cue_idx[i]
+            let to_cue: f64 = atan2(e.cue_y[ci] - a.y[i],
+                                    e.cue_x[ci] - a.x[i])
+            # A landmark in a well known part of the room stops being worth
+            # looking at. This is habituation by proxy: the rat habituates to
+            # the place the cue stands in rather than to the cue itself, which
+            # is a simplification and is named as one in the README.
+            let interest: f64 = novelty_cue_scale(a, np, e, i, e.cue_x[ci],
+                                                  e.cue_y[ci])
+            omega = omega + p.cue_gain * interest
+                    * angle_delta(a.heading[i], to_cue)
+        }
+
+        # An exploring rat drifts toward whichever corner it knows least.
+        # Only exploring: a rat on its way to food has somewhere to be, and
+        # this is what exploring is for.
+        if np.enabled and np.seek_new > 0.0 and a.state[i] == ST_EXPLORE {
+            let mut want: f64 = 0.0
+            if novelty_bearing(a, e, i, &want) {
+                omega = omega + np.seek_new
+                        * angle_delta(a.heading[i], want)
+            }
+        }
+
+        # Where the rat is trying to get to, if anywhere. Only the two states
+        # that have a destination steer toward one; exploring is a walk with
+        # no target, which is what makes the difference between the two
+        # visible in the trajectories.
+        omega = omega + goal_torque(a, e, p, mp, i)
+        omega = omega + social_torque(a, p, g, i)
+
+        if omega > p.turn_max { omega = p.turn_max }
+        if omega < -p.turn_max { omega = -p.turn_max }
+
+        # Resting. A Poisson process on stopping, with the rest length read
+        # back out of the same deterministic stream so no extra state is
+        # needed per rat.
+        if p.rest_rate > 0.0 {
+            let u: f64 = rng_u01(seed, STREAM_RESPAWN + rat, counter)
+            if u < p.rest_rate * dt {
+                speed = 0.0
+            }
+        }
+    }
+
+    let x0: f64 = a.x[i]
+    let y0: f64 = a.y[i]
+
+    let mut x: f64 = x0
+    let mut y: f64 = y0
+    let mut h: f64 = a.heading[i]
+    kin_step(integrator, &x, &y, &h, speed, omega, dt)
+
+    # Hard containment. A rat that crossed a surface is put back on the legal
+    # side and its heading reflected, so it leaves the wall instead of
+    # grinding along it for the rest of the run.
+    if !env_is_free(e, x, y) {
+        let mut px: f64 = x
+        let mut py: f64 = y
+        let moved: bool = env_push_inside(e, p.margin, &px, &py)
+        let mut widx: i32 = -1
+        let mut nx: f64 = 0.0
+        let mut ny: f64 = 0.0
+        let wd: f64 = env_nearest_wall(e, px, py, &widx, &nx, &ny)
+        if widx >= 0 {
+            h = reflect_heading(h, nx, ny)
+            # Nudge along the outward normal so the next step starts clear of
+            # the surface even if the reflection points back into it.
+            px = px + nx * p.margin * 0.5
+            py = py + ny * p.margin * 0.5
+            if !env_is_free(e, px, py) {
+                px = x0
+                py = y0
+            }
+        } else {
+            px = x0
+            py = y0
+        }
+        x = px
+        y = py
+        # Losing forward momentum on impact stops a rat from ricocheting
+        # around a corner at full speed.
+        speed = speed * 0.5
+        omega = 0.0
+    }
+
+    # Last line of defence. If anything above still produced a non-number,
+    # the rat is returned to where it started this step rather than carrying
+    # the value into every population that reads its position. A number is
+    # not equal to itself only when it is not a number.
+    if x != x or y != y or h != h or speed != speed or omega != omega {
+        x = x0
+        y = y0
+        h = a.heading[i]
+        speed = 0.0
+        omega = 0.0
+    }
+
+    a.x[i] = x
+    a.y[i] = y
+    a.heading[i] = wrap_pi(h)
+    a.speed[i] = speed
+    a.ang_vel[i] = omega
+    a.accel[i] = (speed - prev_speed) / dt
+    a.ang_accel[i] = (omega - prev_omega) / dt
+    a.distance[i] = a.distance[i] + dist(x0, y0, x, y)
+
+    if mp.enabled {
+        homing_step(a, mp, i, x - x0, y - y0, seed, counter)
+        # Arriving home re-zeroes the estimate. An animal that gets back
+        # occasionally does not accumulate error forever, which is why dead
+        # reckoning is usable at all. The nest was already located above.
+        # The reckoning is corrected by actually being there, which is the
+        # only fix the rat gets and the reason the drift stays bounded.
+        if has_nest {
+            if dist(x, y, nest_x, nest_y) < nest_radius(e) {
+                homing_reset(a, i)
+            }
+        }
+    }
+}
+
+# Which way to turn to reach whatever the current state is aiming at.
+#
+# Returns a turn rate like every other behavioural term, so it composes with
+# wall avoidance rather than overriding it and steering the rat into a wall.
+# The target itself was chosen by the state machine; this only turns toward
+# it.
+function goal_torque(a: ptr<Agents>, e: ptr<Env>, p: ptr<MotionParams>,
+                     mp: ptr<MemoryParams>, i: i32) -> f64 {
+    if p.forage_gain <= 0.0 { return 0.0 }
+
+    if a.state[i] == ST_HOME {
+        # Steered by the rat's own dead-reckoned vector rather than by
+        # looking at the nest. It is usually wrong by a few centimetres and
+        # occasionally wrong by more, which is the point.
+        #
+        # Close enough to smell the bedding, the rat stops reckoning and
+        # walks at the thing itself. Steering by the estimate the whole way
+        # in cannot work: near the nest the reckoned vector is short and the
+        # drift is the same size as it, so the bearing becomes noise and the
+        # animal circles the spot it believes is home without ever crossing
+        # the real one.
+        let mut nx: f64 = 0.0
+        let mut ny: f64 = 0.0
+        if nest_position(e, &nx, &ny) {
+            if dist(a.x[i], a.y[i], nx, ny) < nest_reach(e, mp) {
+                return p.forage_gain
+                       * angle_delta(a.heading[i],
+                                     atan2(ny - a.y[i], nx - a.x[i]))
+            }
+        }
+        return p.forage_gain * angle_delta(a.heading[i],
+                                           homing_bearing(a, i))
+    }
+
+    if a.state[i] != ST_FORAGE { return 0.0 }
+    let patch: i32 = a.food_target[i]
+    if patch < 0 { return 0.0 }
+    let mut cx: f64 = 0.0
+    let mut cy: f64 = 0.0
+    env_zone_center(e, patch, &cx, &cy)
+    let to_food: f64 = atan2(cy - a.y[i], cx - a.x[i])
+    # Scaled by hunger, so the pull grows as the rat needs it more.
+    return p.forage_gain * a.hunger[i] * angle_delta(a.heading[i], to_food)
+}
+
+# Turning away from whoever is too close, and optionally toward wherever the
+# crowd is going.
+#
+# The repulsion falls off linearly to nothing at the full range, so a rat at
+# the edge of another's space is barely deflected and one about to walk into
+# it turns hard. Turning is the only lever: pushing positions apart directly
+# would let two rats teleport through a wall between them, and the whole
+# motion model is a turn rate.
+function social_torque(a: ptr<Agents>, p: ptr<MotionParams>, g: ptr<Grid>,
+                       i: i32) -> f64 {
+    if p.social_range <= 0.0 { return 0.0 }
+    let mut omega: f64 = 0.0
+
+    if p.social_push > 0.0 {
+        let mut d: f64 = 0.0
+        let mut dx: f64 = 0.0
+        let mut dy: f64 = 0.0
+        let near: i32 = grid_nearest(g, i, p.social_range, &d, &dx, &dy)
+        if near >= 0 and d > 0.000001 {
+            # Away from the neighbour is the reverse of the bearing to it.
+            let away: f64 = atan2(-dy, -dx)
+            let closeness: f64 = 1.0 - d / p.social_range
+            omega = omega + p.social_push * closeness
+                    * angle_delta(a.heading[i], away)
+        }
+    }
+
+    if p.follow_gain > 0.0 {
+        let mut hx: f64 = 0.0
+        let mut hy: f64 = 0.0
+        let n: i32 = grid_neighbours(g, i, p.social_range * 3.0, &hx, &hy)
+        if n > 0 and (hx * hx + hy * hy) > 0.000001 {
+            let mean: f64 = atan2(hy, hx)
+            omega = omega + p.follow_gain
+                    * angle_delta(a.heading[i], mean)
+        }
+    }
+    return omega
+}
+
+# Centre of the first start zone, which is where a hoarding rat takes food.
+function nest_position(e: ptr<Env>, x_out: ptr<f64>,
+                       y_out: ptr<f64>) -> bool {
+    for z in 0 to e.n_zones {
+        if e.zone_kind[z] == ZONE_START {
+            env_zone_center(e, z, x_out, y_out)
+            return true
+        }
+    }
+    return false
+}
+
+# The nest's own extent. Inside this the rat has arrived.
+export function nest_radius(e: ptr<Env>) -> f64 {
+    for z in 0 to e.n_zones {
+        if e.zone_kind[z] == ZONE_START {
+            let mut r: f64 = e.zone_a[z]
+            if e.zone_b[z] > r { r = e.zone_b[z] }
+            return r
+        }
+    }
+    return 0.0
+}
+
+# How close the rat has to get before it can sense the nest rather than
+# merely reckon toward it: the nest's own extent plus however far away it can
+# smell the bedding. A big nest is easier to find than a small one, which is
+# the right shape for the answer.
+export function nest_reach(e: ptr<Env>, mp: ptr<MemoryParams>) -> f64 {
+    return nest_radius(e) + mp.home_sense
+}
+
+# The batch. This is the loop the whole SoA layout exists for: rat i reads
+# and writes only slot i, so the iterations are independent and the compiler
+# is told so.
+export function motion_step_all(a: ptr<Agents>, e: ptr<Env>,
+                                p: ptr<MotionParams>,
+                                bp: ptr<BehaviourParams>,
+                                mp: ptr<MemoryParams>,
+                                np: ptr<NoveltyParams>,
+                                g: ptr<Grid>,
+                                step_index: i32, seed: u32,
+                                dt: f64, integrator: i32) -> void {
+    # The grid was built serially before this loop and nothing here writes to
+    # it, so every rat can ask who is near it without any two of them racing.
+    parallel for i in 0 to a.n {
+        motion_step_one(a, e, p, bp, mp, np, g, i, step_index, seed, dt,
+                        integrator)
+    }
+}
+
+# Fill the sensory cache for every rat at its current position.
+#
+# This is the expensive half of a step: RAY_COUNT ray casts against every
+# wall, per rat. It is also embarrassingly parallel and reads the environment
+# without writing it, which makes it the first thing worth moving to a GPU.
+export function agents_sense(a: ptr<Agents>, e: ptr<Env>,
+                             require_sight: bool) -> void {
+    parallel for i in 0 to a.n {
+        let mut widx: i32 = -1
+        let mut nx: f64 = 0.0
+        let mut ny: f64 = 0.0
+        a.wall_dist[i] = env_nearest_wall(e, a.x[i], a.y[i], &widx, &nx, &ny)
+        a.wall_nx[i] = nx
+        a.wall_ny[i] = ny
+
+        # The fan is anchored on where the head points, not on where the body
+        # is going, because the whiskers and the eyes are on the head. Ray 0
+        # is straight along the nose and ray r is r * (2pi / RAY_COUNT) to
+        # the left of it. Every consumer relies on that convention, and the
+        # two that care about the body rather than the head take the head's
+        # offset back out themselves.
+        let base: i32 = i * RAY_COUNT
+        let stepang: f64 = 6.283185307179586 / (RAY_COUNT as f64)
+        let look: f64 = agents_head_dir(a, i)
+        for r in 0 to RAY_COUNT {
+            a.rays[base + r] = env_ray_distance(e, a.x[i], a.y[i],
+                                                look + (r as f64) * stepang)
+        }
+
+        let mut cd: f64 = GEO_FAR
+        a.cue_idx[i] = env_nearest_cue(e, a.x[i], a.y[i], require_sight, &cd)
+        a.cue_dist[i] = cd
+        a.zone_reward[i] = env_zone_at(e, a.x[i], a.y[i], ZONE_REWARD)
+    }
+}

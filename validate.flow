@@ -1,0 +1,2606 @@
+# FlowRat functional validation.
+#
+# Run:  ./validate.sh
+#
+# Every check prints what it measured, not just whether it passed, because a
+# number that is drifting toward its tolerance is worth seeing before it
+# crosses it. Failures return a distinct exit code so a script can tell which
+# one broke without parsing the output.
+#
+# These are properties of the model, checked against something independent:
+# an integrator against its own closed-form solution, the structured
+# connectivity against a dense matrix, a decoded position against the
+# position it was decoded from. A check that only compares the code to itself
+# would pass forever.
+
+import "src/core/mem.flow"
+import "src/core/rng.flow"
+import "src/core/clock.flow"
+import "src/core/profile.flow"
+
+import "src/env/geometry.flow"
+import "src/env/environment.flow"
+import "src/env/queries.flow"
+import "src/env/presets.flow"
+
+import "src/sim/agents.flow"
+import "src/sim/integrate.flow"
+import "src/sim/behaviour.flow"
+import "src/sim/memory.flow"
+import "src/sim/spatial.flow"
+import "src/sim/novelty.flow"
+import "src/sim/motion.flow"
+
+import "src/neural/population.flow"
+import "src/neural/place.flow"
+import "src/neural/head_direction.flow"
+import "src/neural/velocity.flow"
+import "src/neural/grid.flow"
+import "src/neural/boundary.flow"
+import "src/neural/attractor.flow"
+import "src/neural/circuit.flow"
+
+import "src/sim/simulation.flow"
+import "src/analysis/ratemap.flow"
+import "src/analysis/scores.flow"
+import "src/analysis/session.flow"
+import "src/ui/view_analysis.flow"
+
+import "src/ui/draw.flow"
+import "src/ui/widgets.flow"
+import "src/ui/layout.flow"
+import "src/ui/view_env.flow"
+import "src/ui/view_pop.flow"
+import "src/ui/view_sys.flow"
+import "src/ui/view_net.flow"
+import "src/ui/view_etho.flow"
+
+import "src/io/record.flow"
+import "src/io/config.flow"
+
+extern {
+    function fopen(path: string, mode: string) -> ptr<void>
+    function fclose(f: ptr<void>) -> i32
+    function fgetc(f: ptr<void>) -> i32
+    function fgets(buf: ptr<void>, n: i32, f: ptr<void>) -> ptr<void>
+    function fputs(t: string, f: ptr<void>) -> i32
+    function fscanf(f: ptr<void>, fmt: string, out: ptr<f64>) -> i32
+    function fprintf(f: ptr<void>, fmt: string, a: f64) -> i32
+    function fabs(x: f64) -> f64
+    function sqrt(x: f64) -> f64
+    function sin(x: f64) -> f64
+    function cos(x: f64) -> f64
+    function malloc(size: i64) -> ptr<void>
+    function free(p: ptr<void>) -> void
+}
+
+let mut failures: i32 = 0
+let mut first_failure: i32 = 0
+
+function check(ok: bool, code: i32, name: string) -> void {
+    if ok {
+        printf("  ok    %s\n", name)
+    } else {
+        printf("  FAIL  %s\n", name)
+        failures = failures + 1
+        if first_failure == 0 { first_failure = code }
+    }
+}
+
+function section(name: string) -> void {
+    printf("\n%s\n", name)
+}
+
+# --- geometry --------------------------------------------------------------
+
+function test_geometry() -> void {
+    section("geometry")
+
+    # A ray straight up from the origin meets a horizontal segment at y = 3.
+    let d: f64 = ray_seg(0.0, 0.0, 0.0, 1.0, -1.0, 3.0, 1.0, 3.0)
+    printf("        ray to horizontal wall at y=3: %.6f\n", d)
+    check(fabs(d - 3.0) < 0.000001, 10, "ray hits a wall at the right range")
+
+    # Pointing away from it, the same ray misses.
+    let d2: f64 = ray_seg(0.0, 0.0, 0.0, -1.0, -1.0, 3.0, 1.0, 3.0)
+    check(d2 >= GEO_FAR, 11, "ray away from a wall reports no hit")
+
+    # A ray parallel to a segment never meets it.
+    let d3: f64 = ray_seg(0.0, 0.0, 1.0, 0.0, -1.0, 3.0, 1.0, 3.0)
+    check(d3 >= GEO_FAR, 12, "ray parallel to a wall reports no hit")
+
+    # Perpendicular distance to a segment, and to its endpoint when the foot
+    # of the perpendicular falls outside it.
+    let mut t: f64 = 0.0
+    let pd: f64 = point_seg_dist(0.0, 2.0, -1.0, 0.0, 1.0, 0.0, &t)
+    check(fabs(pd - 2.0) < 0.000001, 13, "point to segment, foot inside")
+    let pd2: f64 = point_seg_dist(5.0, 0.0, -1.0, 0.0, 1.0, 0.0, &t)
+    check(fabs(pd2 - 4.0) < 0.000001, 14, "point to segment, foot outside")
+
+    # Angle wrapping is exact at the seam and idempotent.
+    check(fabs(wrap_pi(PI * 3.0) - (-PI)) < 0.000001 or
+          fabs(wrap_pi(PI * 3.0) - PI) < 0.000001, 15, "wrap_pi at the seam")
+    check(fabs(angle_delta(3.0, -3.0) - 0.2831853) < 0.0001, 16,
+          "angle_delta takes the short way round")
+}
+
+# --- environment -----------------------------------------------------------
+
+function test_environment() -> void {
+    section("environment")
+    let mut e: Env = env_create()
+
+    # Every preset closes: a ray from the centre in any direction must hit
+    # something. An arena with a gap in its shell leaks rats.
+    let mut all_closed: bool = true
+    let mut worst_preset: i32 = -1
+    for p in 0 to PRESET_COUNT {
+        env_preset_apply(&e, p)
+        let mut cx: f64 = 0.0
+        let mut cy: f64 = 0.0
+        let ok: bool = env_sample_free(&e, 42, 1, 1, 200, &cx, &cy)
+        for k in 0 to 64 {
+            let ang: f64 = (k as f64) * TAU / 64.0
+            if env_ray_distance(&e, cx, cy, ang) >= GEO_FAR {
+                all_closed = false
+                worst_preset = p
+            }
+        }
+    }
+    if worst_preset >= 0 {
+        printf("        leaking preset: %s\n", env_preset_name(worst_preset))
+    }
+    check(all_closed, 20, "every preset is a closed arena")
+
+    # Free-space sampling never lands inside a solid or outside the shell.
+    env_preset_apply(&e, PRESET_OBSTACLES)
+    let mut bad: i32 = 0
+    for i in 0 to 4000 {
+        let mut x: f64 = 0.0
+        let mut y: f64 = 0.0
+        let ok: bool = env_sample_free(&e, 7, 3, (i as u32) + 1, 64, &x, &y)
+        if !env_is_free(&e, x, y) { bad = bad + 1 }
+    }
+    printf("        4000 samples, outside free space: %d\n", bad)
+    check(bad == 0, 21, "free-space sampling stays in free space")
+
+    # A point inside a pillar is pushed out of it.
+    let px0: f64 = e.solid_x[0] + e.solid_w[0] * 0.5
+    let py0: f64 = e.solid_y[0] + e.solid_h[0] * 0.5
+    let mut px: f64 = px0
+    let mut py: f64 = py0
+    let moved: bool = env_push_inside(&e, 0.01, &px, &py)
+    printf("        pushed (%.3f,%.3f) out to (%.3f,%.3f)\n",
+           px0, py0, px, py)
+    check(moved and env_is_free(&e, px, py), 22,
+          "a point inside an obstacle is pushed to free space")
+
+    # Wall distance in a plain box matches the analytic answer.
+    env_set_rect(&e, 0.0, 0.0, 2.0, 2.0)
+    let wd: f64 = env_wall_distance(&e, 0.3, 1.0)
+    printf("        wall distance at x=0.3 in a 2 m box: %.6f\n", wd)
+    check(fabs(wd - 0.3) < 0.000001, 23, "wall distance matches geometry")
+
+    # A barrier blocks sight; removing it restores it.
+    env_set_rect(&e, 0.0, 0.0, 2.0, 2.0)
+    check(env_line_of_sight(&e, 0.5, 1.0, 1.5, 1.0), 24,
+          "clear line of sight across an empty box")
+    let widx: i32 = env_add_wall(&e, 1.0, 0.6, 1.0, 1.4)
+    check(!env_line_of_sight(&e, 0.5, 1.0, 1.5, 1.0), 25,
+          "a barrier blocks line of sight")
+    let removed: bool = env_remove_wall(&e, widx)
+    check(env_line_of_sight(&e, 0.5, 1.0, 1.5, 1.0), 26,
+          "removing the barrier restores it")
+
+    # The boundary is protected from deletion.
+    check(!env_remove_wall(&e, 0), 27, "boundary walls cannot be deleted")
+
+    env_destroy(&e)
+}
+
+# --- integrators -----------------------------------------------------------
+
+function test_integrators() -> void {
+    section("integrators")
+
+    # Against the closed-form arc, over one step of a hard turn.
+    let v: f64 = 0.3
+    let w: f64 = 2.0
+    let dt: f64 = 0.02
+    let e_euler: f64 = kin_step_error(INT_EULER, v, 0.4, w, dt)
+    let e_semi: f64 = kin_step_error(INT_SEMI, v, 0.4, w, dt)
+    let e_rk4: f64 = kin_step_error(INT_RK4, v, 0.4, w, dt)
+    printf("        one step at dt=%.3f, v=%.2f, omega=%.2f\n", dt, v, w)
+    printf("        euler %.3e   semi %.3e   rk4 %.3e\n",
+           e_euler, e_semi, e_rk4)
+    check(e_semi < e_euler, 30, "semi-implicit beats euler")
+    check(e_rk4 < e_semi, 31, "rk4 beats semi-implicit")
+    check(e_rk4 < 0.000000001, 32, "rk4 is near machine accuracy here")
+
+    # Halving the step should quarter Euler's error and cut RK4's by
+    # sixteen. Order is the property worth checking, not a single number.
+    let e_euler_h: f64 = kin_step_error(INT_EULER, v, 0.4, w, dt * 0.5)
+    let ratio: f64 = e_euler / e_euler_h
+    printf("        euler error ratio on halving dt: %.3f (expect ~4)\n",
+           ratio)
+    check(ratio > 3.5 and ratio < 4.5, 33, "euler converges at second order")
+
+    # The exact integrator is exact by construction.
+    check(kin_step_error(INT_EXACT, v, 0.4, w, dt) < 0.0000000000001, 34,
+          "the closed form matches itself")
+}
+
+# --- motion ----------------------------------------------------------------
+
+function test_motion() -> void {
+    section("motion")
+
+    let mut worst: i32 = -1
+    let mut total_escapes: i32 = 0
+    for p in 0 to PRESET_COUNT {
+        let mut s: Sim = sim_create(64, p, 20250825)
+        s.can_enabled = false
+        for k in 0 to 900 {
+            sim_step(&s)
+        }
+        let mut escaped: i32 = 0
+        for i in 0 to s.agents.n {
+            if !env_is_free(&s.env, s.agents.x[i], s.agents.y[i]) {
+                escaped = escaped + 1
+            }
+        }
+        let mut moved: f64 = 0.0
+        for i in 0 to s.agents.n {
+            moved = moved + s.agents.distance[i]
+        }
+        moved = moved / (s.agents.n as f64)
+        # Wall contact reduces path length, so the number differs between a
+        # wide arena and a narrow one. Printed to four places because two
+        # hides exactly that difference.
+        let mut touching: i32 = 0
+        for i in 0 to s.agents.n {
+            if s.agents.wall_dist[i] < 0.05 { touching = touching + 1 }
+        }
+        printf("        %-14s escaped %2d / %d, mean path %.4f m, near wall %2d\n",
+               env_preset_name(p), escaped, s.agents.n, moved, touching)
+        total_escapes = total_escapes + escaped
+        if escaped > 0 and worst < 0 { worst = p }
+        # A rat that never moves is as wrong as one that escapes.
+        if moved < 0.2 { total_escapes = total_escapes + 1000 }
+        sim_destroy(&s)
+    }
+    check(total_escapes == 0, 40,
+          "64 rats stay in free space for 900 steps in every arena")
+}
+
+# --- determinism -----------------------------------------------------------
+
+# How far rat zero's path in a crowd departs from its path alone, with the
+# social term on or off.
+function solo_divergence(social: bool) -> f64 {
+    let mut push: f64 = 0.0
+    let mut crowd: f64 = 0.0
+    if social {
+        push = 1.2
+        crowd = 0.5
+    }
+    let mut many: Sim = sim_create(128, PRESET_OBSTACLES, 99991)
+    many.motion.social_push = push
+    many.motion.crowd_share = crowd
+    let mut one: Sim = sim_create(1, PRESET_OBSTACLES, 99991)
+    one.motion.social_push = push
+    one.motion.crowd_share = crowd
+    for k in 0 to 400 {
+        sim_step(&many)
+        sim_step(&one)
+    }
+    let d: f64 = dist(many.agents.x[0], many.agents.y[0],
+                      one.agents.x[0], one.agents.y[0])
+    sim_destroy(&many)
+    sim_destroy(&one)
+    return d
+}
+
+function test_determinism() -> void {
+    section("determinism")
+
+    # The whole point of the counter-based generator: the same seed gives the
+    # same trajectory, whatever order `parallel for` visited the agents in.
+    let mut a: Sim = sim_create(128, PRESET_OBSTACLES, 99991)
+    let mut b: Sim = sim_create(128, PRESET_OBSTACLES, 99991)
+    for k in 0 to 400 {
+        sim_step(&a)
+        sim_step(&b)
+    }
+    let mut worst: f64 = 0.0
+    for i in 0 to a.agents.n {
+        let d: f64 = dist(a.agents.x[i], a.agents.y[i],
+                          b.agents.x[i], b.agents.y[i])
+        if d > worst { worst = d }
+    }
+    printf("        128 rats, 400 steps, largest divergence: %.3e m\n", worst)
+    check(worst == 0.0, 50, "two runs of one seed are bit identical")
+
+    # Rat zero's noise stream must not depend on how many rats were
+    # simulated alongside it. If it did, the stream would be indexed by
+    # something other than the rat, and a run would stop being reproducible
+    # at a different batch size.
+    #
+    # This has to be measured with the rats ignoring each other, because once
+    # they steer around their neighbours a rat in a crowd genuinely does take
+    # a different path from a rat on its own. That is the whole point of the
+    # social term, so the check is split: with it off the paths must match to
+    # the bit, and with it on they must not, which is the evidence that the
+    # term does anything at all.
+    let lonely_batch: f64 = solo_divergence(false)
+    let social_batch: f64 = solo_divergence(true)
+    printf("        rat 0 in a batch of 128 vs alone: %.3e m ignoring others\n",
+           lonely_batch)
+    printf("        %*s%.3e m noticing them\n", 42, "", social_batch)
+    check(lonely_batch == 0.0, 51,
+          "a lone rat's path does not depend on the batch size")
+    check(social_batch > 0.0, 52,
+          "and a sociable one's does, because it steers around the others")
+
+    let mut d2: Sim = sim_create(128, PRESET_OBSTACLES, 12345)
+    for k in 0 to 400 {
+        sim_step(&d2)
+    }
+    let diff: f64 = dist(a.agents.x[0], a.agents.y[0],
+                         d2.agents.x[0], d2.agents.y[0])
+    printf("        different seed moves rat 0 by: %.3f m\n", diff)
+    check(diff > 0.01, 52, "a different seed gives a different trajectory")
+
+    sim_destroy(&a)
+    sim_destroy(&b)
+    sim_destroy(&d2)
+}
+
+# --- populations -----------------------------------------------------------
+
+function test_populations() -> void {
+    section("populations")
+    let mut s: Sim = sim_create(1, PRESET_OPEN_FIELD, 4242)
+    s.can_enabled = false
+
+    # Place fields sit in free space.
+    let mut outside: i32 = 0
+    for c in 0 to s.place.n {
+        if !env_is_free(&s.env, s.place.p0[c], s.place.p1[c]) {
+            outside = outside + 1
+        }
+    }
+    check(outside == 0, 60, "no place field centre lands in a wall")
+
+    # A place cell peaks at its own centre and decays with distance.
+    let at_centre: f64 = place_rate_at(&s.place, 0, s.place.p0[0],
+                                       s.place.p1[0])
+    let one_sigma: f64 = place_rate_at(&s.place, 0,
+                                       s.place.p0[0] + s.place.p2[0],
+                                       s.place.p1[0])
+    printf("        place cell 0: peak %.3f, one sigma out %.3f, ratio %.4f\n",
+           at_centre, one_sigma, one_sigma / at_centre)
+    check(fabs(at_centre - s.place.p3[0]) < 0.0001, 61,
+          "a place cell reaches its peak rate at its centre")
+    # A Gaussian at one sigma is exp(-1/2) of its peak.
+    check(fabs(one_sigma / at_centre - 0.6065307) < 0.0001, 62,
+          "the field falls off as a gaussian")
+
+    # Head-direction tuning peaks at the preferred angle.
+    let hd_at: f64 = hd_rate_at(&s.hd, 3, s.hd.p0[3])
+    let hd_off: f64 = hd_rate_at(&s.hd, 3, s.hd.p0[3] + PI)
+    printf("        hd cell 3: at preferred %.3f, opposite %.5f\n",
+           hd_at, hd_off)
+    check(fabs(hd_at - s.hd.p2[3]) < 0.0001, 63,
+          "a head-direction cell peaks at its preferred angle")
+    check(hd_off < hd_at * 0.01, 64,
+          "and is nearly silent facing the other way")
+
+    # Run, then check the population decodes recover the true state.
+    let mut worst_place: f64 = 0.0
+    let mut worst_hd: f64 = 0.0
+    for k in 0 to 600 {
+        sim_step(&s)
+        let pe: f64 = sim_place_error(&s)
+        let he: f64 = sim_hd_error(&s)
+        if pe > worst_place { worst_place = pe }
+        if he > worst_hd { worst_hd = he }
+    }
+    printf("        over 600 steps, worst place decode error %.4f m\n",
+           worst_place)
+    printf("        over 600 steps, worst head decode error %.4f rad\n",
+           worst_hd)
+    check(worst_place < 0.15, 65, "the place code tracks position")
+    check(worst_hd < 0.05, 66, "the head-direction code tracks heading")
+
+    # A grid cell repeats on its lattice.
+    #
+    # The lattice translation vectors are not along the three wave vectors.
+    # They sit thirty degrees off them: with wave vectors at theta, theta+60
+    # and theta+120, a shift of one spacing along theta+30 gives phases of
+    # 2pi, 2pi and 0, so every term returns to where it started. Shifting
+    # along theta itself is not a lattice vector and does not repeat, which
+    # is what the first version of this check got wrong.
+    let spacing: f64 = s.grid.p0[0]
+    let orient: f64 = s.grid.p1[0]
+    let lat: f64 = orient + PI / 6.0
+    let gx: f64 = 1.0
+    let gy: f64 = 1.0
+    let r0: f64 = grid_rate_at(&s.grid, 0, &s.grid_p, gx, gy)
+    let r1: f64 = grid_rate_at(&s.grid, 0, &s.grid_p,
+                               gx + spacing * cos(lat),
+                               gy + spacing * sin(lat))
+    let r2: f64 = grid_rate_at(&s.grid, 0, &s.grid_p,
+                               gx + spacing * cos(lat + PI / 3.0),
+                               gy + spacing * sin(lat + PI / 3.0))
+    let r3: f64 = grid_rate_at(&s.grid, 0, &s.grid_p,
+                               gx + spacing * 0.5 * cos(lat),
+                               gy + spacing * 0.5 * sin(lat))
+    printf("        grid cell 0 at r: %.4f\n", r0)
+    printf("        one lattice vector along: %.4f, next vector: %.4f\n",
+           r1, r2)
+    printf("        half a lattice vector along: %.4f\n", r3)
+    check(fabs(r0 - r1) < 0.0001 and fabs(r0 - r2) < 0.0001, 67,
+          "a grid field repeats on both lattice vectors")
+    check(fabs(r0 - r3) > 0.1, 69,
+          "and does not repeat at half a lattice vector")
+
+    # Boundary cells respond to walls, so the population must be quieter in
+    # the open than against an edge.
+    let mut mid: f64 = 0.0
+    let mut edge: f64 = 0.0
+    agents_place(&s.agents, 0, 1.0, 1.0, 0.0, 0.0)
+    agents_sense(&s.agents, &s.env, s.require_sight)
+    boundary_update(&s.bvc, &s.agents, &s.bvc_p)
+    pop_summarise(&s.bvc, 0)
+    mid = s.bvc.last_max
+    agents_place(&s.agents, 0, 0.06, 1.0, 0.0, 0.0)
+    agents_sense(&s.agents, &s.env, s.require_sight)
+    boundary_update(&s.bvc, &s.agents, &s.bvc_p)
+    pop_summarise(&s.bvc, 0)
+    edge = s.bvc.last_max
+    printf("        boundary peak: arena centre %.3f, against a wall %.3f\n",
+           mid, edge)
+    check(edge > mid * 1.5, 68,
+          "boundary cells fire harder near a wall than in the open")
+
+    sim_destroy(&s)
+}
+
+# --- recurrent networks ----------------------------------------------------
+
+function test_attractor() -> void {
+    section("recurrent attractors")
+    let dt: f64 = 1.0 / 60.0
+
+    # A bump forms out of noise and is a single localised blob.
+    let mut sh: Can = can_params_sheet(32, 32)
+    can_build_kernel(&sh)
+    printf("        sheet: lambda_bump %.3f, lambda_2nd %.3f, w_global %.3f\n",
+           sh.lambda_bump, sh.lambda_second, sh.w_global)
+    check(sh.lambda_second < 1.0, 70,
+          "only the leading spatial mode is unstable")
+    can_reset(&sh, 5)
+    can_settle(&sh, 600, dt)
+    printf("        after settling: peak %.3f, mean %.3f, strength %.3f\n",
+           sh.max_rate, sh.mean_rate, sh.bump_strength)
+    check(sh.bump_strength > 0.4, 71, "a single bump forms from noise")
+    check(sh.max_rate > sh.mean_rate * 2.0, 72,
+          "activity is localised rather than uniform")
+
+    # Structured connectivity against the dense matrix. Same start, same
+    # input, same number of steps, compared element by element.
+    let mut ref: Can = can_params_sheet(16, 16)
+    can_build_kernel(&ref)
+    can_reset(&ref, 11)
+    let built: bool = can_build_dense(&ref)
+    check(built, 73, "the dense reference builds within its size limit")
+
+    let n: i32 = ref.n
+    let saved: ptr<f64> = malloc((n as i64) * 8) as ptr<f64>
+    can_copy_state(ref.r, saved, n)
+
+    can_set_input_sheet(&ref, 1.7, -0.9, 0.0, 0.0, false)
+    ref.use_dense = false
+    for k in 0 to 40 {
+        can_step(&ref, dt)
+    }
+    let structured: ptr<f64> = malloc((n as i64) * 8) as ptr<f64>
+    can_copy_state(ref.r, structured, n)
+
+    can_copy_state(saved, ref.r, n)
+    can_set_input_sheet(&ref, 1.7, -0.9, 0.0, 0.0, false)
+    ref.use_dense = true
+    for k in 0 to 40 {
+        can_step(&ref, dt)
+    }
+    let diff: f64 = can_max_abs_diff(structured, ref.r, n)
+    printf("        structured vs dense over 40 steps: max diff %.3e\n", diff)
+    check(diff < 0.000000001, 74,
+          "structured connectivity matches the dense matrix")
+    free(saved as ptr<void>)
+    free(structured as ptr<void>)
+    can_destroy(&ref)
+
+    # Path integration: drive at a known rate and check the bump keeps up.
+    can_calibrate_sheet(&sh, dt)
+    can_settle(&sh, 400, dt)
+    can_decode(&sh)
+    let mut prev: f64 = sh.bump_x
+    let mut travelled: f64 = 0.0
+    let drive: f64 = 3.0
+    let steps: i32 = 240
+    for k in 0 to steps {
+        can_set_input_sheet(&sh, drive, 0.0, 0.0, 0.0, false)
+        can_step(&sh, dt)
+        can_decode(&sh)
+        travelled = travelled + torus_delta(sh.bump_x, prev, sh.nx as f64)
+        prev = sh.bump_x
+    }
+    let want: f64 = drive * (steps as f64) * dt
+    printf("        driven at %.1f cells/s for %.1f s: moved %.2f, want %.2f\n",
+           drive, (steps as f64) * dt, travelled, want)
+    check(fabs(travelled / want - 1.0) < 0.08, 75,
+          "the bump tracks velocity within eight per cent")
+    check(sh.bump_strength > 0.4, 76, "and the bump survives the motion")
+    can_destroy(&sh)
+
+    # The ring holds a direction and turns with angular velocity.
+    let mut rg: Can = can_params_ring(64)
+    can_build_kernel(&rg)
+    can_reset(&rg, 3)
+    can_calibrate_ring(&rg, dt)
+    can_settle(&rg, 400, dt)
+    can_decode(&rg)
+    printf("        ring: lambda_2nd %.3f, strength %.3f\n",
+           rg.lambda_second, rg.bump_strength)
+    check(rg.bump_strength > 0.4, 77, "the ring holds one bump")
+
+    let mut rprev: f64 = rg.bump_x
+    let mut rtrav: f64 = 0.0
+    let omega: f64 = 1.0
+    for k in 0 to steps {
+        can_set_input_ring(&rg, omega, 0.0, false)
+        can_step(&rg, dt)
+        can_decode(&rg)
+        rtrav = rtrav + torus_delta(rg.bump_x, rprev, rg.nx as f64)
+        rprev = rg.bump_x
+    }
+    let rrad: f64 = rtrav / (rg.n as f64) * TAU
+    let rwant: f64 = omega * (steps as f64) * dt
+    printf("        ring driven at %.1f rad/s: turned %.3f, want %.3f\n",
+           omega, rrad, rwant)
+    check(fabs(rrad / rwant - 1.0) < 0.10, 78,
+          "the ring integrates angular velocity within ten per cent")
+    can_destroy(&rg)
+}
+
+# --- the circuit -----------------------------------------------------------
+
+# Peak response of place cell `c` over a sweep of the arena, and where it is.
+# Measured by moving the rat, not by asking the model what it intended.
+function sweep_peak(s: ptr<Sim>, c: i32, n: i32,
+                    px: ptr<f64>, py: ptr<f64>) -> f64 {
+    let mut best: f64 = -1.0
+    for j in 0 to n {
+        let y: f64 = s.env.y0 + ((j as f64) + 0.5) / (n as f64)
+                     * (s.env.y1 - s.env.y0)
+        for i in 0 to n {
+            let x: f64 = s.env.x0 + ((i as f64) + 0.5) / (n as f64)
+                         * (s.env.x1 - s.env.x0)
+            if env_is_free(&s.env, x, y) {
+                agents_place(&s.agents, 0, x, y, 0.0, 0.1)
+                agents_sense(&s.agents, &s.env, s.require_sight)
+                grid_update(&s.grid, &s.agents, &s.grid_p)
+                boundary_update(&s.bvc, &s.agents, &s.bvc_p)
+                circuit_update(&s.circuit, &s.place, &s.bvc, &s.grid, 1, 0)
+                let r: f64 = s.place.rates[c]
+                if r > best {
+                    best = r
+                    px[0] = x
+                    py[0] = y
+                }
+            }
+        }
+    }
+    return best
+}
+
+function test_circuit() -> void {
+    section("place cells driven by their inputs")
+    let mut s: Sim = sim_create(1, PRESET_OPEN_FIELD, 4242)
+    s.can_enabled = false
+    sim_set_circuit(&s, true)
+
+    check(s.circuit.enabled, 120, "the circuit switches on and wires itself")
+    let mut live_total: i32 = 0
+    for c in 0 to 16 {
+        live_total = live_total + circuit_live_inputs(&s.circuit, c)
+    }
+    printf("        mean inputs per cell over 16 cells: %.1f of %d\n",
+           (live_total as f64) / 16.0, s.circuit.fan_in)
+    check(live_total > 16 * 4, 121,
+          "every cell finds a usable set of inputs")
+
+    # A place cell here has no access to position. Its field is wherever its
+    # boundary and grid inputs happen to agree, so the check is that this
+    # lands where the cell was wired around.
+    let mut worst: f64 = 0.0
+    let mut worst_peak_err: f64 = 0.0
+    for c in 0 to 6 {
+        let mut mx: f64 = 0.0
+        let mut my: f64 = 0.0
+        let peak: f64 = sweep_peak(&s, c, 40, &mx, &my)
+        let off: f64 = dist(mx, my, s.place.p0[c], s.place.p1[c])
+        if off > worst { worst = off }
+        let perr: f64 = fabs(peak - s.place.p3[c]) / s.place.p3[c]
+        if perr > worst_peak_err { worst_peak_err = perr }
+    }
+    printf("        worst field offset from its wiring centre: %.3f m\n",
+           worst)
+    printf("        worst peak rate error against the configured peak: %.1f%%\n",
+           worst_peak_err * 100.0)
+    check(worst < 0.15, 122, "a field forms where the cell was wired")
+    check(worst_peak_err < 0.35, 123,
+          "and reaches roughly its configured peak rate")
+
+    # The point of the model: the field is anchored to walls, not to a
+    # coordinate. Put a barrier beside a cell and its response changes.
+    let mut bx: f64 = 0.0
+    let mut by: f64 = 0.0
+    let peak_before: f64 = sweep_peak(&s, 0, 36, &bx, &by)
+    let wall: i32 = env_add_wall(&s.env, bx + 0.10, by - 0.35,
+                                 bx + 0.10, by + 0.35)
+    agents_sense(&s.agents, &s.env, s.require_sight)
+    let mut ax2: f64 = 0.0
+    let mut ay2: f64 = 0.0
+    let peak_after: f64 = sweep_peak(&s, 0, 36, &ax2, &ay2)
+    let shift: f64 = dist(bx, by, ax2, ay2)
+    printf("        a wall beside cell 0: field moved %.3f m, peak %.1f -> %.1f\n",
+           shift, peak_before, peak_after)
+    check(shift > 0.0 or fabs(peak_after - peak_before) > 0.5, 124,
+          "adding a wall changes a field built from boundary input")
+    let removed: bool = env_remove_wall(&s.env, wall)
+    sim_env_changed(&s)
+
+    # Turning the circuit off returns the analytic fields, unchanged.
+    sim_set_circuit(&s, false)
+    sim_reset(&s, 1)
+    for k in 0 to 200 {
+        sim_step(&s)
+    }
+    let analytic_err: f64 = sim_place_error(&s)
+    check(analytic_err >= 0.0 and analytic_err < 0.2, 125,
+          "switching the circuit off restores the analytic fields")
+
+    sim_destroy(&s)
+}
+
+# --- end to end ------------------------------------------------------------
+
+function test_end_to_end() -> void {
+    section("end to end")
+    let mut s: Sim = sim_create(8, PRESET_OPEN_FIELD, 777)
+
+    # Path integration against ground truth, with the anchor off, so what is
+    # measured is the network's own drift.
+    for k in 0 to 600 {
+        sim_step(&s)
+    }
+    let i: i32 = sim_selected(&s)
+    let mut ix: f64 = 0.0
+    let mut iy: f64 = 0.0
+    sim_sheet_position(&s, &ix, &iy)
+    let drift: f64 = dist(ix, iy, s.agents.x[i], s.agents.y[i])
+    printf("        after %.1f s unanchored, sheet is %.4f m from the truth\n",
+           s.time, drift)
+    check(drift < 0.25, 80, "path integration stays close over ten seconds")
+    check(s.sheet.bump_strength > 0.3, 81,
+          "the sheet keeps a readable bump while the rat moves")
+
+    # Editing the environment has to change the outcome.
+    #
+    # The barrier is dropped right beside the start zone, and the comparison
+    # is over the whole batch. An earlier version put the wall across the far
+    # side of the arena and compared one rat, which passed or failed on
+    # whether that rat happened to wander over there in ten seconds. A test
+    # whose result depends on that is not testing the edit.
+    let mut t: Sim = sim_create(8, PRESET_OPEN_FIELD, 777)
+    let before_wall: f64 = t.agents.wall_dist[0]
+    env_add_box(&t.env, 0.5, 0.0, 0.15, 1.0)
+    sim_env_changed(&t)
+    let after_wall: f64 = t.agents.wall_dist[0]
+    printf("        rat 0 wall distance before the edit %.4f, after %.4f\n",
+           before_wall, after_wall)
+    check(fabs(after_wall - before_wall) > 0.001, 86,
+          "an edit changes what the rats sense immediately")
+
+    for k in 0 to 600 {
+        sim_step(&t)
+    }
+    let mut worst_move: f64 = 0.0
+    for k in 0 to t.agents.n {
+        let d: f64 = dist(s.agents.x[k], s.agents.y[k],
+                          t.agents.x[k], t.agents.y[k])
+        if d > worst_move { worst_move = d }
+    }
+    printf("        adding a barrier moved endpoints by up to %.3f m\n",
+           worst_move)
+    check(worst_move > 0.05, 82, "an environment edit changes the outcome")
+
+    let mut in_solid: i32 = 0
+    for k in 0 to t.agents.n {
+        if env_in_solid(&t.env, t.agents.x[k], t.agents.y[k]) {
+            in_solid = in_solid + 1
+        }
+    }
+    check(in_solid == 0, 83, "and no rat ends up inside the new barrier")
+
+    # Disabling a population must silence it and leave the others alone.
+    let hd_before: f64 = t.hd.last_max
+    sim_pop_toggle(&t, 0)
+    sim_step(&t)
+    printf("        place peak with the population off: %.4f\n",
+           t.place.last_max)
+    check(t.place.last_max == 0.0, 84, "a disabled population goes silent")
+    check(t.hd.last_max > 0.0, 85, "and its neighbours keep running")
+
+    # Poisson spiking. The control panel toggles it, so it has to actually
+    # produce spikes: an earlier version gated the draw on a per-population
+    # flag that nothing ever set, and the toggle did nothing at all.
+    sim_pop_toggle(&t, 0)
+    t.spiking = true
+    let mut total_spikes: i32 = 0
+    for k in 0 to 200 {
+        sim_step(&t)
+        let p: ptr<Pop> = sim_pop(&t, 0)
+        let base: i32 = pop_base(p, sim_selected(&t))
+        for c in 0 to p.n {
+            total_spikes = total_spikes + p.spikes[base + c]
+        }
+    }
+    printf("        place spikes over 200 steps with spiking on: %d\n",
+           total_spikes)
+    check(total_spikes > 0, 87, "the spiking toggle produces spikes")
+
+    t.spiking = false
+    for k in 0 to 5 {
+        sim_step(&t)
+    }
+    let mut off_spikes: i32 = 0
+    let p2: ptr<Pop> = sim_pop(&t, 0)
+    let base2: i32 = pop_base(p2, sim_selected(&t))
+    for c in 0 to p2.n {
+        off_spikes = off_spikes + p2.spikes[base2 + c]
+    }
+    check(off_spikes >= 0, 88, "and turning it off is harmless")
+
+    sim_destroy(&s)
+    sim_destroy(&t)
+}
+
+# Count lines in a file, or -1 when it cannot be opened. Used to check that
+# a recording actually wrote something rather than trusting that fopen
+# returning non-null means the rows arrived.
+function count_lines(path: string) -> i32 {
+    let f: ptr<void> = fopen(path, "r")
+    if f == null { return -1 }
+    let mut n: i32 = 0
+    let mut ch: i32 = fgetc(f)
+    while ch != -1 {
+        if ch == 10 { n = n + 1 }
+        ch = fgetc(f)
+    }
+    let c: i32 = fclose(f)
+    return n
+}
+
+function test_io() -> void {
+    section("recording and configuration")
+
+    let mut s: Sim = sim_create(4, PRESET_TWO_ROOMS, 606)
+    let mut ed: Editor = editor_new()
+    let mut rec: Recorder = rec_new()
+    rec.stride = 2
+
+    let started: bool = rec_start(&rec, &s)
+    check(started, 90, "the recorder opens its three output files")
+    for k in 0 to 60 {
+        sim_step(&s)
+        rec_step(&rec, &s)
+    }
+    rec_stop(&rec)
+
+    let traj: i32 = count_lines("data/out/trajectory.csv")
+    let neural: i32 = count_lines("data/out/neural.csv")
+    let recur: i32 = count_lines("data/out/recurrent.csv")
+    printf("        rows: trajectory %d, neural %d, recurrent %d\n",
+           traj, neural, recur)
+    # 60 steps at stride 2 is 30 recorded steps, plus a header line, times
+    # four rats for the trajectory stream.
+    check(traj == 1 + 30 * 4, 91, "the trajectory stream has every rat row")
+    check(recur == 1 + 30, 92, "the recurrent stream has one row per step")
+    check(neural > 30, 93, "the neural stream has cell rows")
+
+    let map_ok: bool = export_ratemap(&s, 0, 3, "data/out/ratemap.csv")
+    let map_rows: i32 = count_lines("data/out/ratemap.csv")
+    printf("        rate map rows: %d\n", map_rows)
+    check(map_ok and map_rows == 1 + 96 * 96, 94,
+          "a place-cell rate map exports a full grid")
+
+    let occ_ok: bool = export_occupancy(&s, "data/out/occupancy.csv", 32)
+    check(occ_ok and count_lines("data/out/occupancy.csv") == 1 + 32 * 32,
+          95, "an occupancy map exports a full grid")
+
+    # Round trip: draw something into the arena, save, change everything,
+    # load, and check the arena and the parameters came back.
+    let cue_idx: i32 = env_add_cue(&s.env, 0.42, 0.77, 0.6)
+    env_add_box(&s.env, 1.3, 0.2, 0.2, 0.3)
+    s.motion.speed_mean = 0.271
+    s.place_p.sigma = 0.137
+    ed.trail_len = 123
+    let walls_before: i32 = s.env.n_walls
+    let cues_before: i32 = s.env.n_cues
+    let solids_before: i32 = s.env.n_solids
+
+    let saved: bool = config_save(&s, &ed, "data/out/roundtrip.flowrat")
+    check(saved, 96, "a configuration saves")
+
+    sim_set_preset(&s, PRESET_CIRCLE)
+    s.motion.speed_mean = 0.5
+    s.place_p.sigma = 0.3
+    ed.trail_len = 40
+
+    let loaded: bool = config_load(&s, &ed, "data/out/roundtrip.flowrat")
+    printf("        after reload: walls %d (was %d), cues %d (was %d), solids %d (was %d)\n",
+           s.env.n_walls, walls_before, s.env.n_cues, cues_before,
+           s.env.n_solids, solids_before)
+    printf("        speed %.4f, place sigma %.4f, trail %d\n",
+           s.motion.speed_mean, s.place_p.sigma, ed.trail_len)
+    check(loaded, 97, "a configuration loads")
+    check(s.env.n_walls == walls_before and s.env.n_cues == cues_before
+          and s.env.n_solids == solids_before, 98,
+          "the edited arena survives a round trip")
+    check(fabs(s.motion.speed_mean - 0.271) < 0.000001
+          and fabs(s.place_p.sigma - 0.137) < 0.000001
+          and ed.trail_len == 123, 99,
+          "parameters survive a round trip")
+
+    let bad: bool = config_load(&s, &ed, "data/out/does_not_exist")
+    check(!bad, 100, "a missing configuration is refused, not half applied")
+
+    sim_destroy(&s)
+}
+
+# The whole interface draws into an offscreen canvas, so it can be exercised
+# without a window. This catches a panel that reads past the end of an array
+# or divides by a count that happens to be zero.
+function test_ui() -> void {
+    section("interface")
+    let mut cv: Canvas = canvas_create(WIN_W, WIN_H)
+    let mut lay: Layout = layout_build(WIN_W, WIN_H)
+    let mut u: Ui = ui_create()
+    let mut ed: Editor = editor_new()
+    let mut rec: Recorder = rec_new()
+    let mut defs: Defaults = defaults_new(32)
+    # The analysis panel needs a session to draw, and drawing it before
+    # anything is recorded is exactly the state a user first sees, so the
+    # interface check covers it unrecorded as well as recorded.
+    let mut ui_sess: Session = session_create(32, 32)
+
+    let mut drawn: i32 = 0
+    for p in 0 to PRESET_COUNT {
+        let mut s: Sim = sim_create(3, p, 8080)
+        let mut v: View = view_new(lay.env_x, lay.env_y, lay.env_w, lay.env_h)
+        view_fit(&v, s.env.x0, s.env.y0, s.env.x1, s.env.y1)
+        for k in 0 to 20 {
+            sim_step(&s)
+        }
+        # Every population selected in turn, and the mouse parked over the
+        # control panel, so the widget paths run too.
+        for sel in 0 to SIM_POP_COUNT {
+            ed.sel_pop = sel
+            ui_begin(&u, lay.ctl_x + 20, lay.ctl_y + 60, false, 0)
+            dr_clear(&cv, C_BG)
+            view_header_draw(&cv, &s, &ed, 16.7, &lay)
+            let a: bool = view_control_draw(&cv, &u, &s, &ed, &v, &defs, &lay)
+            let b: bool = view_editor_draw(&cv, &u, &s, &ed, &rec, &v, &defs, &lay)
+            view_pop_draw(&cv, &u, &s, &ed, &lay)
+            view_tabs_draw(&cv, &u, &ed, &lay)
+            # Every tab, every arena, every selected population.
+            for tb in 0 to TAB_COUNT {
+                ed.tab = tb
+                if tb == TAB_RAT { view_rat_draw(&cv, &u, &s, &ed, &lay) }
+                if tb == TAB_ETHO {
+                    view_etho_draw(&cv, &u, &s, &defs, &ed, &lay)
+                }
+                if tb == TAB_CAN { view_can_draw(&cv, &u, &s, &defs, &lay) }
+                if tb == TAB_NET {
+                    view_net_draw(&cv, &u, &s, &defs, &ed, &lay)
+                }
+                if tb == TAB_ANALYSIS {
+                    view_analysis_draw(&cv, &u, &s, &ui_sess, &ed, &lay)
+                }
+                if tb == TAB_PERF { view_perf_draw(&cv, &u, &s, 16.7, &lay) }
+                if tb == TAB_EDIT {
+                    let e2: bool = view_editor_draw(&cv, &u, &s, &ed, &rec,
+                                                    &v, &defs, &lay)
+                }
+            }
+            ed.tab = TAB_RAT
+            view_env_draw(&cv, &u, &v, &s, &ed, &lay)
+            drawn = drawn + 1
+        }
+        sim_destroy(&s)
+    }
+    printf("        drew %d full frames across %d arenas\n",
+           drawn, PRESET_COUNT)
+    check(drawn == PRESET_COUNT * SIM_POP_COUNT, 101,
+          "every panel draws in every arena")
+
+    # The editor, driven the way a mouse would drive it. Synthesising the
+    # Ui state here reaches the drag-and-commit path that a headless run
+    # otherwise never touches.
+    let mut es: Sim = sim_create(2, PRESET_OPEN_FIELD, 21)
+    let mut ev: View = view_new(lay.env_x, lay.env_y, lay.env_w, lay.env_h)
+    view_fit(&ev, es.env.x0, es.env.y0, es.env.x1, es.env.y1)
+    ed.tool = TOOL_BOX
+
+    let sx0: i32 = view_sx(&ev, 1.2)
+    let sy0: i32 = view_sy(&ev, 1.2)
+    let sx1: i32 = view_sx(&ev, 1.5)
+    let sy1: i32 = view_sy(&ev, 1.5)
+    let solids0: i32 = es.env.n_solids
+    let walls0: i32 = es.env.n_walls
+
+    # Press, drag, release. The commit happens on release.
+    ui_begin(&u, sx0, sy0, true, 0)
+    let d1: bool = view_env_input(&u, &ev, &es, &ed, &lay)
+    ui_begin(&u, sx1, sy1, true, 0)
+    let d2: bool = view_env_input(&u, &ev, &es, &ed, &lay)
+    ui_begin(&u, sx1, sy1, false, 0)
+    let d3: bool = view_env_input(&u, &ev, &es, &ed, &lay)
+    printf("        drag a box: solids %d -> %d, walls %d -> %d\n",
+           solids0, es.env.n_solids, walls0, es.env.n_walls)
+    check(d3 and es.env.n_solids == solids0 + 1
+          and es.env.n_walls == walls0 + 4, 103,
+          "dragging with the box tool adds a block on release")
+
+    sim_env_changed(&es)
+    check(env_in_solid(&es.env, 1.35, 1.35), 104,
+          "the new block occupies the space it was drawn over")
+
+    # Erase it again.
+    ed.tool = TOOL_ERASE
+    let ex: i32 = view_sx(&ev, 1.35)
+    let ey: i32 = view_sy(&ev, 1.35)
+    ui_begin(&u, ex, ey, true, 0)
+    let d4: bool = view_env_input(&u, &ev, &es, &ed, &lay)
+    printf("        erase: solids %d, walls %d\n",
+           es.env.n_solids, es.env.n_walls)
+    check(d4 and es.env.n_solids == solids0
+          and es.env.n_walls == walls0, 105,
+          "the erase tool removes the block and its segments")
+
+    # A click that never moved must not leave a zero-length wall behind.
+    ed.tool = TOOL_WALL
+    ui_begin(&u, sx0, sy0, true, 0)
+    let d5: bool = view_env_input(&u, &ev, &es, &ed, &lay)
+    ui_begin(&u, sx0, sy0, false, 0)
+    let d6: bool = view_env_input(&u, &ev, &es, &ed, &lay)
+    check(es.env.n_walls == walls0, 106,
+          "a click with the wall tool adds nothing")
+
+    ed.tool = TOOL_SELECT
+    sim_destroy(&es)
+
+    # The scroll wheel. The backend reports a cumulative total that never
+    # resets, so ui_begin has to difference it. Passing the total through
+    # raw leaves it permanently non-zero after the first scroll, and the
+    # environment view then zooms every single frame until the arena is a
+    # speck. That is what this checks.
+    ui_begin(&u, 0, 0, false, 0)
+    check(u.wheel == 0, 107, "no scroll reports no wheel movement")
+    ui_begin(&u, 0, 0, false, 3)
+    check(u.wheel == 3, 108, "a scroll reports its delta")
+    ui_begin(&u, 0, 0, false, 3)
+    check(u.wheel == 0, 109,
+          "holding still after a scroll reports no further movement")
+    ui_begin(&u, 0, 0, false, 1)
+    check(u.wheel == -2, 110, "scrolling back reports a negative delta")
+
+    # And the zoom it drives must be stable when nothing is scrolling.
+    let mut zs: Sim = sim_create(2, PRESET_OPEN_FIELD, 5)
+    let mut zv: View = view_new(lay.env_x, lay.env_y, lay.env_w, lay.env_h)
+    view_fit(&zv, zs.env.x0, zs.env.y0, zs.env.x1, zs.env.y1)
+    let zoom0: f64 = zv.zoom
+    ui_begin(&u, lay.env_x + 40, lay.env_y + 40, false, 12)
+    let zd1: bool = view_env_input(&u, &zv, &zs, &ed, &lay)
+    let zoom_scrolled: f64 = zv.zoom
+    for k in 0 to 60 {
+        ui_begin(&u, lay.env_x + 40, lay.env_y + 40, false, 12)
+        let zd: bool = view_env_input(&u, &zv, &zs, &ed, &lay)
+    }
+    printf("        zoom: fitted %.1f, after one scroll %.1f, after 60 idle frames %.1f\n",
+           zoom0, zoom_scrolled, zv.zoom)
+    check(zoom_scrolled > zoom0, 111, "a scroll zooms in")
+    check(zv.zoom == zoom_scrolled, 112,
+          "and the zoom holds while the wheel is untouched")
+    sim_destroy(&zs)
+
+    # A batch of zero rats is reachable from the controls and must not
+    # divide by the count.
+    let mut z: Sim = sim_create(1, PRESET_OPEN_FIELD, 1)
+    agents_set_count(&z.agents, 0)
+    ui_begin(&u, -50, -50, false, 0)
+    dr_clear(&cv, C_BG)
+    view_rat_draw(&cv, &u, &z, &ed, &lay)
+    view_pop_draw(&cv, &u, &z, &ed, &lay)
+    check(true, 102, "the inspector survives an empty batch")
+    sim_destroy(&z)
+
+    session_destroy(&ui_sess)
+    canvas_destroy(&cv)
+}
+
+# --- behaviour --------------------------------------------------------------
+
+function test_behaviour() -> void {
+    section("behavioural states")
+
+    let mut s: Sim = sim_create(24, PRESET_OPEN_FIELD, 606)
+    s.can_enabled = false
+    for k in 0 to 6000 {
+        sim_step(&s)
+    }
+
+    printf("        %-9s %8s %8s %8s\n",
+           "state", "share", "bouts", "mean s")
+    let mut seen: i32 = 0
+    let mut budget: f64 = 0.0
+    for st in 0 to ST_COUNT {
+        let frac: f64 = ethogram_fraction(&s.etho, st)
+        budget = budget + s.etho.total_time[st]
+        if s.etho.bouts[st] > 0 or frac > 0.0 { seen = seen + 1 }
+        printf("        %-9s %7.1f%% %8d %8.2f\n",
+               state_name(st), frac * 100.0, s.etho.bouts[st],
+               ethogram_mean_bout(&s.etho, st))
+    }
+
+    # The budget is summed over every rat, so it should be the elapsed time
+    # times the batch size. A rat in no state, or in two, shows up here.
+    let want: f64 = s.etho.elapsed * (s.agents.n as f64)
+    printf("        time budget %.2f, expected %.2f\n", budget, want)
+    check(fabs(budget - want) < 0.001, 180,
+          "every rat is in exactly one state at every step")
+
+    check(seen >= 4, 181, "the rats use several of their behaviours")
+    check(s.etho.bouts[ST_GROOM] > 0 and s.etho.bouts[ST_REAR] > 0
+          and s.etho.bouts[ST_REST] > 0, 182,
+          "grooming, rearing and resting all occur")
+    check(s.etho.bouts[ST_EAT] > 0, 183, "and so does eating")
+
+    # Bouts have sensible lengths: rearing is brief, resting is not.
+    let rear: f64 = ethogram_mean_bout(&s.etho, ST_REAR)
+    let rest: f64 = ethogram_mean_bout(&s.etho, ST_REST)
+    printf("        mean rear bout %.2f s, mean rest bout %.2f s\n",
+           rear, rest)
+    check(rear > 0.2 and rear < 2.0, 184,
+          "a rearing bout lasts about a second")
+    check(rest > rear * 3.0, 185, "and a resting bout lasts far longer")
+
+    # No bout of zero length: those come from a machine that flickers
+    # between two states at a threshold, and they poison a time budget.
+    let mut total_bouts: i32 = 0
+    for st in 0 to ST_COUNT {
+        total_bouts = total_bouts + s.etho.bouts[st]
+    }
+    let mut binned: i32 = 0
+    for st in 0 to ST_COUNT {
+        for b in 0 to BOUT_BINS {
+            binned = binned + ethogram_hist_at(&s.etho, st, b)
+        }
+    }
+    check(binned == total_bouts, 186,
+          "every completed bout lands in the histogram")
+
+    # No state should be churning through bouts a single step long. That is
+    # the signature of two states swapping every step at a threshold, and it
+    # makes a time budget meaningless: the first version of this recorded
+    # sixty-six thousand exploring bouts averaging two hundredths of a
+    # second, from rats retrying an exhausted patch.
+    let mut churn: i32 = -1
+    for st in 0 to ST_COUNT {
+        if s.etho.bouts[st] > 20 and ethogram_mean_bout(&s.etho, st) < 0.1 {
+            churn = st
+        }
+    }
+    if churn >= 0 {
+        printf("        %s churns: %d bouts of %.4f s\n", state_name(churn),
+               s.etho.bouts[churn], ethogram_mean_bout(&s.etho, churn))
+    }
+    check(churn < 0, 193, "no state churns through single-step bouts")
+
+    # A stationary state means stationary.
+    let mut moving_while_still: i32 = 0
+    for i in 0 to s.agents.n {
+        if state_is_still(s.agents.state[i]) and s.agents.speed[i] > 0.0 {
+            moving_while_still = moving_while_still + 1
+        }
+    }
+    check(moving_while_still == 0, 187,
+          "a rat that is grooming or resting is not moving")
+
+    sim_destroy(&s)
+
+    # The same machine with enough food, which is the condition a published
+    # time budget would have been measured under.
+    # Eight rats for five minutes rather than two for three. Resting bouts
+    # run to a dozen seconds, so a short run with a couple of rats samples
+    # only a handful of them and the budget swings by tens of per cent
+    # between seeds. This is a measurement, so it gets a sample size.
+    let mut w: Sim = sim_create(8, PRESET_OPEN_FIELD, 606)
+    w.can_enabled = false
+    for z in 0 to w.env.n_zones {
+        if w.env.zone_kind[z] == ZONE_REWARD {
+            w.env.zone_capacity[z] = 40.0
+            w.env.zone_regrow[z] = 2.0
+        }
+    }
+    env_refill_food(&w.env)
+    # Five minutes of habituation before anything is recorded, then the
+    # ethogram is cleared and the measurement starts. The band below comes
+    # from the literature on animals in a familiar arena, and a colony that
+    # has just been put down is not in one: it is still working along the
+    # walls of a room it has never seen. Habituating before recording is what
+    # an experimenter does, and skipping it made this test a measurement of
+    # novelty rather than of the time budget.
+    for k in 0 to 18000 {
+        sim_step(&w)
+    }
+    printf("        familiarity of rat 0 after habituation: %.2f\n",
+           novelty_mean(&w.agents, &w.env, 0))
+    ethogram_reset(&w.etho)
+    for k in 0 to 18000 {
+        sim_step(&w)
+    }
+    printf("        well fed and habituated, eight rats, 300 s\n")
+    for st in 0 to ST_COUNT {
+        let frac: f64 = ethogram_fraction(&w.etho, st)
+        if frac > 0.0 {
+            printf("        %-9s %7.1f%%\n", state_name(st), frac * 100.0)
+        }
+    }
+    # Walking back to the nest is locomotion. Leaving it out of both sums
+    # left a tenth of the budget in neither bucket, which made maintenance
+    # look low for a reason that had nothing to do with maintenance.
+    let locomotion: f64 = ethogram_fraction(&w.etho, ST_EXPLORE)
+                          + ethogram_fraction(&w.etho, ST_FORAGE)
+                          + ethogram_fraction(&w.etho, ST_HOME)
+    let maintenance: f64 = ethogram_fraction(&w.etho, ST_GROOM)
+                           + ethogram_fraction(&w.etho, ST_REST)
+                           + ethogram_fraction(&w.etho, ST_REAR)
+    printf("        locomotion %.1f%%, maintenance %.1f%%\n",
+           locomotion * 100.0, maintenance * 100.0)
+    # The open-field literature puts a familiar, fed rat at roughly half its
+    # time locomoting, with rearing, grooming and resting making up most of
+    # the rest. This is the one number in FlowRat that can be held against a
+    # published measurement, so the band is deliberately wide rather than
+    # tuned to whatever the model currently produces.
+    check(maintenance > 0.2 and maintenance < 0.6, 190,
+          "a fed rat spends a fifth to three fifths of its time on upkeep")
+    check(locomotion > 0.3 and locomotion < 0.75, 191,
+          "and between a third and three quarters moving")
+    check(ethogram_mean_bout(&w.etho, ST_REST) > 2.0, 192,
+          "a resting bout is not a single step")
+    sim_destroy(&w)
+
+    # Switching the machine off returns the old always-exploring behaviour.
+    let mut t: Sim = sim_create(4, PRESET_OPEN_FIELD, 21)
+    t.can_enabled = false
+    t.behaviour.enabled = false
+    for k in 0 to 600 {
+        sim_step(&t)
+    }
+    let mut all_explore: bool = true
+    for i in 0 to t.agents.n {
+        if t.agents.state[i] != ST_EXPLORE { all_explore = false }
+    }
+    check(all_explore, 188,
+          "turning the machine off leaves every rat exploring")
+    sim_destroy(&t)
+
+    # And the whole thing stays reproducible.
+    let mut a1: Sim = sim_create(32, PRESET_OBSTACLES, 4321)
+    let mut a2: Sim = sim_create(32, PRESET_OBSTACLES, 4321)
+    for k in 0 to 900 {
+        sim_step(&a1)
+        sim_step(&a2)
+    }
+    let mut same: bool = true
+    for st in 0 to ST_COUNT {
+        if a1.etho.bouts[st] != a2.etho.bouts[st] { same = false }
+        if a1.etho.total_time[st] != a2.etho.total_time[st] { same = false }
+    }
+    printf("        two runs of one seed: identical ethogram %d\n",
+           same as i32)
+    check(same, 189, "the ethogram is reproducible to the bit")
+    sim_destroy(&a1)
+    sim_destroy(&a2)
+}
+
+# --- the head ---------------------------------------------------------------
+
+function test_head() -> void {
+    section("head direction")
+
+    let mut s: Sim = sim_create(8, PRESET_OPEN_FIELD, 31337)
+    s.can_enabled = false
+
+    let mut worst_head: f64 = 0.0
+    let mut worst_offset: f64 = 0.0
+    let mut biggest_decouple: f64 = 0.0
+    let mut out_of_range: i32 = 0
+    for k in 0 to 3000 {
+        sim_step(&s)
+        for i in 0 to s.agents.n {
+            let off: f64 = s.agents.head_angle[i]
+            if fabs(off) > fabs(worst_offset) { worst_offset = off }
+            if fabs(off) > s.motion.head_max + 0.000001 {
+                out_of_range = out_of_range + 1
+            }
+        }
+        let e: f64 = sim_hd_error(&s)
+        if e > worst_head { worst_head = e }
+        # How far the population's estimate is from the body's heading. The
+        # two used to be the same variable, so this was zero by construction.
+        let i0: i32 = sim_selected(&s)
+        let mut strength: f64 = 0.0
+        let est: f64 = hd_decode(&s.hd, i0, &strength)
+        let d: f64 = fabs(angle_delta(s.agents.heading[i0], est))
+        if d > biggest_decouple { biggest_decouple = d }
+    }
+    printf("        largest head offset from the body: %.3f rad, limit %.3f\n",
+           worst_offset, s.motion.head_max)
+    printf("        decode against the head %.5f rad, against the body %.3f rad\n",
+           worst_head, biggest_decouple)
+    check(out_of_range == 0, 200, "the head stays inside its range")
+    check(fabs(worst_offset) > 0.1, 201, "and it actually moves")
+    check(worst_head < 0.01, 202,
+          "the population recovers the head direction")
+    check(biggest_decouple > 0.2, 203,
+          "which is now a different thing from the body's heading")
+    sim_destroy(&s)
+
+    # Vicarious trial and error. A fork is somewhere with three or more open
+    # directions, so it should happen in a maze and not in an empty box.
+    let mut open_field: Sim = sim_create(8, PRESET_OPEN_FIELD, 55)
+    open_field.can_enabled = false
+    for k in 0 to 6000 {
+        sim_step(&open_field)
+    }
+    let open_scans: i32 = agents_total_scans(&open_field.agents)
+    sim_destroy(&open_field)
+
+    let mut maze: Sim = sim_create(8, PRESET_PLUS_MAZE, 55)
+    maze.can_enabled = false
+    for k in 0 to 6000 {
+        sim_step(&maze)
+    }
+    let maze_scans: i32 = agents_total_scans(&maze.agents)
+    printf("        scans in 100 s: open field %d, plus maze %d\n",
+           open_scans, maze_scans)
+    check(maze_scans > 0, 204, "rats stop and look around at a fork")
+    check(open_scans < maze_scans, 205,
+          "and do it less in a box with no forks")
+    check(ethogram_fraction(&maze.etho, ST_SCAN) > 0.0, 206,
+          "scanning shows up in the time budget")
+    let scan_bout: f64 = ethogram_mean_bout(&maze.etho, ST_SCAN)
+    printf("        mean scan bout %.2f s\n", scan_bout)
+    check(scan_bout > 0.3 and scan_bout < 3.0, 207,
+          "and a scan lasts about a second")
+    sim_destroy(&maze)
+
+    # Switching it off stops it happening.
+    let mut off: Sim = sim_create(8, PRESET_PLUS_MAZE, 55)
+    off.can_enabled = false
+    off.behaviour.vte_enabled = false
+    for k in 0 to 3000 {
+        sim_step(&off)
+    }
+    check(agents_total_scans(&off.agents) == 0, 208,
+          "turning it off stops the scanning")
+    sim_destroy(&off)
+}
+
+# --- foraging ---------------------------------------------------------------
+
+function test_foraging() -> void {
+    section("food, hunger and eating")
+
+    let mut s: Sim = sim_create(1, PRESET_OPEN_FIELD, 4242)
+    s.can_enabled = false
+    # Depletion is what this section is about, so the test sets its own
+    # regrowth to zero rather than depending on whichever preset it uses
+    # keeping the value it had when the test was written.
+    for z in 0 to s.env.n_zones {
+        s.env.zone_regrow[z] = 0.0
+    }
+    let stock: f64 = env_food_capacity(&s.env)
+    check(stock > 0.0, 160, "an arena starts with food in it")
+
+    # Hunger rises on its own, and only eating brings it down.
+    let h0: f64 = s.agents.hunger[0]
+    for k in 0 to 600 {
+        sim_step(&s)
+    }
+    printf("        after 10 s: hunger %.3f, eaten %.2f, food left %.2f\n",
+           s.agents.hunger[0], s.agents.eaten[0],
+           env_food_remaining(&s.env))
+    check(s.agents.hunger[0] > h0, 161, "hunger rises on its own")
+
+    # A hundred and fifty seconds. Hunger climbs at 0.012 a second now, so
+    # fifty leaves the animal only half hungry, and a half-hungry rat is
+    # entitled to spend the time grooming.
+    for k in 0 to 9000 {
+        sim_step(&s)
+    }
+    printf("        after 150 s: hunger %.3f, eaten %.2f, food left %.2f\n",
+           s.agents.hunger[0], s.agents.eaten[0],
+           env_food_remaining(&s.env))
+    check(s.agents.eaten[0] > 0.0, 162, "a hungry rat finds food and eats")
+    check(env_food_remaining(&s.env) < stock, 163,
+          "and the arena has less food than it started with")
+
+    # Food is conserved. Everything taken from a patch is inside a rat.
+    printf("        food taken %.4f, held by rats %.4f, unaccounted %.6f\n",
+           s.food_taken,
+           agents_total_eaten(&s.agents) + agents_total_carried(&s.agents),
+           sim_food_unaccounted(&s))
+    check(fabs(sim_food_unaccounted(&s)) < 0.000001, 164,
+          "every unit removed from a patch ends up in a rat")
+
+    # A patch cannot go negative however many rats are at it.
+    let mut neg: i32 = 0
+    for z in 0 to s.env.n_zones {
+        if s.env.zone_amount[z] < 0.0 { neg = neg + 1 }
+    }
+    check(neg == 0, 165, "no patch is eaten past empty")
+    sim_destroy(&s)
+
+    # Scarcity. Sixteen rats and one patch: the patch empties, and not
+    # everyone gets fed. That is the point of a limited resource.
+    let mut c: Sim = sim_create(16, PRESET_OPEN_FIELD, 77)
+    c.can_enabled = false
+    # Thirst off, so this measures competition for one resource rather than
+    # sixteen rats deciding between two. The point here is the patch, and a
+    # second drive pulling half the colony to the far corner would confound
+    # it without testing anything the drive tests do not already cover.
+    c.motion.thirst_rate = 0.0
+    for z in 0 to c.env.n_zones {
+        c.env.zone_regrow[z] = 0.0
+    }
+    # Two minutes rather than forty seconds, for the same reason: at the
+    # rescaled metabolism sixteen rats take longer to clear a patch than they
+    # used to, and the check is that the patch empties rather than how fast.
+    for k in 0 to 7200 {
+        sim_step(&c)
+    }
+    let mut fed: i32 = 0
+    for i in 0 to c.agents.n {
+        if c.agents.eaten[i] > 0.0 { fed = fed + 1 }
+    }
+    printf("        16 rats: %.2f eaten, %.2f left, %d of 16 got any\n",
+           agents_total_eaten(&c.agents), env_food_remaining(&c.env), fed)
+    check(env_food_remaining(&c.env) < 0.001, 166,
+          "a shared patch is emptied")
+    check(fed < c.agents.n, 167, "and not every rat gets fed")
+    check(fabs(sim_food_unaccounted(&c)) < 0.000001, 168,
+          "food stays conserved under competition")
+    sim_destroy(&c)
+
+    # Seeking food is what makes the difference, not luck. The same seed
+    # with the foraging drive off should find far less.
+    let mut f: Sim = sim_create(8, PRESET_OPEN_FIELD, 909)
+    f.can_enabled = false
+    for z in 0 to f.env.n_zones {
+        f.env.zone_regrow[z] = 0.0
+    }
+    f.motion.forage_gain = 0.0
+    for k in 0 to 3000 {
+        sim_step(&f)
+    }
+    let blind: f64 = agents_total_eaten(&f.agents)
+    sim_destroy(&f)
+
+    let mut g: Sim = sim_create(8, PRESET_OPEN_FIELD, 909)
+    g.can_enabled = false
+    for z in 0 to g.env.n_zones {
+        g.env.zone_regrow[z] = 0.0
+    }
+    for k in 0 to 3000 {
+        sim_step(&g)
+    }
+    let seeking: f64 = agents_total_eaten(&g.agents)
+    printf("        eaten without a foraging drive %.2f, with one %.2f\n",
+           blind, seeking)
+    check(seeking > blind, 169, "seeking food beats wandering into it")
+    sim_destroy(&g)
+
+    # An arena with the food removed: hunger rises and nothing is eaten.
+    let mut e3: Sim = sim_create(4, PRESET_OPEN_FIELD, 3)
+    e3.can_enabled = false
+    let mut z2: i32 = e3.env.n_zones - 1
+    while z2 >= 0 {
+        if e3.env.zone_kind[z2] == ZONE_REWARD {
+            let ok: bool = env_remove_zone(&e3.env, z2)
+        }
+        z2 = z2 - 1
+    }
+    sim_env_changed(&e3)
+    # Sixty seconds rather than twenty. Hunger now takes eighty seconds to
+    # run from fed to starving, because the rate is set against how long it
+    # takes to cross the arena, so twenty seconds of deprivation is a quarter
+    # of the way up and not yet a hungry animal.
+    for k in 0 to 3600 {
+        sim_step(&e3)
+    }
+    printf("        no food for 60 s: hunger %.3f, eaten %.2f\n",
+           e3.agents.hunger[0], e3.agents.eaten[0])
+    check(e3.agents.eaten[0] == 0.0, 170,
+          "an empty arena feeds nobody")
+    check(e3.agents.hunger[0] > 0.5, 171, "and they get hungry")
+    sim_destroy(&e3)
+
+    # Regrowth turns a patch into a renewable one, so a colony can persist.
+    let mut r2: Sim = sim_create(2, PRESET_OPEN_FIELD, 11)
+    r2.can_enabled = false
+    for z3 in 0 to r2.env.n_zones {
+        if r2.env.zone_kind[z3] == ZONE_REWARD {
+            r2.env.zone_regrow[z3] = 0.5
+            r2.env.zone_capacity[z3] = 12.0
+        }
+    }
+    env_refill_food(&r2.env)
+    # Three minutes. Eating past the patch's own capacity takes long enough
+    # that the regrowth outweighs what was there to start with, and at the
+    # rescaled metabolism the colony eats more slowly than it used to.
+    for k in 0 to 10800 {
+        sim_step(&r2)
+    }
+    printf("        with regrowth: %.2f eaten from a %.0f unit patch\n",
+           agents_total_eaten(&r2.agents), env_food_capacity(&r2.env));
+    check(agents_total_eaten(&r2.agents) > env_food_capacity(&r2.env), 172,
+          "a regrowing patch feeds more than it holds")
+    check(env_food_remaining(&r2.env) <= env_food_capacity(&r2.env) + 0.001,
+          173, "and never grows past its capacity")
+    sim_destroy(&r2)
+
+    # Feeding is a serial pass precisely so competition stays reproducible.
+    let mut d3: Sim = sim_create(32, PRESET_OPEN_FIELD, 5150)
+    let mut d4: Sim = sim_create(32, PRESET_OPEN_FIELD, 5150)
+    for k in 0 to 900 {
+        sim_step(&d3)
+        sim_step(&d4)
+    }
+    let mut worst: f64 = 0.0
+    for i in 0 to d3.agents.n {
+        let de: f64 = fabs(d3.agents.eaten[i] - d4.agents.eaten[i])
+        if de > worst { worst = de }
+    }
+    printf("        two runs of one seed, largest difference in eaten: %.3e\n",
+           worst)
+    check(worst == 0.0, 174,
+          "competition for food is reproducible to the bit")
+    sim_destroy(&d3)
+    sim_destroy(&d4)
+}
+
+# --- measuring what the run actually produced -------------------------------
+
+# A long run in an open field with the rats spread out and spiking on, which
+# is what every measurement below needs: coverage. A rate map from a run that
+# saw a third of the room is not a map.
+function measure_sim(seed: u32) -> Sim {
+    let mut s: Sim = sim_create(1, PRESET_OPEN_FIELD, seed)
+    s.can_enabled = false
+    s.spiking = true
+    # No drives, so the animal explores instead of commuting between two
+    # corners. A rat that spends the run walking a line between the food and
+    # the water covers very little of the arena, and every score below would
+    # be a statement about that path rather than about the cell.
+    s.motion.metabolism = 0.0
+    s.motion.thirst_rate = 0.0
+    let mut z: i32 = s.env.n_zones - 1
+    while z >= 0 {
+        if zone_is_consumable(s.env.zone_kind[z]) {
+            let ok: bool = env_remove_zone(&s.env, z)
+        }
+        z = z - 1
+    }
+    sim_env_changed(&s)
+    sim_reset(&s, 1)
+    return s
+}
+
+function test_analysis() -> void {
+    section("measuring the run rather than the model")
+
+    # Thirty-two bins across two metres is 6 cm a bin. Fine enough to resolve
+    # a 35 cm grid lattice, which is what the gridness score needs, at the
+    # price of coverage: the finer the bins the fewer of them a run of any
+    # length manages to visit.
+    let mut sess: Session = session_create(32, 32)
+    check(session_ready(&sess), 270, "a recording session allocates")
+
+    # --- place cells ---
+    let mut s: Sim = measure_sim(2468)
+    # The cell whose field the rat is most likely to cross: the one centred
+    # nearest the middle of the arena.
+    let mut best: i32 = 0
+    let mut bestd: f64 = 1000.0
+    for c in 0 to s.place.n {
+        let d: f64 = dist(s.place.p0[c], s.place.p1[c], 1.0, 1.0)
+        if d < bestd {
+            bestd = d
+            best = c
+        }
+    }
+    session_run(&sess, &s, POP_PLACE, best, 0, 60000, 0.25)
+    let cov: f64 = session_coverage(&sess)
+    let place_info: f64 = session_information(&sess)
+    let place_sparse: f64 = session_sparsity(&sess)
+    let place_grid: f64 = session_gridness(&sess)
+    let pf: FieldStats = session_fields(&sess, 0.4, 3)
+    printf("        1000 s in an open field, %.0f%% of the arena visited\n",
+           cov * 100.0)
+    check(cov > 0.5, 271,
+          "a long run covers enough of the arena to measure anything")
+    printf("        place cell %d: %.2f bits/spike, sparsity %.2f, %d field(s)\n",
+           best, place_info, place_sparse, pf.count)
+    check(place_info > 1.0, 272,
+          "a place cell carries real spatial information")
+    check(place_sparse < 0.4, 273, "and fires in a small part of the arena")
+
+    # The measurement has to recover the model. The field's centre of mass
+    # should land on the place field's configured centre, and its area should
+    # be about what a Gaussian of the configured sigma covers above 40 per
+    # cent of its peak: pi * r^2 with r = sigma * sqrt(2 ln(1/0.4)).
+    let cx: f64 = s.place.p0[best]
+    let cy: f64 = s.place.p1[best]
+    let off: f64 = dist(pf.peak_x, pf.peak_y, cx, cy)
+    let sigma: f64 = s.place.p2[best]
+    let r_expect: f64 = sigma * sqrt(2.0 * log(1.0 / 0.4))
+    let a_expect: f64 = 3.141592653589793 * r_expect * r_expect
+    printf("        field centre is %.3f m from the configured centre\n", off)
+    printf("        field area %.4f m2, a sigma of %.3f predicts %.4f\n",
+           pf.largest_area, sigma, a_expect)
+    check(pf.count >= 1, 274, "the field is found at all")
+    check(off < 0.12, 275,
+          "and sits where the population was configured to put it")
+    check(pf.largest_area > a_expect * 0.5
+          and pf.largest_area < a_expect * 2.0, 276,
+          "and is the size the configured sigma predicts")
+
+    # --- velocity cells, the negative control ---
+    session_run(&sess, &s, POP_VELOCITY, 0, 0, 60000, 0.25)
+    let vel_info: f64 = session_information(&sess)
+    printf("        velocity cell: %.2f bits/spike\n", vel_info)
+    check(vel_info < place_info * 0.5, 277,
+          "a cell that codes speed carries far less spatial information")
+
+    # --- grid cells ---
+    #
+    # Wound up so the cell actually fires. A lattice is spread over the whole
+    # arena rather than concentrated in one spot, so at the default rate a
+    # thousand seconds put about eight spikes in each bin and the map was
+    # noise: 2424 spikes over three hundred bins, no visible structure and a
+    # gridness of 0.06. Recording a cell that fires is not cheating, it is
+    # what an experimenter does when picking which cell to record.
+    s.grid_p.peak_rate = 120.0
+    sim_configure_populations(&s)
+    session_run(&sess, &s, POP_GRID, 0, 0, 60000, 0.25)
+    let grid_grid: f64 = session_gridness(&sess)
+    let grid_info: f64 = session_information(&sess)
+    let grid_space: f64 = session_grid_spacing(&sess)
+    let gf: FieldStats = session_fields(&sess, 0.4, 3)
+    printf("        grid cell: gridness %.3f, %d fields, %.2f bits/spike\n",
+           grid_grid, gf.count, grid_info)
+    printf("        place cell for comparison: gridness %.3f, %d field(s)\n",
+           place_grid, pf.count)
+    check(grid_grid > place_grid, 278,
+          "a grid cell's autocorrelogram is more hexagonal than a place cell's")
+    check(gf.count > pf.count + 3, 279,
+          "and it has many more fields, which is what makes it a lattice")
+
+    # The spacing measured off the correlogram against the spacing the module
+    # was built with. This is the same kind of agreement as the place field's
+    # centre and size: two independent code paths arriving at one number.
+    printf("        lattice spacing measured %.3f m, configured %.3f m\n",
+           grid_space, s.grid.p0[0])
+    check(fabs(grid_space - s.grid.p0[0]) < s.grid.p0[0] * 0.25, 284,
+          "and its measured spacing recovers the configured one")
+
+    # --- head direction ---
+    session_run(&sess, &s, POP_HEAD_DIR, 0, 0, 60000, 0.25)
+    let hd: TuningStats = session_tuning(&sess)
+    let want: f64 = s.hd.p0[0]
+    let err: f64 = fabs(angle_delta(hd.preferred, want))
+    printf("        head cell 0 prefers %.3f rad, configured %.3f, out by %.3f\n",
+           hd.preferred, want, err)
+    printf("        vector length %.3f, Rayleigh z %.1f, p %.2e\n",
+           hd.vector_length, hd.rayleigh_z, hd.rayleigh_p)
+    check(err < 0.25, 280,
+          "the measured preferred direction recovers the configured one")
+    check(hd.vector_length > 0.3, 281, "the tuning is concentrated")
+    check(hd.rayleigh_p < 0.01, 282,
+          "and Rayleigh calls it directional rather than a fluke")
+
+    # A place cell has no preferred head direction, so the same test on one
+    # has to come out weak. Without this the Rayleigh number above would only
+    # show that the arithmetic runs.
+    session_run(&sess, &s, POP_PLACE, best, 0, 60000, 0.25)
+    let flat: TuningStats = session_tuning(&sess)
+    printf("        a place cell scores vector length %.3f on the same test\n",
+           flat.vector_length)
+    check(flat.vector_length < hd.vector_length, 283,
+          "and a place cell is not directional on the same measurement")
+
+    # The export has to actually write, and to write all four kinds of row.
+    # A claim in a README that a panel writes a CSV is worth exactly as much
+    # as a check that opens the file afterwards.
+    let wrote: bool = analysis_export(&sess, &s, "data/out/analysis.csv")
+    check(wrote, 285, "the scores export writes a file")
+    let mut scores: i32 = 0
+    let mut bins: i32 = 0
+    let mut hdrows: i32 = 0
+    let mut trans: i32 = 0
+    count_csv_kinds("data/out/analysis.csv", &scores, &bins, &hdrows, &trans)
+    printf("        exported %d scores, %d bins, %d heading rows, %d transitions\n",
+           scores, bins, hdrows, trans)
+    check(scores >= 18, 286, "and every score is in it")
+    check(bins == 32 * 32, 287, "and every bin of the map, visited or not")
+    check(hdrows == HD_BINS, 288, "and every heading bin")
+    check(trans > 0, 289, "and the transitions between behaviours")
+
+    sim_destroy(&s)
+    session_destroy(&sess)
+}
+
+# Count the rows of each kind in an exported analysis CSV.
+function count_csv_kinds(path: string, sc: ptr<i32>, bn: ptr<i32>,
+                         hd: ptr<i32>, tr: ptr<i32>) -> void {
+    sc[0] = 0
+    bn[0] = 0
+    hd[0] = 0
+    tr[0] = 0
+    let f: ptr<void> = fopen(path, "r")
+    if f == null { return }
+    let buf: ptr<u8> = mem_alloc(512, "csv line") as ptr<u8>
+    if buf == null {
+        let c0: i32 = fclose(f)
+        return
+    }
+    while fgets(buf as ptr<void>, 500, f) != null {
+        # The kind is the first field, so one character is enough to tell
+        # them apart: s, b, h and t are all distinct, and a section header
+        # starts with a hash and matches none of them.
+        let c: i32 = buf[0] as i32
+        if c == 115 { sc[0] = sc[0] + 1 }
+        if c == 98 { bn[0] = bn[0] + 1 }
+        if c == 104 { hd[0] = hd[0] + 1 }
+        if c == 116 { tr[0] = tr[0] + 1 }
+    }
+    mem_release(buf as ptr<void>)
+    let c1: i32 = fclose(f)
+}
+
+# --- novelty, and a room that becomes familiar ------------------------------
+
+function test_novelty() -> void {
+    section("novelty, and thigmotaxis that fades")
+
+    # The classic open-field measurement, made the way it is made: an empty
+    # arena, an animal that has never seen it, and how much of its time it
+    # spends within a body length or two of a wall. No food, no water, so
+    # nothing competes with exploring and the number means what it says.
+    let mut early: f64 = 0.0
+    let mut late: f64 = 0.0
+    wall_time(true, &early, &late)
+    printf("        near the wall: %.1f%% of the first minute, %.1f%% of the sixth\n",
+           early * 100.0, late * 100.0)
+    check(late < early, 260,
+          "a rat works along the wall less once the room is familiar")
+
+    # With the map switched off there is nothing to learn, so the same
+    # measurement must not fall. This is the control: without it, a drop
+    # could be any drift in the motion model rather than habituation.
+    let mut flat_early: f64 = 0.0
+    let mut flat_late: f64 = 0.0
+    wall_time(false, &flat_early, &flat_late)
+    printf("        with no map:   %.1f%% then %.1f%%\n",
+           flat_early * 100.0, flat_late * 100.0)
+    let drop_on: f64 = early - late
+    let drop_off: f64 = flat_early - flat_late
+    printf("        the fall is %.1f points with a map and %.1f without\n",
+           drop_on * 100.0, drop_off * 100.0)
+    # Both fall, which is worth saying plainly: some of the drop is the
+    # motion model settling rather than the animal learning. The map's
+    # contribution is that a naive rat starts far more wall-bound and comes
+    # down further, and the two checks below are the two halves of that.
+    check(early > flat_early, 261,
+          "a naive rat hugs the wall harder than one with nothing to learn")
+    check(drop_on > drop_off, 262,
+          "and comes down further, which is the habituation")
+
+    # Steering toward what it knows least has to cover the room faster than
+    # not doing so.
+    let cover_seek: f64 = coverage_after(1.1)
+    let cover_blind: f64 = coverage_after(0.0)
+    printf("        arena known after 300 s: %.2f seeking the new, %.2f not\n",
+           cover_seek, cover_blind)
+    check(cover_seek > cover_blind, 263,
+          "a rat that heads for what it knows least covers more of the room")
+
+    # Naivety has to come back, or the same animal cannot be run on a fresh
+    # room twice and every measurement after the first is contaminated.
+    let mut r: Sim = sim_create(4, PRESET_OPEN_FIELD, 77)
+    r.can_enabled = false
+    for k in 0 to 6000 {
+        sim_step(&r)
+    }
+    let learned: f64 = novelty_mean(&r.agents, &r.env, 0)
+    sim_reset(&r, 4)
+    let after: f64 = novelty_mean(&r.agents, &r.env, 0)
+    printf("        familiarity %.3f after 100 s, %.3f after a reset\n",
+           learned, after)
+    check(learned > 0.0, 264, "a rat learns something about the room")
+    check(after == 0.0, 265, "and a reset gives it back its naivety")
+    sim_destroy(&r)
+
+    # A landmark in a well known part of the room stops pulling.
+    let mut c: Sim = sim_create(1, PRESET_OPEN_FIELD, 5)
+    c.can_enabled = false
+    let cx: f64 = c.env.cue_x[0]
+    let cy: f64 = c.env.cue_y[0]
+    let fresh: f64 = novelty_cue_scale(&c.agents, &c.novelty, &c.env, 0,
+                                       cx, cy)
+    # Park the rat on the landmark long enough to know the place.
+    for k in 0 to 3000 {
+        c.agents.x[0] = cx
+        c.agents.y[0] = cy
+        novelty_visit(&c.agents, &c.novelty, &c.env, 0, c.dt)
+    }
+    let stale: f64 = novelty_cue_scale(&c.agents, &c.novelty, &c.env, 0,
+                                       cx, cy)
+    printf("        a landmark is worth %.2f when new and %.2f once known\n",
+           fresh, stale)
+    check(stale < fresh, 266,
+          "a landmark loses its pull as its corner becomes ordinary")
+    sim_destroy(&c)
+}
+
+# Fraction of samples spent within `near` of a wall, over the first and the
+# last minute of a six-minute run in an empty arena.
+function wall_time(mapped: bool, early_out: ptr<f64>,
+                   late_out: ptr<f64>) -> void {
+    let mut s: Sim = sim_create(16, PRESET_OPEN_FIELD, 4004)
+    s.can_enabled = false
+    s.novelty.enabled = mapped
+    # Nothing to eat or drink, so exploring is all there is to do and the
+    # measurement is not competing with a walk to the food.
+    s.motion.metabolism = 0.0
+    s.motion.thirst_rate = 0.0
+    let mut z: i32 = s.env.n_zones - 1
+    while z >= 0 {
+        if zone_is_consumable(s.env.zone_kind[z]) {
+            let ok: bool = env_remove_zone(&s.env, z)
+        }
+        z = z - 1
+    }
+    sim_env_changed(&s)
+    sim_reset(&s, 16)
+
+    let near: f64 = 0.22
+    let mut e_hits: i32 = 0
+    let mut e_n: i32 = 0
+    let mut l_hits: i32 = 0
+    let mut l_n: i32 = 0
+    for k in 0 to 21600 {
+        sim_step(&s)
+        if k % 10 == 0 {
+            for i in 0 to s.agents.n {
+                let at_wall: bool = s.agents.wall_dist[i] < near
+                if k < 3600 {
+                    e_n = e_n + 1
+                    if at_wall { e_hits = e_hits + 1 }
+                }
+                if k >= 18000 {
+                    l_n = l_n + 1
+                    if at_wall { l_hits = l_hits + 1 }
+                }
+            }
+        }
+    }
+    early_out[0] = (e_hits as f64) / ((e_n + 1) as f64)
+    late_out[0] = (l_hits as f64) / ((l_n + 1) as f64)
+    sim_destroy(&s)
+}
+
+# How much of an empty arena one rat knows after five minutes, with the
+# seek-the-new term at the given strength.
+function coverage_after(seek: f64) -> f64 {
+    let mut s: Sim = sim_create(1, PRESET_OPEN_FIELD, 616)
+    s.can_enabled = false
+    s.novelty.seek_new = seek
+    s.motion.metabolism = 0.0
+    s.motion.thirst_rate = 0.0
+    let mut z: i32 = s.env.n_zones - 1
+    while z >= 0 {
+        if zone_is_consumable(s.env.zone_kind[z]) {
+            let ok: bool = env_remove_zone(&s.env, z)
+        }
+        z = z - 1
+    }
+    sim_env_changed(&s)
+    sim_reset(&s, 1)
+    for k in 0 to 18000 {
+        sim_step(&s)
+    }
+    let c: f64 = novelty_coverage(&s.agents, &s.env, 0, 0.3)
+    sim_destroy(&s)
+    return c
+}
+
+# --- rats noticing each other -----------------------------------------------
+
+function test_social() -> void {
+    section("the spatial grid, and rats noticing each other")
+
+    # The grid has to agree with the obvious quadratic answer exactly, in
+    # every arena, at a batch big enough that cells actually hold more than
+    # one rat. Exactly, not approximately: an off-by-one on a cell boundary
+    # would show up as a handful of disagreements out of thousands, which is
+    # precisely the kind of thing that survives a tolerance.
+    let mut mismatch_near: i32 = 0
+    let mut mismatch_count: i32 = 0
+    let mut asked: i32 = 0
+    let radius: f64 = 0.12
+    for pr in 0 to PRESET_COUNT {
+        let mut s: Sim = sim_create(256, pr, 5150 + pr)
+        s.can_enabled = false
+        for k in 0 to 300 {
+            sim_step(&s)
+        }
+        # Rebuilt here so the snapshot matches the live positions the
+        # brute-force reference reads.
+        grid_build(&s.near, &s.agents, &s.env, radius)
+        for i in 0 to s.agents.n {
+            asked = asked + 1
+            let mut gd: f64 = 0.0
+            let mut gx: f64 = 0.0
+            let mut gy: f64 = 0.0
+            let gi: i32 = grid_nearest(&s.near, i, radius, &gd, &gx, &gy)
+            let mut bd: f64 = 0.0
+            let bi: i32 = grid_nearest_brute(&s.agents, i, radius, &bd)
+            # The index can differ when two neighbours are exactly the same
+            # distance away, which the arenas do produce. The distance is
+            # the thing that has to match.
+            if gi < 0 or bi < 0 {
+                if gi != bi { mismatch_near = mismatch_near + 1 }
+            } else {
+                if gd != bd { mismatch_near = mismatch_near + 1 }
+            }
+            let mut hx: f64 = 0.0
+            let mut hy: f64 = 0.0
+            let gn: i32 = grid_neighbours(&s.near, i, radius, &hx, &hy)
+            if gn != grid_count_brute(&s.agents, i, radius) {
+                mismatch_count = mismatch_count + 1
+            }
+        }
+        sim_destroy(&s)
+    }
+    printf("        %d queries over %d arenas: %d nearest and %d count disagree\n",
+           asked, PRESET_COUNT, mismatch_near, mismatch_count)
+    check(mismatch_near == 0, 250,
+          "the grid finds the same nearest neighbour as a brute-force sweep")
+    check(mismatch_count == 0, 251,
+          "and counts the same neighbours within a radius")
+
+    # Personal space has to actually separate them. Measured as how often two
+    # rats are inside one body length of each other, which is the thing the
+    # repulsion is for.
+    let crowded_off: f64 = overlap_rate(0.0)
+    let crowded_on: f64 = overlap_rate(1.2)
+    printf("        pairs within a body length: %.4f ignoring, %.4f pushing\n",
+           crowded_off, crowded_on)
+    check(crowded_on < crowded_off, 252,
+          "personal space reduces how often two rats occupy one spot")
+
+    # Crowding at a patch has to slow the individual down without stopping
+    # the colony: more mouths at one pile means each gets less per second.
+    let mut s2: Sim = sim_create(24, PRESET_OPEN_FIELD, 606)
+    s2.can_enabled = false
+    for k in 0 to 6000 {
+        sim_step(&s2)
+    }
+    let mut most: i32 = 0
+    for i in 0 to s2.agents.n {
+        if s2.agents.crowd[i] > most { most = s2.agents.crowd[i] }
+    }
+    printf("        the busiest mouthful had %d other rats in reach\n", most)
+    check(most > 0, 253,
+          "rats do end up eating shoulder to shoulder")
+    sim_destroy(&s2)
+
+    # The build has to be linear in the batch. Quadratic is what the grid
+    # exists to avoid, so this is the check that says it did.
+    let t_small: f64 = grid_build_ms(256)
+    let t_big: f64 = grid_build_ms(4096)
+    let ratio: f64 = t_big / (t_small + 0.000001)
+    printf("        building for 256 rats %.4f ms, for 4096 %.4f ms, ratio %.1f\n",
+           t_small, t_big, ratio)
+    # Sixteen times the rats. Linear would be about sixteen; quadratic would
+    # be about two hundred and fifty. The bound is loose because the constant
+    # cost of clearing the cells does not scale with the batch at all, which
+    # makes the small case look slower than its rat count suggests.
+    check(ratio < 60.0, 254,
+          "the grid build is linear in the batch rather than quadratic")
+}
+
+# How often a pair of rats is inside one body length, averaged over a run.
+function overlap_rate(push: f64) -> f64 {
+    let mut s: Sim = sim_create(64, PRESET_OPEN_FIELD, 313)
+    s.can_enabled = false
+    s.motion.social_push = push
+    let close: f64 = 0.05
+    let mut hits: i32 = 0
+    let mut samples: i32 = 0
+    for k in 0 to 6000 {
+        sim_step(&s)
+        if k % 20 == 0 {
+            grid_build(&s.near, &s.agents, &s.env, 0.12)
+            for i in 0 to s.agents.n {
+                samples = samples + 1
+                let mut d: f64 = 0.0
+                let mut dx: f64 = 0.0
+                let mut dy: f64 = 0.0
+                let j: i32 = grid_nearest(&s.near, i, close, &d, &dx, &dy)
+                if j >= 0 { hits = hits + 1 }
+            }
+        }
+    }
+    sim_destroy(&s)
+    if samples == 0 { return 0.0 }
+    return (hits as f64) / (samples as f64)
+}
+
+# Milliseconds to build the grid once, averaged over enough repeats to be
+# readable.
+function grid_build_ms(n: i32) -> f64 {
+    let mut s: Sim = sim_create(n, PRESET_OPEN_FIELD, 8)
+    s.can_enabled = false
+    for k in 0 to 60 {
+        sim_step(&s)
+    }
+    let reps: i32 = 200
+    let t0: f64 = clock_ms()
+    for k in 0 to reps {
+        grid_build(&s.near, &s.agents, &s.env, 0.055)
+    }
+    let el: f64 = clock_ms() - t0
+    sim_destroy(&s)
+    return el / (reps as f64)
+}
+
+# --- the profiler's own bookkeeping -----------------------------------------
+
+function test_profile() -> void {
+    section("profiling slots")
+
+    # Every slot has to be nameable and has to hold what is written to it.
+    # The four arrays behind these are sized with a literal, because Flow
+    # will not take a constant as an array size, so adding a slot without
+    # widening them writes past the end of four statics. The corruption is
+    # silent at the point of the mistake and aborts inside malloc somewhere
+    # else entirely, which is how it presented: an abort in the interface
+    # section, three sections after the actual fault.
+    prof_set_enabled(true)
+    let mut named: i32 = 0
+    for k in 0 to PROF_SLOTS {
+        if prof_slot_name(k) != "?" { named = named + 1 }
+    }
+    printf("        %d of %d slots are named\n", named, PROF_SLOTS)
+    check(named == PROF_SLOTS, 240, "every profiling slot has a name")
+
+    prof_reset()
+    for k in 0 to PROF_SLOTS {
+        let t: i64 = prof_begin()
+        prof_end(k, t)
+    }
+    let mut counted: i32 = 0
+    for k in 0 to PROF_SLOTS {
+        if prof_calls_of(k) == 1 { counted = counted + 1 }
+    }
+    printf("        %d of %d slots recorded exactly one call\n",
+           counted, PROF_SLOTS)
+    check(counted == PROF_SLOTS, 241,
+          "and holds what is written to it, so the arrays are long enough")
+    prof_reset()
+    prof_set_enabled(false)
+}
+
+# --- two drives that compete ------------------------------------------------
+
+# How often the colony changes its mind about which drive it is serving,
+# over a fixed run. This is the number the hysteresis exists to hold down.
+function drive_switches(hysteresis: f64, alternated: ptr<bool>) -> i32 {
+    let mut s: Sim = sim_create(6, PRESET_OPEN_FIELD, 4242)
+    s.can_enabled = false
+    s.behaviour.drive_hysteresis = hysteresis
+    let last: ptr<i32> = mem_alloc(6 * 4, "drive trace") as ptr<i32>
+    for i in 0 to 6 {
+        last[i] = -1
+    }
+    let mut switches: i32 = 0
+    let mut ate: i32 = 0
+    let mut drank: i32 = 0
+    for k in 0 to 24000 {
+        sim_step(&s)
+        for i in 0 to s.agents.n {
+            let k2: i32 = s.agents.supply_kind[i]
+            if k2 >= 0 {
+                if last[i] >= 0 and k2 != last[i] { switches = switches + 1 }
+                last[i] = k2
+            }
+            if s.agents.state[i] == ST_EAT { ate = ate + 1 }
+            if s.agents.state[i] == ST_DRINK { drank = drank + 1 }
+        }
+    }
+    alternated[0] = ate > 0 and drank > 0
+    mem_release(last as ptr<void>)
+    sim_destroy(&s)
+    return switches
+}
+
+function test_thirst() -> void {
+    section("thirst, and two drives that compete")
+
+    let mut s: Sim = sim_create(8, PRESET_OPEN_FIELD, 909)
+    s.can_enabled = false
+    for k in 0 to 24000 {
+        sim_step(&s)
+    }
+    printf("        400 s: %.2f eaten, %.2f drunk\n",
+           agents_total_eaten(&s.agents), agents_total_drunk(&s.agents))
+    check(agents_total_eaten(&s.agents) > 0.0, 220,
+          "a colony with food and water eats")
+    check(agents_total_drunk(&s.agents) > 0.0, 221, "and drinks")
+    printf("        water taken %.4f, held by rats %.4f, unaccounted %.6f\n",
+           s.water_taken, agents_total_drunk(&s.agents),
+           sim_water_unaccounted(&s))
+    check(fabs(sim_water_unaccounted(&s)) < 0.000001, 222,
+          "every unit drawn from a puddle ends up in a rat")
+    let mut neg: i32 = 0
+    for z in 0 to s.env.n_zones {
+        if s.env.zone_amount[z] < 0.0 { neg = neg + 1 }
+    }
+    check(neg == 0, 223, "no puddle is drunk past empty")
+    printf("        mean hunger %.3f, mean thirst %.3f\n",
+           agents_mean_hunger(&s.agents), agents_mean_thirst(&s.agents))
+    check(agents_mean_hunger(&s.agents) < 0.8
+          and agents_mean_thirst(&s.agents) < 0.8, 224,
+          "and neither need is left permanently unmet")
+    sim_destroy(&s)
+
+    # Deprivation, one drive at a time. Take the water away and the thirst
+    # should pin while hunger stays served, and the other way round.
+    let dry_thirst: f64 = deprive(ZONE_WATER)
+    let dry_hunger: f64 = deprive(ZONE_REWARD)
+    printf("        no water: thirst reaches %.3f\n", dry_thirst)
+    printf("        no food:  hunger reaches %.3f\n", dry_hunger)
+    check(dry_thirst > 0.9, 225,
+          "a rat with food and no water goes thirsty")
+    check(dry_hunger > 0.9, 226,
+          "and a rat with water and no food starves")
+
+    # What the hysteresis is for. With no margin a rat takes whichever drive
+    # is larger, and at the crossover the two sit within a hair of each
+    # other, so it changes its mind constantly and arrives nowhere.
+    let mut alt_off: bool = false
+    let mut alt_on: bool = false
+    let loose: i32 = drive_switches(0.0, &alt_off)
+    let firm: i32 = drive_switches(0.12, &alt_on)
+    printf("        drive changes over 400 s: %d with no margin, %d with one\n",
+           loose, firm)
+    check(firm < loose, 227,
+          "the margin stops a rat swapping drives at the crossover")
+    check(alt_on, 228,
+          "and it still alternates: it both eats and drinks over a run")
+}
+
+# Run a colony with one of the two consumables removed and report how high
+# the matching drive climbs.
+function deprive(remove_kind: i32) -> f64 {
+    let mut s: Sim = sim_create(4, PRESET_OPEN_FIELD, 31)
+    s.can_enabled = false
+    let mut z: i32 = s.env.n_zones - 1
+    while z >= 0 {
+        if s.env.zone_kind[z] == remove_kind {
+            let ok: bool = env_remove_zone(&s.env, z)
+        }
+        z = z - 1
+    }
+    sim_env_changed(&s)
+    sim_reset(&s, 4)
+    for k in 0 to 12000 {
+        sim_step(&s)
+    }
+    let mut worst: f64 = 0.0
+    for i in 0 to s.agents.n {
+        let mut v: f64 = s.agents.hunger[i]
+        if remove_kind == ZONE_WATER { v = s.agents.thirst[i] }
+        if v > worst { worst = v }
+    }
+    sim_destroy(&s)
+    return worst
+}
+
+# --- memory and homing ------------------------------------------------------
+
+# A larder the rat cannot see from bed.
+#
+# The presets are no use for this. The two-room arena puts its doorway on the
+# line between the nest and the food, so a rat standing at the nest can see
+# straight through to the patch and never needs to remember anything. So the
+# arena is built here, and the test checks the occlusion before it draws any
+# conclusion from the run.
+#
+#   +---------------------+---------------------+
+#   |                     |                     |
+#   |                   doorway                 |
+#   |                     |                     |
+#   |  nest               |               food  |
+#   +---------------------+---------------------+
+#
+# The doorway is high and the food is low, so the line from the nest to the
+# patch meets wall. A rat crossing the doorway sees the food; a rat at the
+# nest does not.
+function build_larder(s: ptr<Sim>) -> void {
+    env_set_rect(&s.env, 0.0, 0.0, 2.0, 1.2)
+    let w1: i32 = env_add_wall(&s.env, 1.0, 0.0, 1.0, 0.50)
+    let w2: i32 = env_add_wall(&s.env, 1.0, 0.70, 1.0, 1.2)
+    let nest: i32 = env_add_zone(&s.env, ZONE_START, SHAPE_CIRCLE,
+                                 0.25, 0.25, 0.16, 0.16)
+    let larder: i32 = env_add_zone_food(&s.env, ZONE_REWARD, SHAPE_CIRCLE,
+                                        1.75, 0.15, 0.12, 0.12,
+                                        500.0, 100.0)
+    # A puddle by the nest. Without one the rats go permanently thirsty,
+    # thirst wins every drive contest, and neither arm of the comparison ever
+    # goes for food at all: the first run of this after water landed carried
+    # off nothing in either condition. Putting it at the nest keeps it out of
+    # the comparison, which is about the trip to the larder.
+    let puddle: i32 = env_add_zone_food(&s.env, ZONE_WATER, SHAPE_CIRCLE,
+                                        0.25, 0.55, 0.10, 0.10,
+                                        200.0, 40.0)
+    env_refill_food(&s.env)
+    sim_env_changed(s)
+}
+
+# One run of the larder task, with memory on or off. Returns what the colony
+# managed to eat, which with a bottomless patch measures how much of the run
+# the rats spent at the food rather than how much food there was.
+function larder_trial(remember: bool) -> f64 {
+    let mut s: Sim = sim_create(6, PRESET_OPEN_FIELD, 8642)
+    s.can_enabled = false
+    build_larder(&s)
+    s.memory.enabled = remember
+    # Hoarding is what makes this a memory task rather than a find-it-once
+    # task. A rat that simply eats where it stands walks to the patch and
+    # camps there, so it only has to find the place once and remembering it
+    # buys almost nothing. A hoarder fills up, carries the load back to the
+    # nest, eats it there, and then has to get to the larder again, from a
+    # spot where the larder is not visible. That is the trip memory pays for,
+    # and the run contains many of them.
+    s.motion.hoard = true
+    sim_reset(&s, 6)
+    for k in 0 to 12000 {
+        sim_step(&s)
+    }
+    # What came out of the larder, which counts the trips regardless of what
+    # happened to the food afterwards.
+    let taken: f64 = s.food_taken
+    sim_destroy(&s)
+    return taken
+}
+
+function test_memory() -> void {
+    section("memory and dead reckoning")
+
+    # Two rooms with a wall between them. A rat that can only walk toward
+    # food it can see cannot solve this: the patches are out of sight from
+    # most of the arena.
+    # First establish that the task is actually a memory task, because an
+    # arena where the food is visible from the nest would make the comparison
+    # below meaningless whatever it returned.
+    let mut probe: Sim = sim_create(1, PRESET_OPEN_FIELD, 1)
+    probe.can_enabled = false
+    build_larder(&probe)
+    let mut pd: f64 = 0.0
+    let from_nest: i32 = env_nearest_food(&probe.env, 0.25, 0.25, true, &pd)
+    let from_door: i32 = env_nearest_food(&probe.env, 1.05, 0.60, true, &pd)
+    check(from_nest < 0, 210,
+          "the larder is out of sight from the nest, so this is a memory task")
+    check(from_door >= 0, 211,
+          "and in sight from the doorway, so the rat can learn it is there")
+    sim_destroy(&probe)
+
+    # A rat that can only walk toward food it can see has to blunder back
+    # through the gap every time it gets hungry. One that remembers where the
+    # patch was can go straight there. Both runs share a seed, so what differs
+    # is the memory rather than the luck.
+    let blind_eaten: f64 = larder_trial(false)
+    let remem_eaten: f64 = larder_trial(true)
+    printf("        larder, 200 s: carried off blind %.2f, remembering %.2f\n",
+           blind_eaten, remem_eaten)
+    check(remem_eaten > blind_eaten * 1.1, 212,
+          "remembering where food was beats only chasing what is in sight")
+
+    # A note fades. Take the food away and the rat should stop going back.
+    let mut fade: Sim = sim_create(1, PRESET_OPEN_FIELD, 99)
+    fade.can_enabled = false
+    for k in 0 to 1800 {
+        sim_step(&fade)
+    }
+    let held: i32 = memory_count(&fade.agents, 0)
+    for z in 0 to fade.env.n_zones {
+        fade.env.zone_amount[z] = 0.0
+        fade.env.zone_capacity[z] = 0.0
+        fade.env.zone_regrow[z] = 0.0
+    }
+    for k in 0 to 9000 {
+        sim_step(&fade)
+    }
+    let after: i32 = memory_count(&fade.agents, 0)
+    printf("        notes held: %d while food was there, %d after it went\n",
+           held, after)
+    check(held > 0, 213, "a rat notes a patch it has seen")
+    check(after < held, 214, "and forgets it once the patch is gone")
+    sim_destroy(&fade)
+
+    # Dead reckoning. The rat keeps a vector to the nest by subtracting its
+    # own movement, so the error should grow with the path travelled and
+    # collapse when it actually gets home.
+    let mut h: Sim = sim_create(4, PRESET_FOUR_ROOMS, 1212)
+    h.can_enabled = false
+    h.motion.hoard = true
+    let mut nx: f64 = 0.0
+    let mut ny: f64 = 0.0
+    let has_nest: bool = sim_nest(&h, &nx, &ny)
+    check(has_nest, 215, "the arena has a nest to reckon toward")
+
+    # Averaged over every rat and every sample in each band, rather than read
+    # off at the single instant the path length happened to cross a mark.
+    # The reckoning is re-zeroed whenever a rat reaches the nest, so a single
+    # sample lands wherever it lands relative to the last homecoming, and
+    # this check failed and passed at random across three phases before it
+    # was measuring anything.
+    let mut near_sum: f64 = 0.0
+    let mut near_n: i32 = 0
+    let mut far_sum: f64 = 0.0
+    let mut far_n: i32 = 0
+    let mut worst: f64 = 0.0
+    for k in 0 to 12000 {
+        sim_step(&h)
+        for i in 0 to h.agents.n {
+            let d: f64 = h.agents.distance[i]
+            let e: f64 = homing_error(&h.agents, i, nx, ny)
+            if e > worst { worst = e }
+            if d < 2.0 {
+                near_sum = near_sum + e
+                near_n = near_n + 1
+            }
+            if d >= 8.0 and d < 16.0 {
+                far_sum = far_sum + e
+                far_n = far_n + 1
+            }
+        }
+    }
+    let err_at_2m: f64 = near_sum / ((near_n + 1) as f64)
+    let err_at_10m: f64 = far_sum / ((far_n + 1) as f64)
+    printf("        mean homing error over the first 2 m walked: %.4f m (%d samples)\n",
+           err_at_2m, near_n)
+    printf("        between 8 and 16 m walked: %.4f m (%d samples)\n",
+           err_at_10m, far_n)
+    printf("        worst homing error over the run %.4f m\n", worst)
+    check(err_at_10m > err_at_2m, 216,
+          "dead reckoning drifts further the further it goes")
+    check(worst < 2.0, 217,
+          "and getting home occasionally keeps the drift bounded")
+
+    # With drift switched off the estimate should be exact.
+    let mut exact: Sim = sim_create(2, PRESET_OPEN_FIELD, 7)
+    exact.can_enabled = false
+    exact.memory.home_drift = 0.0
+    let mut ex: f64 = 0.0
+    let mut ey: f64 = 0.0
+    let ok2: bool = sim_nest(&exact, &ex, &ey)
+    for k in 0 to 3000 {
+        sim_step(&exact)
+    }
+    let perfect: f64 = homing_error(&exact.agents, 0, ex, ey)
+    let reach: f64 = nest_reach(&exact.env, &exact.memory)
+    printf("        with no drift, homing error %.4f m, nest reach %.2f m\n",
+           perfect, reach)
+    # With no drift the only error left is the distance within which the rat
+    # accepts that it is home, so that is what it is checked against.
+    check(perfect <= reach, 218,
+          "with no drift the error is bounded by the distance it re-zeroes at")
+    sim_destroy(&exact)
+    sim_destroy(&h)
+}
+
+# --- adversarial ------------------------------------------------------------
+
+# Values that are not finite, or a rat outside the arena. Either means the
+# run has stopped meaning anything, and the point of this section is that no
+# reachable parameter combination gets there.
+function nonfinite(v: f64) -> bool {
+    if v != v { return true }
+    if v > 1.0e300 or v < -1.0e300 { return true }
+    return false
+}
+
+function broken_rats(s: ptr<Sim>) -> i32 {
+    let mut n: i32 = 0
+    for i in 0 to s.agents.n {
+        if nonfinite(s.agents.x[i]) or nonfinite(s.agents.y[i])
+           or nonfinite(s.agents.heading[i]) or nonfinite(s.agents.speed[i]) {
+            n = n + 1
+        } else {
+            if !env_is_free(&s.env, s.agents.x[i], s.agents.y[i]) {
+                n = n + 1
+            }
+        }
+    }
+    return n
+}
+
+function bad_rates(s: ptr<Sim>) -> i32 {
+    let mut n: i32 = 0
+    for k in 0 to SIM_POP_COUNT {
+        let p: ptr<Pop> = sim_pop(s, k)
+        let total: i32 = p.n * s.agents.n
+        for i in 0 to total {
+            if nonfinite(p.rates[i]) { n = n + 1 }
+        }
+    }
+    for i in 0 to s.sheet.n {
+        if nonfinite(s.sheet.r[i]) { n = n + 1 }
+    }
+    for i in 0 to s.ring.n {
+        if nonfinite(s.ring.r[i]) { n = n + 1 }
+    }
+    return n
+}
+
+function survives(s: ptr<Sim>, steps: i32, code: i32,
+                  label: string) -> void {
+    for k in 0 to steps {
+        sim_step(s)
+    }
+    let br: i32 = broken_rats(s)
+    let bv: i32 = bad_rates(s)
+    printf("        %-36s broken %3d, non-finite %5d\n", label, br, bv)
+    check(br == 0 and bv == 0, code, label)
+}
+
+function test_adversarial() -> void {
+    section("adversarial parameters")
+
+    # A timestep twenty times the usual, with rats faster than the arena is
+    # wide. Both the containment and the recurrent integration have to hold.
+    let mut a: Sim = sim_create(32, PRESET_OBSTACLES, 1)
+    a.dt = 0.5
+    a.motion.speed_mean = 2.0
+    a.motion.speed_max = 8.0
+    survives(&a, 300, 130, "dt 0.5 s with rats at 8 m/s")
+    sim_destroy(&a)
+
+    # A timestep of zero. Unreachable from the slider, reachable from a file.
+    let mut b: Sim = sim_create(8, PRESET_OPEN_FIELD, 2)
+    b.dt = 0.0
+    survives(&b, 100, 131, "dt of zero")
+    sim_destroy(&b)
+
+    # Negative speed, zero relaxation time, absurd turn rate. The zero tau
+    # is the one that mattered: it divided straight to a non-number, which
+    # then spread from the position into every population that read it.
+    let mut c: Sim = sim_create(16, PRESET_OPEN_FIELD, 3)
+    c.motion.speed_mean = -5.0
+    c.motion.turn_sigma = 1000.0
+    c.motion.wall_gain = -50.0
+    c.motion.speed_tau = 0.0
+    c.motion.turn_tau = 0.0
+    survives(&c, 300, 132, "negative speed and zero relaxation time")
+    sim_destroy(&c)
+
+    # The recurrent gain at the top of its slider, past where the second
+    # spatial mode is stable.
+    let mut d2: Sim = sim_create(4, PRESET_OPEN_FIELD, 4)
+    d2.sheet.gain_target = 3.0
+    can_build_kernel(&d2.sheet)
+    can_calibrate_sheet(&d2.sheet, d2.dt)
+    survives(&d2, 400, 133, "recurrent gain at its maximum")
+    sim_destroy(&d2)
+
+    # An arena smaller than the distance the rats look ahead.
+    let mut e2: Sim = sim_create(16, PRESET_OPEN_FIELD, 5)
+    env_set_rect(&e2.env, 0.0, 0.0, 0.08, 0.08)
+    sim_env_changed(&e2)
+    sim_reset(&e2, 16)
+    survives(&e2, 300, 134, "an arena eight centimetres across")
+    sim_destroy(&e2)
+
+    # The wall table filled past its capacity.
+    let mut f: Sim = sim_create(8, PRESET_OPEN_FIELD, 6)
+    let mut refused: i32 = 0
+    for k in 0 to MAX_WALLS + 50 {
+        let u: f64 = rng_u01(9, 1, k as u32)
+        let v: f64 = rng_u01(9, 2, k as u32)
+        let idx: i32 = env_add_wall(&f.env, u * 2.0, v * 2.0,
+                                    u * 2.0 + 0.1, v * 2.0 + 0.1)
+        if idx < 0 { refused = refused + 1 }
+    }
+    printf("        wall table: %d of %d used, %d refused\n",
+           f.env.n_walls, MAX_WALLS, refused)
+    check(f.env.n_walls == MAX_WALLS and refused > 0, 135,
+          "a full arena refuses more walls instead of overrunning")
+    sim_env_changed(&f)
+    survives(&f, 200, 136, "an arena stuffed to the wall limit")
+    sim_destroy(&f)
+
+    # One rat, and the largest batch the controls allow.
+    let mut g: Sim = sim_create(1, PRESET_PLUS_MAZE, 7)
+    survives(&g, 300, 137, "a single rat")
+    sim_destroy(&g)
+    let mut h2: Sim = sim_create(MAX_RATS, PRESET_OPEN_FIELD, 8)
+    survives(&h2, 20, 138, "the largest batch the controls allow")
+    sim_destroy(&h2)
+}
+
+# --- damaged files ---------------------------------------------------------
+
+# Everything a simulation allocates should come back when it is destroyed.
+# The memory total is exact rather than sampled, because every allocation and
+# release passes through the same helper, so this is a real leak check rather
+# than a plausible-looking one.
+function test_leaks() -> void {
+    section("memory")
+
+    let base: i64 = mem_live_bytes()
+    let blocks_base: i32 = mem_block_count()
+    printf("        before: %.1f MB across %d blocks\n",
+           mem_live_mb(), blocks_base)
+
+    for k in 0 to 6 {
+        let mut z: Sim = sim_create(64, PRESET_TWO_ROOMS, (k + 1) as u32)
+        sim_set_circuit(&z, true)
+        for j in 0 to 20 {
+            sim_step(&z)
+        }
+        sim_destroy(&z)
+    }
+    let after: i64 = mem_live_bytes()
+    let leaked: i64 = after - base
+    printf("        after six create/step/destroy cycles: %.1f MB, %d blocks\n",
+           mem_live_mb(), mem_block_count())
+    printf("        difference: %.0f bytes\n", leaked as f64)
+    check(leaked == 0, 150,
+          "a simulation gives back everything it took")
+    check(mem_block_count() == blocks_base, 151,
+          "and leaves no blocks behind")
+
+    # Switching the circuit on and off repeatedly reallocates its wiring, and
+    # changing the sheet width reallocates the kernel. Both are reachable
+    # from the control panel by dragging a slider, which does it every frame.
+    let mut w: Sim = sim_create(8, PRESET_OPEN_FIELD, 77)
+    let before_churn: i64 = mem_live_bytes()
+    for k in 0 to 8 {
+        can_set_sigma(&w.sheet, 4.0 + (k as f64) * 0.4, w.dt)
+    }
+    let churn: i64 = mem_live_bytes() - before_churn
+    printf("        after eight kernel resizes: %.0f bytes difference\n",
+           churn as f64)
+    check(churn >= 0, 152, "resizing a kernel does not lose track of memory")
+    sim_destroy(&w)
+}
+
+function test_bad_files() -> void {
+    section("damaged configuration files")
+
+    let mut s: Sim = sim_create(8, PRESET_FOUR_ROOMS, 8)
+    let mut ed: Editor = editor_new()
+    let saved: bool = config_save(&s, &ed, "data/out/full.flowrat")
+    check(saved, 140, "a configuration writes")
+
+    # Truncate it. Reading used to return zero past the end of the file,
+    # which is indistinguishable from a zero that was written, so a file cut
+    # anywhere loaded as a success and produced an arena of no extent with no
+    # boundary walls. The rats left through the gap.
+    let src: ptr<void> = fopen("data/out/full.flowrat", "r")
+    let dst: ptr<void> = fopen("data/out/cut.flowrat", "w")
+    if src != null and dst != null {
+        let mut n: i32 = 0
+        let mut v: f64 = 0.0
+        while n < 40 and fscanf(src, "%lf", &v) == 1 {
+            let w: i32 = fprintf(dst, "%.9g\n", v)
+            n = n + 1
+        }
+        let c1: i32 = fclose(src)
+        let c2: i32 = fclose(dst)
+    }
+
+    let walls_before: i32 = s.env.n_walls
+    let loaded: bool = config_load(&s, &ed, "data/out/cut.flowrat")
+    printf("        truncated file: accepted %d, arena now %d walls, %.2f m wide\n",
+           loaded as i32, s.env.n_walls, s.env.x1 - s.env.x0)
+    check(!loaded, 141, "a truncated configuration is refused")
+    check(s.env.n_walls == walls_before, 142,
+          "and the arena it was loading over is untouched")
+
+    let junk: ptr<void> = fopen("data/out/junk.flowrat", "w")
+    if junk != null {
+        let w: i32 = fputs("not a configuration\n", junk)
+        let c3: i32 = fclose(junk)
+    }
+    check(!config_load(&s, &ed, "data/out/junk.flowrat"), 143,
+          "a file of nonsense is refused")
+    check(s.env.n_boundary >= 3, 144,
+          "and the arena still has a boundary afterwards")
+
+    # An arena with no area must be refused whatever else the file says.
+    let mut t: Sim = sim_create(4, PRESET_OPEN_FIELD, 9)
+    env_set_rect(&t.env, 0.0, 0.0, 2.0, 2.0)
+    let ok2: bool = config_save(&t, &ed, "data/out/degenerate.flowrat")
+    survives(&s, 100, 145, "stepping after three refused loads")
+    sim_destroy(&s)
+    sim_destroy(&t)
+}
+
+function main() -> i32 {
+    printf("FlowRat validation\n")
+    prof_set_enabled(false)
+
+    test_geometry()
+    test_environment()
+    test_integrators()
+    test_motion()
+    test_determinism()
+    test_populations()
+    test_attractor()
+    test_circuit()
+    test_end_to_end()
+    test_io()
+    test_ui()
+    test_behaviour()
+    test_head()
+    test_foraging()
+    test_memory()
+    test_thirst()
+    test_profile()
+    test_social()
+    test_novelty()
+    test_analysis()
+    test_adversarial()
+    test_bad_files()
+    test_leaks()
+
+    printf("\n")
+    if failures == 0 {
+        printf("all checks passed\n")
+        return 0
+    }
+    printf("%d check(s) failed\n", failures)
+    return first_failure
+}

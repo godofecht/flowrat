@@ -1,0 +1,596 @@
+# What the rat is doing, as one of a small number of things.
+#
+# WHY A STATE MACHINE
+#   Every behavioural term in the motion model used to be a turn rate, and the
+#   rat's behaviour was their sum. That composes nicely for steering, and it
+#   cannot express "the rat is grooming": grooming is not a direction, it is
+#   an activity that excludes walking. Nor can it express a bout, which is the
+#   unit real behaviour comes in. An animal grooms for six seconds and then
+#   stops; it does not groom at an intensity of 0.3 forever.
+#
+#   So the rat is in exactly one state at a time, states have durations, and
+#   the motion model dispatches on the state rather than blending everything.
+#   Steering terms still compose, but only within the states that move.
+#
+# WHY THIS IS WORTH HAVING BEYOND REALISM
+#   A state machine is measurable. The fraction of time an animal spends in
+#   each activity is its time budget, and a time budget is how ethologists
+#   describe a species: it can be compared against a published one. Nothing
+#   in FlowRat could be compared against a real measurement before this.
+#
+# DETERMINISM
+#   Every choice is drawn from the counter-based generator keyed on (rat,
+#   step), so the machine gives the same answer whatever order `parallel for`
+#   visits the rats in. Bout endings are recorded per rat and folded into the
+#   shared histogram by a serial pass afterwards, the same arrangement the
+#   feeding pass uses, because a shared histogram written from a parallel loop
+#   is a race.
+
+import "agents.flow"
+
+extern {
+    function log(x: f64) -> f64
+    function exp(x: f64) -> f64
+}
+
+export const ST_EXPLORE: i32 = 0
+export const ST_FORAGE: i32 = 1
+export const ST_EAT: i32 = 2
+export const ST_DRINK: i32 = 3
+export const ST_GROOM: i32 = 4
+export const ST_REAR: i32 = 5
+export const ST_REST: i32 = 6
+export const ST_HOME: i32 = 7
+export const ST_SCAN: i32 = 8
+export const ST_COUNT: i32 = 9
+
+export function state_name(s: i32) -> string {
+    if s == ST_FORAGE { return "forage" }
+    if s == ST_EAT { return "eat" }
+    if s == ST_DRINK { return "drink" }
+    if s == ST_GROOM { return "groom" }
+    if s == ST_REAR { return "rear" }
+    if s == ST_REST { return "rest" }
+    if s == ST_HOME { return "home" }
+    if s == ST_SCAN { return "scan" }
+    return "explore"
+}
+
+# Whether a state moves the animal. The motion model asks this rather than
+# listing the stationary states in three places.
+# Three letters, for a matrix that has to fit nine columns in a panel.
+export function state_short(s: i32) -> string {
+    if s == ST_FORAGE { return "for" }
+    if s == ST_EAT { return "eat" }
+    if s == ST_DRINK { return "drk" }
+    if s == ST_GROOM { return "grm" }
+    if s == ST_REAR { return "rer" }
+    if s == ST_REST { return "rst" }
+    if s == ST_HOME { return "hom" }
+    if s == ST_SCAN { return "scn" }
+    return "exp"
+}
+
+export function state_is_still(s: i32) -> bool {
+    if s == ST_EAT { return true }
+    if s == ST_DRINK { return true }
+    if s == ST_GROOM { return true }
+    if s == ST_REAR { return true }
+    if s == ST_REST { return true }
+    # Scanning is a pause with the head moving. The body stops, which is the
+    # whole point: a rat that keeps walking while it looks has not made a
+    # decision, it has just looked.
+    if s == ST_SCAN { return true }
+    return false
+}
+
+const STREAM_STATE: u32 = 700001
+const STREAM_BOUT: u32 = 700003
+
+# Hunger above which the animal stops doing anything but look for food, and
+# will not start a maintenance bout.
+const HUNGER_INTERRUPT: f64 = 0.75
+
+export struct BehaviourParams {
+    # Chance per second of starting each activity when nothing more pressing
+    # is going on. Rates rather than probabilities, so they mean the same
+    # thing at any timestep.
+    groom_rate: f64,
+    rear_rate: f64,
+    rest_rate: f64,
+
+    # Bout lengths, drawn uniformly between the two. Roughly the ranges
+    # reported for a rat in a familiar arena: grooming in seconds, rearing
+    # under a second, resting in tens of seconds.
+    groom_min: f64,
+    groom_max: f64,
+    rear_min: f64,
+    rear_max: f64,
+    rest_min: f64,
+    rest_max: f64,
+    # Resting in the nest is a different behaviour from pausing where the
+    # animal stands. A rat that has walked back to its nest to sleep sleeps;
+    # giving that bout the same length as an opportunistic pause made the
+    # colony spend three times longer walking home than resting once it got
+    # there, which is not a thing an animal does.
+    nest_rest_min: f64,
+    nest_rest_max: f64,
+    # How much more pressing the other drive has to be before a rat that is
+    # already going for one abandons it for the other. At the crossover the
+    # two levels sit within a hair of each other, and a rat that simply took
+    # the larger would swap every step: a few centimetres toward the water,
+    # then a few back toward the food, arriving at neither. The margin is
+    # what makes it commit to a trip.
+    drive_hysteresis: f64,
+
+    # Shortest an explore or forage bout can last. Without it the machine can
+    # flicker between the two every step at the hunger threshold, which
+    # produces a time budget full of bouts one step long and a rat that looks
+    # like it is having a fit.
+    move_min: f64,
+
+    # Vicarious trial and error: at a fork, a rat stops and sweeps its head
+    # between the options before committing to one. It is one of the most
+    # studied behaviours in the hippocampal literature, and it needs a head
+    # that moves independently of the body to exist at all.
+    vte_enabled: bool,
+    # A direction counts as open when nothing blocks it within this distance.
+    # Three or more open directions is a fork.
+    junction_open: f64,
+    scan_min: f64,
+    scan_max: f64,
+    # How long before the same rat will stop and look again, so it does not
+    # scan every step it spends standing in the junction.
+    scan_cooldown: f64,
+    # Sweeps of the head per second during a scan, and how far each goes as a
+    # fraction of the head's range.
+    scan_hz: f64,
+    scan_extent: f64,
+
+    enabled: bool,
+}
+
+export function behaviour_params_default() -> BehaviourParams {
+    return BehaviourParams {
+        # Chosen to land the time budget of a fed rat in a familiar arena in
+        # the range the open-field literature reports: locomotion around
+        # half, rearing under a tenth, grooming and resting the rest. They
+        # are rates rather than fractions because the fraction that comes out
+        # also depends on the bout lengths and on how hungry the animal is.
+        # Retuned when the roll below was corrected to charge the whole
+        # interval since the last one rather than a single step. That made
+        # the rates mean what they say, and what they said before was about
+        # thirty times what the colony was actually getting.
+        groom_rate: 0.045,
+        rear_rate: 0.10,
+        rest_rate: 0.010,
+        groom_min: 2.0,
+        groom_max: 8.0,
+        rear_min: 0.4,
+        rear_max: 1.4,
+        rest_min: 4.0,
+        rest_max: 22.0,
+        nest_rest_min: 20.0,
+        nest_rest_max: 70.0,
+        drive_hysteresis: 0.12,
+        move_min: 0.5,
+        vte_enabled: true,
+        junction_open: 0.32,
+        scan_min: 0.6,
+        scan_max: 1.6,
+        scan_cooldown: 4.0,
+        scan_hz: 1.3,
+        scan_extent: 0.85,
+        enabled: true
+    }
+}
+
+# --- the ethogram -----------------------------------------------------------
+
+# Bout durations are spread over two orders of magnitude, so the histogram is
+# log spaced: a linear one would put every rearing bout in the first bin and
+# every rest in the last.
+export const BOUT_BINS: i32 = 12
+const BOUT_MIN_S: f64 = 0.1
+const BOUT_MAX_S: f64 = 60.0
+
+export struct Ethogram {
+    # Seconds spent in each state, summed over every rat.
+    total_time: array<f64, 9>,
+    # Completed bouts of each state, and their summed length, which together
+    # give the mean bout duration.
+    bouts: array<i32, 9>,
+    bout_seconds: array<f64, 9>,
+    # Log-spaced histogram of bout lengths, state major.
+    hist: array<i32, 108>,
+    # Seconds of simulated time the above covers, so the budget can be shown
+    # as a fraction.
+    elapsed: f64,
+}
+
+export function ethogram_new() -> Ethogram {
+    let mut e: Ethogram = Ethogram {
+        total_time: [0.0], bouts: [0], bout_seconds: [0.0],
+        hist: [0], elapsed: 0.0
+    }
+    ethogram_reset(&e)
+    return e
+}
+
+export function ethogram_reset(e: ptr<Ethogram>) -> void {
+    for i in 0 to ST_COUNT {
+        e.total_time[i] = 0.0
+        e.bouts[i] = 0
+        e.bout_seconds[i] = 0.0
+    }
+    for i in 0 to ST_COUNT * BOUT_BINS {
+        e.hist[i] = 0
+    }
+    e.elapsed = 0.0
+}
+
+function bout_bin(seconds: f64) -> i32 {
+    if seconds <= BOUT_MIN_S { return 0 }
+    if seconds >= BOUT_MAX_S { return BOUT_BINS - 1 }
+    let lo: f64 = log(BOUT_MIN_S)
+    let hi: f64 = log(BOUT_MAX_S)
+    let f: f64 = (log(seconds) - lo) / (hi - lo)
+    let b: i32 = (f * (BOUT_BINS as f64)) as i32
+    if b < 0 { return 0 }
+    if b >= BOUT_BINS { return BOUT_BINS - 1 }
+    return b
+}
+
+# Lower and upper edge of a histogram bin, for the axis labels.
+export function bout_bin_edge(bin: i32) -> f64 {
+    let lo: f64 = log(BOUT_MIN_S)
+    let hi: f64 = log(BOUT_MAX_S)
+    return exp(lo + (hi - lo) * (bin as f64) / (BOUT_BINS as f64))
+}
+
+export function ethogram_mean_bout(e: ptr<Ethogram>, s: i32) -> f64 {
+    if e.bouts[s] <= 0 { return 0.0 }
+    return e.bout_seconds[s] / (e.bouts[s] as f64)
+}
+
+export function ethogram_fraction(e: ptr<Ethogram>, s: i32) -> f64 {
+    let mut total: f64 = 0.0
+    for i in 0 to ST_COUNT {
+        total = total + e.total_time[i]
+    }
+    if total <= 0.0 { return 0.0 }
+    return e.total_time[s] / total
+}
+
+export function ethogram_hist_at(e: ptr<Ethogram>, s: i32, bin: i32) -> i32 {
+    return e.hist[s * BOUT_BINS + bin]
+}
+
+# Fold the bouts that ended this step into the shared histogram.
+#
+# Serial, and deliberately so: the parallel motion pass records at most one
+# ended bout per rat in its own slot, and this walks them in rat order. A
+# histogram incremented from inside the parallel loop would be a race on its
+# bins, and the counts would differ between runs of the same seed.
+export function ethogram_fold(e: ptr<Ethogram>, a: ptr<Agents>,
+                              dt: f64) -> void {
+    e.elapsed = e.elapsed + dt
+    for i in 0 to a.n {
+        e.total_time[a.state[i]] = e.total_time[a.state[i]] + dt
+        let ended: i32 = a.bout_done_state[i]
+        if ended >= 0 {
+            let len: f64 = a.bout_done_len[i]
+            e.bouts[ended] = e.bouts[ended] + 1
+            e.bout_seconds[ended] = e.bout_seconds[ended] + len
+            let b: i32 = bout_bin(len)
+            e.hist[ended * BOUT_BINS + b] = e.hist[ended * BOUT_BINS + b] + 1
+            a.bout_done_state[i] = -1
+        }
+    }
+}
+
+# --- transitions ------------------------------------------------------------
+
+# Move rat `i` into `next`, recording the bout that just ended. Exported so
+# that code outside the machine, such as the feeding pass discovering an empty
+# patch, changes state through the same door and its bouts are counted.
+export function behaviour_force(a: ptr<Agents>, i: i32, next: i32,
+                                duration: f64) -> void {
+    enter(a, i, next, duration)
+}
+
+# Move rat `i` into `next`, recording the bout that just ended.
+function enter(a: ptr<Agents>, i: i32, next: i32, duration: f64) -> void {
+    if next != a.state[i] {
+        a.bout_done_state[i] = a.state[i]
+        a.bout_done_len[i] = a.state_elapsed[i]
+        a.state[i] = next
+        a.state_elapsed[i] = 0.0
+    }
+    a.state_timer[i] = duration
+    # Every mouthful is one item, so starting one asks for exactly one. This
+    # is set here rather than at each call site because the machine enters
+    # eating from four places and missing one would be a rat that chews on
+    # nothing.
+    if next == ST_EAT or next == ST_DRINK {
+        a.bite_pending[i] = 1
+    }
+}
+
+function span(bp_min: f64, bp_max: f64, seed: u32, stream: u32,
+              counter: u32) -> f64 {
+    return rng_range(seed, stream, counter, bp_min, bp_max)
+}
+
+# Decide what the rat is doing this step.
+#
+# `food_here` is the index of a patch within reach, `food_seen` one it can
+# see, or -1 for neither. They are passed in rather than looked up here so
+# this module does not need the environment's food machinery, and so the
+# caller can reuse the queries it already made.
+#
+# Priority runs from most to least pressing: finish a timed bout, eat what is
+# under your nose, take food home, go and get food, and only then the things
+# an unbothered animal does.
+# Which drive has the animal: ZONE_REWARD, ZONE_WATER, or -1 when neither is
+# pressing enough to act on. This is the whole of the choice, and it is the
+# only place in FlowRat where two motivations are weighed against each other.
+function choose_drive(a: ptr<Agents>, bp: ptr<BehaviourParams>, i: i32,
+                      hungry: bool, thirsty: bool) -> i32 {
+    if !hungry and !thirsty { return -1 }
+    if hungry and !thirsty { return ZONE_REWARD }
+    if thirsty and !hungry { return ZONE_WATER }
+
+    # Both. Stay with whatever the rat is already on unless the other is
+    # enough stronger to be worth abandoning the trip for.
+    let h: f64 = a.hunger[i]
+    let t: f64 = a.thirst[i]
+    let cur: i32 = a.supply_kind[i]
+    if cur == ZONE_REWARD {
+        if t > h + bp.drive_hysteresis { return ZONE_WATER }
+        return ZONE_REWARD
+    }
+    if cur == ZONE_WATER {
+        if h > t + bp.drive_hysteresis { return ZONE_REWARD }
+        return ZONE_WATER
+    }
+    if t > h { return ZONE_WATER }
+    return ZONE_REWARD
+}
+
+# The state in which a rat consumes the kind it went for.
+function consume_state(kind: i32) -> i32 {
+    if kind == ZONE_WATER { return ST_DRINK }
+    return ST_EAT
+}
+
+export function behaviour_tick(a: ptr<Agents>, bp: ptr<BehaviourParams>,
+                               i: i32, dt: f64, seed: u32, step_index: i32,
+                               hunger_threshold: f64, food_here: i32,
+                               food_seen: i32, water_here: i32,
+                               water_seen: i32, carrying_full: bool,
+                               bite_seconds: f64, at_junction: bool,
+                               has_nest: bool, at_nest: bool) -> void {
+    let counter: u32 = (step_index as u32) * 65536 + (i as u32)
+    let rat: u32 = (i as u32) * 2654435761
+    a.state_elapsed[i] = a.state_elapsed[i] + dt
+    a.roll_dt[i] = a.roll_dt[i] + dt
+    if a.state_timer[i] > 0.0 {
+        a.state_timer[i] = a.state_timer[i] - dt
+    }
+    if a.food_cooldown[i] > 0.0 {
+        a.food_cooldown[i] = a.food_cooldown[i] - dt
+    }
+    if a.scan_cooldown[i] > 0.0 {
+        a.scan_cooldown[i] = a.scan_cooldown[i] - dt
+    }
+
+    if !bp.enabled {
+        enter(a, i, ST_EXPLORE, 0.0)
+        return
+    }
+
+    let hungry: bool = a.hunger[i] > hunger_threshold
+    let thirsty: bool = a.thirst[i] > hunger_threshold
+    let drive: i32 = choose_drive(a, bp, i, hungry, thirsty)
+    let wants: bool = drive >= 0
+    let consuming: i32 = consume_state(drive)
+
+    # Only the chosen drive's patches are visible to the rest of the machine.
+    # A thirsty rat standing on food walks past it, which is the behaviour
+    # that having two drives is for.
+    let mut here: i32 = -1
+    let mut seen: i32 = -1
+    if drive == ZONE_REWARD {
+        here = food_here
+        seen = food_seen
+    }
+    if drive == ZONE_WATER {
+        here = water_here
+        seen = water_seen
+    }
+    # A patch that just gave this rat nothing is off the menu for a moment.
+    # Retrying every step turned a crowd at an exhausted patch into sixty
+    # thousand eating bouts a minute, each one a single step long, and made
+    # the time budget read as three quarters eating when nothing was eaten.
+    if a.food_cooldown[i] > 0.0 { here = -1 }
+
+    # A mouthful in progress continues until its timer runs out, and then
+    # only if there is still something there and still a reason to take it.
+    if a.state[i] == ST_EAT or a.state[i] == ST_DRINK {
+        if a.state_timer[i] > 0.0 { return }
+        if wants and here >= 0 {
+            enter(a, i, consuming, bite_seconds)
+            return
+        }
+    }
+
+    # Something under the nose that the animal wants beats everything else.
+    if wants and here >= 0 {
+        a.food_target[i] = here
+        a.supply_kind[i] = drive
+        enter(a, i, consuming, bite_seconds)
+        return
+    }
+
+    # A scan runs to completion once started.
+    if a.state[i] == ST_SCAN and a.state_timer[i] > 0.0 { return }
+
+    # Arriving at a fork, with something in mind and nothing more urgent to
+    # do, is when a rat stops and looks both ways.
+    if bp.vte_enabled and at_junction and a.scan_cooldown[i] <= 0.0 {
+        if a.state[i] == ST_EXPLORE or a.state[i] == ST_FORAGE
+           or a.state[i] == ST_HOME {
+            a.scan_cooldown[i] = bp.scan_cooldown
+            a.scans[i] = a.scans[i] + 1
+            enter(a, i, ST_SCAN,
+                  span(bp.scan_min, bp.scan_max, seed,
+                       STREAM_BOUT + rat + 3, counter))
+            return
+        }
+    }
+
+    if carrying_full {
+        enter(a, i, ST_HOME, 0.0)
+        return
+    }
+
+    # A rat that set off for the nest keeps going until it gets there. The
+    # bout carries no timer, because how long it takes is however long the
+    # walk takes, so without this the machine would re-decide every step and
+    # the rat would wander off after one.
+    if a.state[i] == ST_HOME and has_nest and !at_nest {
+        if a.hunger[i] <= HUNGER_INTERRUPT { return }
+    }
+
+    # Arrived. Resting is what it came for, and a nest bout is a long one.
+    if a.state[i] == ST_HOME and at_nest {
+        enter(a, i, ST_REST,
+              span(bp.nest_rest_min, bp.nest_rest_max, seed,
+                   STREAM_BOUT + rat + 4, counter))
+        return
+    }
+
+    # A timed bout of something stationary runs to completion. Hunger can cut
+    # it short, because a starving animal stops grooming.
+    if a.state_timer[i] > 0.0 {
+        if a.hunger[i] <= HUNGER_INTERRUPT { return }
+    }
+
+    # Maintenance behaviours are rolled for first, at rates scaled down by
+    # how hungry the animal is.
+    #
+    # The first version tested hunger before this and returned, so any rat
+    # over the threshold never groomed, reared or rested at all. In an arena
+    # with real competition for food that is nearly always, and the time
+    # budget came out ninety-three per cent locomotion, which is not what any
+    # rat does. Motivation in an animal is graded: a peckish rat still
+    # grooms, a starving one does not. Scaling by (1 - hunger) says exactly
+    # that and puts the budget back in a plausible range.
+    # Above the interrupt level, do not start a maintenance bout at all.
+    # Starting one that the next step will cut short produced bouts a single
+    # step long, which showed up as a mean resting bout of two hundredths of
+    # a second: nonsense as a measurement, and nonsense as behaviour.
+    # Either drive, pressed hard enough, stops the animal doing anything else.
+    if a.hunger[i] > HUNGER_INTERRUPT or a.thirst[i] > HUNGER_INTERRUPT {
+        if seen >= 0 {
+            a.food_target[i] = seen
+            a.supply_kind[i] = drive
+            enter(a, i, ST_FORAGE, bp.move_min)
+        } else {
+            a.food_target[i] = -1
+            a.supply_kind[i] = drive
+            enter(a, i, ST_EXPLORE, bp.move_min)
+        }
+        return
+    }
+
+    # Maintenance is scaled down by whichever drive is stronger, because it
+    # is the pressing one that stops a rat grooming.
+    let mut appetite: f64 = a.hunger[i]
+    if a.thirst[i] > appetite { appetite = a.thirst[i] }
+    let mut idle: f64 = 1.0 - appetite
+    if idle < 0.0 { idle = 0.0 }
+
+    # How long it has been since this rat last got to roll for maintenance.
+    #
+    # The roll is only reached on a step where no timed bout is running, and
+    # a locomotion bout carries a half-second timer, so a foraging rat gets
+    # here roughly once every thirty steps. Charging it a single step's worth
+    # of probability each time meant the grooming rate was quietly divided by
+    # however much of the run the colony spent in timed states, which is a
+    # number that moved every time a behaviour was added. Every phase of this
+    # project perturbed the time budget for that reason and no other.
+    #
+    # Charging the whole elapsed interval makes `groom rate /s` mean once per
+    # second, whatever the animal was doing in between. The exponential is
+    # the correct form for a constant hazard over an interval and, unlike a
+    # rate times a duration, cannot exceed one when the interval is long.
+    let span_s: f64 = a.roll_dt[i]
+    a.roll_dt[i] = 0.0
+    let hazard: f64 = (bp.groom_rate + bp.rear_rate + bp.rest_rate) * idle
+    let mut p_any: f64 = 0.0
+    if hazard > 0.0 and span_s > 0.0 {
+        p_any = 1.0 - exp(-hazard * span_s)
+    }
+    let total: f64 = bp.groom_rate + bp.rear_rate + bp.rest_rate
+    let mut p_groom: f64 = 0.0
+    let mut p_rear: f64 = 0.0
+    let mut p_rest: f64 = 0.0
+    if total > 0.0 {
+        p_groom = p_any * bp.groom_rate / total
+        p_rear = p_any * bp.rear_rate / total
+        p_rest = p_any * bp.rest_rate / total
+    }
+    let u: f64 = rng_u01(seed, STREAM_STATE + rat, counter)
+
+    if u < p_groom {
+        enter(a, i, ST_GROOM,
+              span(bp.groom_min, bp.groom_max, seed, STREAM_BOUT + rat,
+                   counter))
+        return
+    }
+    if u < p_groom + p_rear {
+        enter(a, i, ST_REAR,
+              span(bp.rear_min, bp.rear_max, seed, STREAM_BOUT + rat + 1,
+                   counter))
+        return
+    }
+    if u < p_groom + p_rear + p_rest {
+        # A rat sleeps in its nest. Before this, resting happened wherever
+        # the animal was standing when the roll came up, which spread the
+        # resting time evenly over the arena; a real rat's inactive time is
+        # concentrated where it lives. With a nest in the arena the rat walks
+        # back to it and rests there, which is also the only way ST_HOME is
+        # reachable when hoarding is off.
+        if has_nest and !at_nest {
+            enter(a, i, ST_HOME, 0.0)
+        } else {
+            enter(a, i, ST_REST,
+                  span(bp.rest_min, bp.rest_max, seed, STREAM_BOUT + rat + 2,
+                       counter))
+        }
+        return
+    }
+
+    # Nothing else came up, so go and get whatever it wants, if it wants
+    # anything.
+    if wants {
+        if seen >= 0 {
+            a.food_target[i] = seen
+            a.supply_kind[i] = drive
+            enter(a, i, ST_FORAGE, bp.move_min)
+        } else {
+            a.food_target[i] = -1
+            a.supply_kind[i] = drive
+            enter(a, i, ST_EXPLORE, bp.move_min)
+        }
+        return
+    }
+
+    a.food_target[i] = -1
+    a.supply_kind[i] = -1
+    if a.state[i] != ST_EXPLORE and a.state_timer[i] <= 0.0 {
+        enter(a, i, ST_EXPLORE, bp.move_min)
+    }
+}

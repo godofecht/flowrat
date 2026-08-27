@@ -1,0 +1,278 @@
+# What the rat knows that it cannot currently see.
+#
+# TWO KINDS OF KNOWING
+#   Where food was, and where home is. They are different problems and are
+#   solved differently, which is the interesting part.
+#
+#   Food is remembered as a short list of places, each with a confidence that
+#   decays. The rat saw a patch, it noted roughly where, and the note fades.
+#   Going back to a remembered patch and finding nothing wipes the note.
+#
+#   Home is not remembered as a place at all. It is a vector the rat keeps
+#   updated by subtracting its own movement from it, so it always points from
+#   wherever the animal is to wherever it thinks the nest is. That is dead
+#   reckoning, and it needs no landmarks, no map and no line of sight. It also
+#   accumulates error with every step, which is exactly what makes it worth
+#   modelling: the drift is the cost of the method.
+#
+# WHY THIS MATTERS FOR THE BEHAVIOUR
+#   Before this, a hungry rat could only walk toward food it could see. In the
+#   two-room and four-room arenas the food is behind a wall most of the time,
+#   which made those arenas unsolvable rather than difficult. And a rat could
+#   only find the nest by looking at it.
+#
+# WHY NOT USE THE ATTRACTOR
+#   The continuous attractor network computes the same thing and is the more
+#   interesting model of it, but it runs for one rat: a sheet per rat would
+#   multiply the recurrent cost by the batch size. So every rat gets the cheap
+#   integrator, the selected rat also gets the network, and the attractors
+#   panel shows the two estimates against the truth. That comparison says more
+#   than either would alone.
+
+import "agents.flow"
+
+extern {
+    function sqrt(x: f64) -> f64
+    function fabs(x: f64) -> f64
+    function atan2(y: f64, x: f64) -> f64
+}
+
+const STREAM_DRIFT_X: u32 = 810011
+const STREAM_DRIFT_Y: u32 = 810013
+
+export struct MemoryParams {
+    # Confidence lost per second. At 0.02 a note is half gone after half a
+    # minute and worthless after two, which is about how long a rat will keep
+    # returning to a place that has stopped producing.
+    decay: f64,
+    # What a visit that finds nothing does to the note. One wipes it.
+    disappointment: f64,
+    # Below this the note is not worth walking to.
+    usable: f64,
+    # Error added to the home vector per metre travelled. Dead reckoning
+    # drifts; this is how fast.
+    home_drift: f64,
+    # How far outside its nest the rat can still tell that the nest is there,
+    # by smell or by sight of the bedding. Added to the nest's own radius to
+    # give the distance at which it accepts that it has arrived.
+    #
+    # This is a property of the nest rather than of the reckoning, and it has
+    # to be, because the rat steers to its estimate and the estimate is off
+    # by roughly the accumulated drift. A recognition distance smaller than
+    # that drift can never be reached: the rat parks on the spot it believes
+    # is home, a fifth of a metre from the real one, and orbits there. That
+    # is what happened with a fixed radius, and the colony logged twenty-five
+    # trips home without a single arrival.
+    home_sense: f64,
+    enabled: bool,
+}
+
+export function memory_params_default() -> MemoryParams {
+    return MemoryParams {
+        decay: 0.02,
+        disappointment: 0.7,
+        usable: 0.15,
+        home_drift: 0.03,
+        home_sense: 0.12,
+        enabled: true
+    }
+}
+
+# --- food memory ------------------------------------------------------------
+
+# Note that a patch is here, or refresh the note if there is one.
+export function memory_see(a: ptr<Agents>, i: i32, patch: i32,
+                           x: f64, y: f64) -> void {
+    if patch < 0 { return }
+    let base: i32 = i * MEM_SLOTS
+    let mut weakest: i32 = 0
+    let mut weakest_conf: f64 = 2.0
+    for k in 0 to MEM_SLOTS {
+        if a.mem_patch[base + k] == patch {
+            a.mem_x[base + k] = x
+            a.mem_y[base + k] = y
+            a.mem_conf[base + k] = 1.0
+            return
+        }
+        if a.mem_conf[base + k] < weakest_conf {
+            weakest_conf = a.mem_conf[base + k]
+            weakest = k
+        }
+    }
+    # No note for this patch, so the least trusted one is overwritten. A rat
+    # with six slots and seven patches forgets the one it is least sure of.
+    a.mem_patch[base + weakest] = patch
+    a.mem_x[base + weakest] = x
+    a.mem_y[base + weakest] = y
+    a.mem_conf[base + weakest] = 1.0
+}
+
+export function memory_decay(a: ptr<Agents>, mp: ptr<MemoryParams>,
+                             i: i32, dt: f64) -> void {
+    let base: i32 = i * MEM_SLOTS
+    for k in 0 to MEM_SLOTS {
+        if a.mem_patch[base + k] >= 0 {
+            let c: f64 = a.mem_conf[base + k] - mp.decay * dt
+            if c <= 0.0 {
+                a.mem_patch[base + k] = -1
+                a.mem_conf[base + k] = 0.0
+            } else {
+                a.mem_conf[base + k] = c
+            }
+        }
+    }
+}
+
+# Going somewhere remembered and finding nothing costs the note most of its
+# confidence. Repeated disappointment clears it, which is what stops a rat
+# walking back and forth to a patch that has been eaten out.
+export function memory_disappoint(a: ptr<Agents>, mp: ptr<MemoryParams>,
+                                  i: i32, patch: i32) -> void {
+    if patch < 0 { return }
+    let base: i32 = i * MEM_SLOTS
+    for k in 0 to MEM_SLOTS {
+        if a.mem_patch[base + k] == patch {
+            let c: f64 = a.mem_conf[base + k] - mp.disappointment
+            if c <= 0.0 {
+                a.mem_patch[base + k] = -1
+                a.mem_conf[base + k] = 0.0
+            } else {
+                a.mem_conf[base + k] = c
+            }
+            return
+        }
+    }
+}
+
+# The remembered patch worth walking to, weighing how sure the rat is against
+# how far it is. Returns the patch index, or -1 when nothing is worth it.
+export function memory_best(a: ptr<Agents>, mp: ptr<MemoryParams>, i: i32,
+                            x_out: ptr<f64>, y_out: ptr<f64>) -> i32 {
+    let base: i32 = i * MEM_SLOTS
+    let mut best: f64 = 0.0
+    let mut best_k: i32 = -1
+    for k in 0 to MEM_SLOTS {
+        if a.mem_patch[base + k] >= 0 and a.mem_conf[base + k] > mp.usable {
+            let d: f64 = dist(a.x[i], a.y[i], a.mem_x[base + k],
+                              a.mem_y[base + k])
+            # Confidence over distance, floored so a note underfoot does not
+            # divide by nothing.
+            let score: f64 = a.mem_conf[base + k] / (0.25 + d)
+            if score > best {
+                best = score
+                best_k = k
+            }
+        }
+    }
+    if best_k < 0 { return -1 }
+    x_out[0] = a.mem_x[base + best_k]
+    y_out[0] = a.mem_y[base + best_k]
+    return a.mem_patch[base + best_k]
+}
+
+# The best remembered patch of one kind. The notes do not record what they
+# are notes about, because a zone already knows its own kind; the lookup asks
+# the arena. A rat that remembers the puddle and the seed pile holds two notes
+# and picks by which one it currently needs.
+export function memory_best_kind(a: ptr<Agents>, mp: ptr<MemoryParams>,
+                                 e: ptr<Env>, i: i32, kind: i32,
+                                 x_out: ptr<f64>, y_out: ptr<f64>) -> i32 {
+    let base: i32 = i * MEM_SLOTS
+    let mut best: f64 = 0.0
+    let mut best_k: i32 = -1
+    for k in 0 to MEM_SLOTS {
+        let patch: i32 = a.mem_patch[base + k]
+        if patch >= 0 and patch < e.n_zones and a.mem_conf[base + k] > mp.usable {
+            if e.zone_kind[patch] == kind {
+                let d: f64 = dist(a.x[i], a.y[i], a.mem_x[base + k],
+                                  a.mem_y[base + k])
+                let score: f64 = a.mem_conf[base + k] / (0.25 + d)
+                if score > best {
+                    best = score
+                    best_k = k
+                }
+            }
+        }
+    }
+    if best_k < 0 { return -1 }
+    x_out[0] = a.mem_x[base + best_k]
+    y_out[0] = a.mem_y[base + best_k]
+    return a.mem_patch[base + best_k]
+}
+
+export function memory_count(a: ptr<Agents>, i: i32) -> i32 {
+    let base: i32 = i * MEM_SLOTS
+    let mut n: i32 = 0
+    for k in 0 to MEM_SLOTS {
+        if a.mem_patch[base + k] >= 0 { n = n + 1 }
+    }
+    return n
+}
+
+export function memory_conf_at(a: ptr<Agents>, i: i32, k: i32) -> f64 {
+    return a.mem_conf[i * MEM_SLOTS + k]
+}
+
+export function memory_patch_at(a: ptr<Agents>, i: i32, k: i32) -> i32 {
+    return a.mem_patch[i * MEM_SLOTS + k]
+}
+
+# --- dead reckoning ---------------------------------------------------------
+
+# The rat is at the nest and knows it, so the vector is zero and the
+# accumulated error goes with it. Called on reset and whenever a rat actually
+# reaches home, which is what stops the drift growing without bound: an animal
+# that gets home occasionally re-zeroes its own estimate.
+export function homing_reset(a: ptr<Agents>, i: i32) -> void {
+    a.home_dx[i] = 0.0
+    a.home_dy[i] = 0.0
+}
+
+# Subtract this step's movement from the vector, and add the error that comes
+# with having measured that movement imperfectly.
+#
+# The noise scales with the square root of the distance travelled, so the
+# error accumulates as a random walk: it grows with the square root of the
+# path length rather than linearly. That is the standard result for
+# integrating a noisy velocity, and it is why a rat can wander a long way and
+# still get home approximately.
+export function homing_step(a: ptr<Agents>, mp: ptr<MemoryParams>, i: i32,
+                            dx: f64, dy: f64, seed: u32,
+                            counter: u32) -> void {
+    a.home_dx[i] = a.home_dx[i] - dx
+    a.home_dy[i] = a.home_dy[i] - dy
+    if mp.home_drift <= 0.0 { return }
+    let moved: f64 = sqrt(dx * dx + dy * dy)
+    if moved <= 0.0 { return }
+    let n: f64 = mp.home_drift * sqrt(moved)
+    let rat: u32 = (i as u32) * 2654435761
+    a.home_dx[i] = a.home_dx[i]
+                   + n * rng_normal(seed, STREAM_DRIFT_X + rat, counter)
+    a.home_dy[i] = a.home_dy[i]
+                   + n * rng_normal(seed, STREAM_DRIFT_Y + rat, counter)
+}
+
+# Where the rat believes the nest is, in room coordinates.
+export function homing_estimate(a: ptr<Agents>, i: i32,
+                                x_out: ptr<f64>, y_out: ptr<f64>) -> void {
+    x_out[0] = a.x[i] + a.home_dx[i]
+    y_out[0] = a.y[i] + a.home_dy[i]
+}
+
+export function homing_distance(a: ptr<Agents>, i: i32) -> f64 {
+    return sqrt(a.home_dx[i] * a.home_dx[i] + a.home_dy[i] * a.home_dy[i])
+}
+
+export function homing_bearing(a: ptr<Agents>, i: i32) -> f64 {
+    return atan2(a.home_dy[i], a.home_dx[i])
+}
+
+# How wrong the estimate is, given where the nest actually is. The number the
+# panel shows, and the one that grows with the path travelled.
+export function homing_error(a: ptr<Agents>, i: i32,
+                             nest_x: f64, nest_y: f64) -> f64 {
+    let mut ex: f64 = 0.0
+    let mut ey: f64 = 0.0
+    homing_estimate(a, i, &ex, &ey)
+    return dist(ex, ey, nest_x, nest_y)
+}

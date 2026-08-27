@@ -1,0 +1,157 @@
+# Place cells.
+#
+# A localised Gaussian field over position:
+#
+#   rate = peak * exp( -d^2 / (2 sigma^2) )
+#
+# where d is the distance from the rat to the cell's centre.
+#
+# PROPERTIES
+#   p0  centre x
+#   p1  centre y
+#   p2  sigma, the field width in metres
+#   p3  peak rate in Hz
+#   p4  unused
+#
+# CENTRES
+#   Sampled by rejection from free space, so no field sits inside an
+#   obstacle or outside the arena. The sample coordinate is the cell index,
+#   which means the same seed and the same arena give the same tiling every
+#   run, and adding a cell does not move the ones already placed.
+#
+# BARRIERS
+#   With `los_gate` on, a field is suppressed when a wall stands between the
+#   rat and the centre. That is what stops a field bleeding through the
+#   divider in the two-room arena, and it is the cheap stand-in for the
+#   geodesic distance a full model would use. It costs a line-of-sight test
+#   per cell per rat, so it is off by default; the cost is stated in the
+#   profiler as part of the place slot.
+
+extern {
+    function exp(x: f64) -> f64
+    function sqrt(x: f64) -> f64
+}
+
+const STREAM_PLACE_X: u32 = 50021
+const STREAM_PLACE_Y: u32 = 50023
+
+export struct PlaceParams {
+    sigma: f64,
+    sigma_jitter: f64,
+    peak_rate: f64,
+    los_gate: bool,
+}
+
+export function place_params_default() -> PlaceParams {
+    return PlaceParams {
+        sigma: 0.10,
+        sigma_jitter: 0.03,
+        peak_rate: 20.0,
+        los_gate: false
+    }
+}
+
+# Scatter field centres over the arena's free space.
+export function place_configure(p: ptr<Pop>, e: ptr<Env>,
+                                pp: ptr<PlaceParams>, seed: u32) -> void {
+    for c in 0 to p.n {
+        let mut x: f64 = 0.0
+        let mut y: f64 = 0.0
+        # 64 rejection tries covers arenas as cluttered as the plus maze,
+        # where free space is under a third of the bounding box.
+        let ok: bool = env_sample_free(e, seed, STREAM_PLACE_X,
+                                       (c as u32) + 1, 64, &x, &y)
+        p.p0[c] = x
+        p.p1[c] = y
+        # Widths vary between cells the way real fields do, so a population
+        # readout is not artificially uniform.
+        let j: f64 = rng_sym(seed, STREAM_PLACE_Y, (c as u32) + 1,
+                             pp.sigma_jitter)
+        let mut s: f64 = pp.sigma + j
+        if s < 0.02 { s = 0.02 }
+        p.p2[c] = s
+        p.p3[c] = pp.peak_rate
+        p.p4[c] = 0.0
+    }
+    p.revision = p.revision + 1
+}
+
+# Rate of one cell at an arbitrary point. Used by the update, by the tuning
+# preview in the population panel, and by the validation entry point.
+export function place_rate_at(p: ptr<Pop>, cell: i32,
+                              x: f64, y: f64) -> f64 {
+    let dx: f64 = x - p.p0[cell]
+    let dy: f64 = y - p.p1[cell]
+    let s: f64 = p.p2[cell]
+    let d2: f64 = dx * dx + dy * dy
+    return p.p3[cell] * exp(-d2 / (2.0 * s * s))
+}
+
+export function place_update(p: ptr<Pop>, a: ptr<Agents>, e: ptr<Env>,
+                             pp: ptr<PlaceParams>) -> void {
+    if !p.enabled { return }
+    let gate: bool = pp.los_gate
+    parallel for r in 0 to a.n {
+        let base: i32 = r * p.n
+        let rx: f64 = a.x[r]
+        let ry: f64 = a.y[r]
+        for c in 0 to p.n {
+            let dx: f64 = rx - p.p0[c]
+            let dy: f64 = ry - p.p1[c]
+            let s: f64 = p.p2[c]
+            let d2: f64 = dx * dx + dy * dy
+            # Three sigma covers 99% of the field. Past that the exponential
+            # is under 1% of peak and the exp is not worth paying for, which
+            # matters because this is the innermost loop of the whole
+            # simulation at large cell counts.
+            let cut: f64 = 9.0 * s * s
+            if d2 > cut {
+                p.rates[base + c] = 0.0
+            } else {
+                let mut v: f64 = p.p3[c] * exp(-d2 / (2.0 * s * s))
+                if gate {
+                    if !env_line_of_sight(e, rx, ry, p.p0[c], p.p1[c]) {
+                        v = 0.0
+                    }
+                }
+                p.rates[base + c] = v
+            }
+        }
+    }
+}
+
+# Mean field width, for the inspector.
+export function place_mean_sigma(p: ptr<Pop>) -> f64 {
+    if p.n == 0 { return 0.0 }
+    let mut s: f64 = 0.0
+    for c in 0 to p.n {
+        s = s + p.p2[c]
+    }
+    return s / (p.n as f64)
+}
+
+# Population-vector decode: the rate-weighted mean of the active centres.
+# A working place code should track the rat, and the distance between this
+# estimate and the true position is the clearest single number for whether
+# the population is doing its job.
+export function place_decode(p: ptr<Pop>, rat: i32,
+                             x_out: ptr<f64>, y_out: ptr<f64>) -> f64 {
+    let base: i32 = rat * p.n
+    let mut wx: f64 = 0.0
+    let mut wy: f64 = 0.0
+    let mut w: f64 = 0.0
+    for c in 0 to p.n {
+        let v: f64 = p.rates[base + c]
+        wx = wx + v * p.p0[c]
+        wy = wy + v * p.p1[c]
+        w = w + v
+    }
+    if w < 0.000001 {
+        x_out[0] = 0.0
+        y_out[0] = 0.0
+        return 0.0
+    }
+    x_out[0] = wx / w
+    y_out[0] = wy / w
+    return w
+}

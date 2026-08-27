@@ -1,0 +1,230 @@
+# Rate maps measured from a run, rather than read off the model.
+#
+# WHY THIS IS THE POINT
+#   Everything else in FlowRat can be checked for correctness and not for
+#   realism. The rate map it exported was the analytic tuning the model was
+#   handed: a Gaussian, drawn as a Gaussian, which proves that the code can
+#   evaluate the formula it was given and nothing else.
+#
+#   A measured rate map is what an experimenter has. Bin the arena, count how
+#   long the animal spent in each bin and how many spikes it fired there, and
+#   divide. What comes out is an estimate, with all the problems of an
+#   estimate: bins the rat never visited have no answer, bins it barely
+#   visited have a noisy one, and the map depends on the run as much as on the
+#   cell.
+#
+#   That is the value of it. The analysis and the model are independent code
+#   paths, so when the measured tuning recovers the parameters the population
+#   was configured with, that agreement means something. It is the only claim
+#   in this project that is not checking the code against itself.
+#
+# WHAT IT NEEDS FROM THE RUN
+#   Spikes. A rate is not enough: binning a rate gives back a smoothed version
+#   of the rate, which is circular. The populations already emit spikes when
+#   `spiking` is on, so the sampler counts those.
+#
+# UNVISITED BINS
+#   A bin with no occupancy has no rate, and pretending it has one of zero is
+#   the single easiest way to make a field look sparser and a spatial
+#   information score look higher than the data support. Occupancy is kept
+#   alongside the rate and every consumer is required to check it.
+
+extern {
+    function sqrt(x: f64) -> f64
+    function log(x: f64) -> f64
+    function exp(x: f64) -> f64
+    function fabs(x: f64) -> f64
+    function cos(x: f64) -> f64
+    function sin(x: f64) -> f64
+    function atan2(y: f64, x: f64) -> f64
+}
+
+export const MAP_MAX_SIDE: i32 = 64
+
+export struct RateMap {
+    nx: i32,
+    ny: i32,
+    n_bins: i32,
+    x0: f64,
+    y0: f64,
+    bin_w: f64,
+    bin_h: f64,
+    # Seconds spent in each bin, and spikes fired there.
+    occupancy: ptr<f64>,
+    spikes: ptr<f64>,
+    # occupancy * spikes, filled by ratemap_finish.
+    rate: ptr<f64>,
+    total_time: f64,
+    total_spikes: f64,
+    # Which cell of which population this is a map of, so a map cannot be
+    # quietly compared against one of something else.
+    pop_kind: i32,
+    cell: i32,
+    # Occupancy below which a bin counts as unvisited, kept so that every
+    # reader applies the same threshold the map was finished with.
+    min_time: f64,
+    finished: bool,
+}
+
+export function ratemap_create(nx: i32, ny: i32) -> RateMap {
+    let mut sx: i32 = nx
+    let mut sy: i32 = ny
+    if sx < 2 { sx = 2 }
+    if sy < 2 { sy = 2 }
+    if sx > MAP_MAX_SIDE { sx = MAP_MAX_SIDE }
+    if sy > MAP_MAX_SIDE { sy = MAP_MAX_SIDE }
+    let n: i32 = sx * sy
+    let m: RateMap = RateMap {
+        nx: sx, ny: sy, n_bins: n,
+        x0: 0.0, y0: 0.0, bin_w: 1.0, bin_h: 1.0,
+        occupancy: mem_alloc_f64(n as i64, "ratemap occupancy"),
+        spikes: mem_alloc_f64(n as i64, "ratemap spikes"),
+        rate: mem_alloc_f64(n as i64, "ratemap rate"),
+        total_time: 0.0,
+        total_spikes: 0.0,
+        pop_kind: -1,
+        cell: -1,
+        min_time: 0.0,
+        finished: false
+    }
+    return m
+}
+
+export function ratemap_destroy(m: ptr<RateMap>) -> void {
+    mem_release(m.occupancy as ptr<void>)
+    mem_release(m.spikes as ptr<void>)
+    mem_release(m.rate as ptr<void>)
+    m.occupancy = null
+    m.spikes = null
+    m.rate = null
+}
+
+export function ratemap_ready(m: ptr<RateMap>) -> bool {
+    return m.occupancy != null and m.spikes != null and m.rate != null
+}
+
+# Lay the map over an arena and clear it.
+export function ratemap_begin(m: ptr<RateMap>, e: ptr<Env>, pop_kind: i32,
+                              cell: i32) -> void {
+    if !ratemap_ready(m) { return }
+    m.x0 = e.x0
+    m.y0 = e.y0
+    m.bin_w = env_width(e) / (m.nx as f64)
+    m.bin_h = env_height(e) / (m.ny as f64)
+    m.pop_kind = pop_kind
+    m.cell = cell
+    m.total_time = 0.0
+    m.total_spikes = 0.0
+    m.finished = false
+    for k in 0 to m.n_bins {
+        m.occupancy[k] = 0.0
+        m.spikes[k] = 0.0
+        m.rate[k] = 0.0
+    }
+}
+
+export function ratemap_bin_of(m: ptr<RateMap>, x: f64, y: f64) -> i32 {
+    if m.bin_w <= 0.0 or m.bin_h <= 0.0 { return 0 }
+    let mut bx: i32 = ((x - m.x0) / m.bin_w) as i32
+    let mut by: i32 = ((y - m.y0) / m.bin_h) as i32
+    if bx < 0 { bx = 0 }
+    if by < 0 { by = 0 }
+    if bx >= m.nx { bx = m.nx - 1 }
+    if by >= m.ny { by = m.ny - 1 }
+    return by * m.nx + bx
+}
+
+export function ratemap_center(m: ptr<RateMap>, bin: i32, x_out: ptr<f64>,
+                               y_out: ptr<f64>) -> void {
+    let bx: i32 = bin % m.nx
+    let by: i32 = bin / m.nx
+    x_out[0] = m.x0 + ((bx as f64) + 0.5) * m.bin_w
+    y_out[0] = m.y0 + ((by as f64) + 0.5) * m.bin_h
+}
+
+# One sample: the animal was here for dt seconds and fired this many spikes.
+export function ratemap_sample(m: ptr<RateMap>, x: f64, y: f64, dt: f64,
+                               spikes: f64) -> void {
+    if !ratemap_ready(m) { return }
+    let b: i32 = ratemap_bin_of(m, x, y)
+    m.occupancy[b] = m.occupancy[b] + dt
+    m.spikes[b] = m.spikes[b] + spikes
+    m.total_time = m.total_time + dt
+    m.total_spikes = m.total_spikes + spikes
+}
+
+# Divide through. A bin with less than `min_time` of occupancy is left with a
+# rate of zero and must be treated as unvisited by everything downstream,
+# which is what ratemap_visited is for.
+export function ratemap_finish(m: ptr<RateMap>, min_time: f64) -> void {
+    if !ratemap_ready(m) { return }
+    for k in 0 to m.n_bins {
+        if m.occupancy[k] >= min_time and m.occupancy[k] > 0.0 {
+            m.rate[k] = m.spikes[k] / m.occupancy[k]
+        } else {
+            m.rate[k] = 0.0
+        }
+    }
+    m.min_time = min_time
+    m.finished = true
+}
+
+export function ratemap_visited(m: ptr<RateMap>, bin: i32) -> bool {
+    if bin < 0 or bin >= m.n_bins { return false }
+    return m.occupancy[bin] >= m.min_time and m.occupancy[bin] > 0.0
+}
+
+export function ratemap_rate(m: ptr<RateMap>, bin: i32) -> f64 {
+    if bin < 0 or bin >= m.n_bins { return 0.0 }
+    return m.rate[bin]
+}
+
+# How much of the arena the run actually covered. A map built from a run that
+# saw a third of the room is not a map, and every score below is worthless
+# without this number next to it.
+export function ratemap_coverage(m: ptr<RateMap>) -> f64 {
+    if m.n_bins <= 0 { return 0.0 }
+    let mut n: i32 = 0
+    for k in 0 to m.n_bins {
+        if ratemap_visited(m, k) { n = n + 1 }
+    }
+    return (n as f64) / (m.n_bins as f64)
+}
+
+export function ratemap_peak(m: ptr<RateMap>) -> f64 {
+    let mut p: f64 = 0.0
+    for k in 0 to m.n_bins {
+        if ratemap_visited(m, k) and m.rate[k] > p { p = m.rate[k] }
+    }
+    return p
+}
+
+# The bin with the highest measured rate, which is where a field is if there
+# is one.
+export function ratemap_peak_bin(m: ptr<RateMap>) -> i32 {
+    let mut p: f64 = -1.0
+    let mut b: i32 = -1
+    for k in 0 to m.n_bins {
+        if ratemap_visited(m, k) and m.rate[k] > p {
+            p = m.rate[k]
+            b = k
+        }
+    }
+    return b
+}
+
+# Occupancy-weighted mean rate. The right mean for this: an unweighted one
+# would let the bins the animal barely visited count as much as the ones it
+# lived in.
+export function ratemap_mean(m: ptr<RateMap>) -> f64 {
+    let mut num: f64 = 0.0
+    let mut den: f64 = 0.0
+    for k in 0 to m.n_bins {
+        if ratemap_visited(m, k) {
+            num = num + m.occupancy[k] * m.rate[k]
+            den = den + m.occupancy[k]
+        }
+    }
+    if den <= 0.0 { return 0.0 }
+    return num / den
+}

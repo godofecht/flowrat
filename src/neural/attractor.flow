@@ -1,0 +1,1089 @@
+# Continuous attractor network.
+#
+# The recurrent population evolves as
+#
+#   tau * dr/dt = -r + phi( W r + I )
+#
+# with r the rate vector, W recurrent connectivity, I external drive and phi
+# a rectifying nonlinearity. Integrated by explicit Euler into a second
+# buffer, so every cell sees the same pre-step state and the result cannot
+# depend on the order the cells were visited. That is what makes the update
+# safe under `parallel for`.
+#
+# CONNECTIVITY: LOCAL EXCITATION PLUS GLOBAL INHIBITION
+#   W is never stored as a matrix. A dense W for a 64 x 64 sheet is
+#   4096 x 4096 doubles, 134 MB, and 16.7 million multiply-adds per step.
+#   On a torus it is also entirely redundant: the weight between two cells
+#   depends only on the vector between them.
+#
+#   So the excitatory part is a small Gaussian kernel over that difference
+#   vector, evaluated once at build time, and the update is a local gather.
+#   The inhibitory part is uniform, and a uniform term does not need a kernel
+#   at all: subtracting w_global times the mean rate is one reduction per
+#   step and is exact.
+#
+#   That split matters for more than speed. The first version of this file
+#   put both halves in the local kernel as a difference of Gaussians, and the
+#   broad inhibitory Gaussian was cut off by the kernel radius. The truncated
+#   surround left the lattice modes unstable, the network filled with ripple
+#   instead of a bump, and no amount of gain tuning fixed it. Splitting the
+#   two puts the inhibition where it belongs: at the one spatial frequency it
+#   actually acts on.
+#
+#   Cost for a 32 x 32 sheet at radius 9: 361 taps per cell rather than 1024,
+#   and 8 KB of kernel rather than 8 MB of matrix. The dense form is still
+#   built by can_build_dense, and the validation entry point uses it to
+#   confirm the structured path computes the same thing. It is a correctness
+#   reference and is never on a live path.
+#
+# STABILITY IS SET, NOT GUESSED
+#   With a rectifying nonlinearity the dynamics are linear wherever activity
+#   is positive, so the spectrum of the recurrent operator decides
+#   everything. A translation-invariant kernel on a torus makes that operator
+#   circulant, and the eigenvalues of a circulant matrix are exactly the
+#   discrete Fourier transform of its kernel. can_normalise_kernel computes
+#   that transform and scales the kernel so the largest non-uniform
+#   eigenvalue lands on gain_target. Just above one, the flat state is
+#   unstable, a bump grows, and the saturating nonlinearity stops it.
+#
+#   The uniform mode is handled separately by w_global, which is solved for
+#   so the DC eigenvalue lands on dc_gain. Below one there, the network
+#   cannot run away uniformly.
+#
+# HOW THE BUMP MOVES
+#   Following Burak and Fiete, each cell has a preferred direction and its
+#   outgoing kernel is shifted one lattice step that way. Cells then push the
+#   bump in their preferred direction in proportion to how hard the velocity
+#   input drives them. Four preferred directions assigned by the parity of
+#   row and column make the shifts cancel exactly when the rat is still, so
+#   the bump sits. The same machinery in one dimension with two preferred
+#   directions is a head-direction ring, so both networks are this one file
+#   with ny = 1.
+#
+# SINGLE BUMP OR LATTICE
+#   sigma_excite decides how many bumps fit. Wide enough and only the
+#   lowest spatial frequency is unstable, giving one bump whose position
+#   codes the rat's position: that is the default, and it is what makes the
+#   attractor view readable and path integration measurable. Narrow it and
+#   higher frequencies go unstable too, the sheet breaks into a lattice of
+#   bumps, and the network is in the grid-cell regime. Both are reachable
+#   from the control panel. The position decode below is only meaningful in
+#   the single-bump regime, and bump_strength is what says which regime the
+#   network is in.
+#
+# ANCHORING
+#   Path integration drifts. An optional sensory input pins the bump to the
+#   rat's true state at an adjustable strength. At zero the network
+#   integrates velocity alone and the drift shows up in the decode error,
+#   which is the honest way to show what a continuous attractor does and does
+#   not give you.
+
+extern {
+    function exp(x: f64) -> f64
+    function sqrt(x: f64) -> f64
+    function cos(x: f64) -> f64
+    function sin(x: f64) -> f64
+    function atan2(y: f64, x: f64) -> f64
+    function fabs(x: f64) -> f64
+}
+
+export const CAN_RING: i32 = 0
+export const CAN_SHEET: i32 = 1
+
+export const PHI_RELU: i32 = 0
+export const PHI_SATURATING: i32 = 1
+export const PHI_TANH: i32 = 2
+
+# Largest network the dense reference will build. 2048 cells is a 32 MB
+# matrix, a reasonable ceiling for something that exists only to check the
+# fast path.
+export const CAN_DENSE_MAX: i32 = 2048
+
+export struct Can {
+    kind: i32,
+    nx: i32,
+    ny: i32,
+    n: i32,
+
+    r: ptr<f64>,
+    r_next: ptr<f64>,
+    inp: ptr<f64>,
+
+    tau: f64,
+    phi_kind: i32,
+    phi_gain: f64,
+    phi_sat: f64,
+
+    # Excitatory kernel: n_dirs blocks, each a (2 * radius + 1)^dim window
+    # indexed by the toroidal difference vector.
+    radius: i32,
+    kern_w: i32,
+    kern_size: i32,
+    n_dirs: i32,
+    kern: ptr<f64>,
+    # Kernels merged by target parity, and wrap tables. See can_build_tables.
+    mkern: ptr<f64>,
+    wrapx: ptr<i32>,
+    wrapy: ptr<i32>,
+
+    sigma_excite: f64,
+    shift: f64,
+
+    # Eigenvalue targets. gain_target is the largest non-uniform eigenvalue,
+    # dc_gain the uniform one. w_global is solved for, not set.
+    gain_target: f64,
+    dc_gain: f64,
+    w_global: f64,
+    # Diagnostics from the last kernel build.
+    lambda_bump: f64,
+    lambda_second: f64,
+    kernel_scale: f64,
+    # Fingerprint of the parameters the velocity calibration depends on.
+    # Calibration costs a couple of thousand steps, and a reset does not
+    # change any of them, so repeating it on every reset is two seconds of
+    # nothing.
+    calib_sig: f64,
+
+    base_input: f64,
+    velocity_gain: f64,
+    anchor_gain: f64,
+    anchor_sigma: f64,
+    # Metres of arena per cell of the sheet. Sets the spatial period the
+    # bump wraps at, the way module spacing does for analytic grid cells.
+    scale: f64,
+
+    dense: ptr<f64>,
+    has_dense: bool,
+    use_dense: bool,
+
+    bump_x: f64,
+    bump_y: f64,
+    bump_strength: f64,
+    mean_rate: f64,
+    max_rate: f64,
+}
+
+# --- construction ----------------------------------------------------------
+
+# Kernel radius for a given excitatory width.
+#
+# Truncating a Gaussian inside about two sigma turns it into a box, and a box
+# kernel's spectrum has side lobes that put higher spatial modes back above
+# one. The kernel then stops selecting a single bump however the gain is
+# tuned. So the radius follows the width rather than being a fixed number,
+# capped only by the size of the torus, where a radius of half the sheet
+# already reaches every cell.
+#
+# The consequence is worth stating plainly: a single-bump sheet needs
+# sigma near a fifth of its width, so its kernel covers most of the sheet and
+# the structured form saves memory rather than arithmetic. The arithmetic
+# saving arrives in the lattice regime, where a narrow sigma both makes
+# several bumps and makes the kernel genuinely local. Both regimes are
+# measured in bench.flow.
+export function can_radius_for(n: i32, sigma: f64) -> i32 {
+    let mut r: i32 = ((sigma * 2.2) as i32) + 1
+    if r < 3 { r = 3 }
+    # The window is 2r + 1 wide and must not exceed the torus. Wider than
+    # that, two taps land on the same source cell and its contribution is
+    # counted twice, which is not what the weight matrix says and shows up
+    # immediately as a mismatch against the dense reference.
+    let cap: i32 = (n - 1) / 2
+    if r > cap { r = cap }
+    return r
+}
+
+# Rebuild a network at a new excitatory width: the radius, the kernel tables
+# and the velocity calibration all follow from it. Reallocates the kernel,
+# so the old one is released first.
+export function can_set_sigma(c: ptr<Can>, sigma: f64, dt: f64) -> void {
+    let r: i32 = can_radius_for(c.nx, sigma)
+    c.sigma_excite = sigma
+    if r != c.radius {
+        mem_release(c.kern as ptr<void>)
+        mem_release(c.mkern as ptr<void>)
+        mem_release(c.wrapx as ptr<void>)
+        mem_release(c.wrapy as ptr<void>)
+        c.radius = r
+        c.kern_w = 2 * r + 1
+        if c.kind == CAN_SHEET {
+            c.kern_size = c.kern_w * c.kern_w
+        } else {
+            c.kern_size = c.kern_w
+        }
+        let bytes: i64 = (c.kern_size as i64) * (c.n_dirs as i64) * 8
+        c.kern = mem_alloc(bytes, "attractor state") as ptr<f64>
+        c.mkern = mem_alloc(bytes, "attractor state") as ptr<f64>
+        c.wrapx = mem_alloc((c.nx as i64) * (c.kern_w as i64) * 4, "attractor state") as ptr<i32>
+        c.wrapy = mem_alloc((c.ny as i64) * (c.kern_w as i64) * 4, "attractor state") as ptr<i32>
+    }
+    can_build_kernel(c)
+}
+
+function can_alloc(kind: i32, nx: i32, ny: i32, radius: i32) -> Can {
+    let n: i32 = nx * ny
+    let kw: i32 = 2 * radius + 1
+    let mut ks: i32 = kw
+    let mut nd: i32 = 2
+    if kind == CAN_SHEET {
+        ks = kw * kw
+        nd = 4
+    }
+    let mut c: Can = Can {
+        kind: kind, nx: nx, ny: ny, n: n,
+        r: null, r_next: null, inp: null,
+        tau: 0.03, phi_kind: PHI_SATURATING, phi_gain: 1.0, phi_sat: 10.0,
+        radius: radius, kern_w: kw, kern_size: ks, n_dirs: nd, kern: null,
+        mkern: null, wrapx: null, wrapy: null,
+        sigma_excite: 3.0, shift: 1.0,
+        gain_target: 1.12, dc_gain: -0.6, w_global: 0.0,
+        lambda_bump: 0.0, lambda_second: 0.0, kernel_scale: 1.0,
+        calib_sig: -1.0,
+        base_input: 0.5, velocity_gain: 0.5,
+        anchor_gain: 0.35, anchor_sigma: 2.0, scale: 0.05,
+        dense: null, has_dense: false, use_dense: false,
+        bump_x: 0.0, bump_y: 0.0, bump_strength: 0.0,
+        mean_rate: 0.0, max_rate: 0.0
+    }
+    c.r = mem_alloc((n as i64) * 8, "attractor state") as ptr<f64>
+    c.r_next = mem_alloc((n as i64) * 8, "attractor state") as ptr<f64>
+    c.inp = mem_alloc((n as i64) * 8, "attractor state") as ptr<f64>
+    c.kern = mem_alloc((ks as i64) * (nd as i64) * 8, "attractor state") as ptr<f64>
+    c.mkern = mem_alloc((ks as i64) * (nd as i64) * 8, "attractor state") as ptr<f64>
+    c.wrapx = mem_alloc((nx as i64) * (kw as i64) * 4, "attractor state") as ptr<i32>
+    c.wrapy = mem_alloc((ny as i64) * (kw as i64) * 4, "attractor state") as ptr<i32>
+    for i in 0 to n {
+        c.r[i] = 0.0
+        c.r_next[i] = 0.0
+        c.inp[i] = 0.0
+    }
+    return c
+}
+
+# Head-direction ring. The excitatory width is a large fraction of the ring
+# so that only one cycle fits and the network holds a single bump, which is
+# what a head-direction code is.
+export function can_params_ring(n: i32) -> Can {
+    let mut c: Can = can_alloc(CAN_RING, n, 1,
+                               can_radius_for(n, (n as f64) / 4.0))
+    # A quarter of the ring. Wide enough that the second harmonic sits far
+    # below one, so exactly one bump forms, and wide enough that the bump is
+    # not pinned to individual cells: a narrow bump needs a minimum drive
+    # before it will move at all, and that threshold shows up directly as
+    # lost tracking at slow turn rates.
+    c.sigma_excite = (n as f64) / 4.0
+    c.tau = 0.030
+    # How far a cell's outgoing kernel is displaced along its preferred
+    # direction. This is what sets the largest turn rate the ring can follow.
+    # At a shift of one cell the bump falls apart above about 1.4 rad/s; at
+    # n/13 it tracks to 5 rad/s within 3 per cent, because the same bump
+    # speed is then reached with a much smaller input modulation and the
+    # opposing cells are never driven near silence. Measured, not assumed:
+    # the sweep is in docs/validation.md.
+    c.shift = (n as f64) / 13.0
+    c.base_input = 0.5
+    # Overwritten by can_calibrate_ring. The value here only has to be close
+    # enough for the calibration's first probe to move the bump.
+    c.velocity_gain = 0.20
+    c.anchor_gain = 0.5
+    c.anchor_sigma = (n as f64) / 24.0
+    c.gain_target = 1.8
+    c.dc_gain = -0.8
+    c.phi_sat = 12.0
+    c.scale = 1.0
+    return c
+}
+
+# Position sheet. sigma_excite is a little under an eighth of the sheet,
+# which puts the second spatial harmonic below one and leaves a single bump.
+export function can_params_sheet(nx: i32, ny: i32) -> Can {
+    let mut c: Can = can_alloc(CAN_SHEET, nx, ny,
+                               can_radius_for(nx, (nx as f64) / 5.0))
+    # A fifth of the sheet. Measured, not guessed: at this width the (1,1)
+    # eigenvalue lands at 0.93 with the leading mode at 1.9, so the second
+    # spatial harmonic stays stable and the sheet holds one bump. Narrowing
+    # it pushes (1,1) above one and the sheet breaks into a lattice, which is
+    # the grid regime and is reachable from the control panel.
+    c.sigma_excite = (nx as f64) / 5.0
+    c.tau = 0.030
+    # See the note on the ring's shift. At nx / 8 the sheet tracks from 0.5
+    # to 10 cells per second within 2 per cent.
+    c.shift = (nx as f64) / 8.0
+    c.base_input = 0.5
+    # Overwritten by can_calibrate_sheet.
+    c.velocity_gain = 0.26
+    c.anchor_gain = 0.35
+    c.anchor_sigma = (nx as f64) / 16.0
+    c.gain_target = 1.9
+    c.dc_gain = -0.8
+    c.phi_sat = 10.0
+    # Reset from the arena's size by sim_reset, so one trip across the sheet
+    # is one trip across the arena.
+    c.scale = 0.0625
+    return c
+}
+
+export function can_destroy(c: ptr<Can>) -> void {
+    mem_release(c.r as ptr<void>)
+    mem_release(c.r_next as ptr<void>)
+    mem_release(c.inp as ptr<void>)
+    mem_release(c.kern as ptr<void>)
+    mem_release(c.mkern as ptr<void>)
+    mem_release(c.wrapx as ptr<void>)
+    mem_release(c.wrapy as ptr<void>)
+    if c.has_dense { mem_release(c.dense as ptr<void>) }
+}
+
+# --- preferred directions --------------------------------------------------
+
+# The sheet hands out the four cardinal directions on a 2 x 2 checkerboard,
+# which is the arrangement that makes the shifts cancel exactly when the rat
+# is still. The ring alternates left and right.
+export function can_dir_index(c: ptr<Can>, i: i32) -> i32 {
+    if c.kind == CAN_RING { return i % 2 }
+    let col: i32 = i % c.nx
+    let row: i32 = i / c.nx
+    return (col % 2) + 2 * (row % 2)
+}
+
+export function can_dir_dx(c: ptr<Can>, d: i32) -> f64 {
+    if c.kind == CAN_RING {
+        if d == 0 { return 1.0 }
+        return -1.0
+    }
+    if d == 0 { return 1.0 }
+    if d == 1 { return -1.0 }
+    return 0.0
+}
+
+export function can_dir_dy(c: ptr<Can>, d: i32) -> f64 {
+    if c.kind == CAN_RING { return 0.0 }
+    if d == 2 { return 1.0 }
+    if d == 3 { return -1.0 }
+    return 0.0
+}
+
+# --- kernel ----------------------------------------------------------------
+
+function excite(c: ptr<Can>, dx: f64, dy: f64) -> f64 {
+    let s: f64 = c.sigma_excite
+    return exp(-(dx * dx + dy * dy) / (2.0 * s * s))
+}
+
+# Build one kernel block per preferred direction, each shifted by `shift`
+# lattice steps along that direction, then set the overall scale and the
+# global inhibition from the eigenvalue targets.
+export function can_build_kernel(c: ptr<Can>) -> void {
+    let R: i32 = c.radius
+    let kw: i32 = c.kern_w
+    for d in 0 to c.n_dirs {
+        let sx: f64 = can_dir_dx(c, d) * c.shift
+        let sy: f64 = can_dir_dy(c, d) * c.shift
+        let block: i32 = d * c.kern_size
+        if c.kind == CAN_RING {
+            for a in 0 to kw {
+                let dx: f64 = (a - R) as f64
+                c.kern[block + a] = excite(c, dx - sx, 0.0)
+            }
+        } else {
+            for b in 0 to kw {
+                let dy: f64 = (b - R) as f64
+                for a in 0 to kw {
+                    let dx: f64 = (a - R) as f64
+                    c.kern[block + b * kw + a] = excite(c, dx - sx, dy - sy)
+                }
+            }
+        }
+    }
+    can_normalise_kernel(c)
+    can_build_tables(c)
+    # The kernel decides how far the bump travels for a given drive, so the
+    # calibration that matched them no longer holds.
+    c.calib_sig = -1.0
+}
+
+# Precompute everything the inner loop would otherwise recompute per tap.
+#
+# THE PROBLEM
+#   The obvious gather reads, for every tap, a wrapped source index and that
+#   source's preferred direction. Written directly that is a modulo for the
+#   wrap and, inside can_dir_index, a divide and two more modulos. Three
+#   integer divisions per multiply-add, on the innermost loop of the whole
+#   program. Measured against the dense matrix it was slower, despite doing a
+#   fifth of the arithmetic: the dense version's inner loop is a clean
+#   streaming dot product and the structured one was drowning in address
+#   arithmetic.
+#
+# THE FIX
+#   Two observations remove all of it.
+#
+#   First, the wrapped index depends only on the target's row or column and
+#   the tap offset, so the whole nx-by-kw table of them is built once.
+#
+#   Second, a source cell's preferred direction depends only on the parity of
+#   its row and column, and the source's parity is the target's parity
+#   flipped by the tap offset's parity. So the direction a tap will need is a
+#   function of the target's parity and the tap position, both known without
+#   touching memory. That means the four direction kernels can be merged into
+#   four parity kernels: the loop picks one by the target's parity and then
+#   reads it straight through, with no per-tap lookup at all.
+#
+#   What is left in the inner loop is two table loads and a multiply-add.
+export function can_build_tables(c: ptr<Can>) -> void {
+    let R: i32 = c.radius
+    let kw: i32 = c.kern_w
+    let nx: i32 = c.nx
+    let ny: i32 = c.ny
+
+    for col in 0 to nx {
+        for a in 0 to kw {
+            c.wrapx[col * kw + a] = (col - (a - R) + nx * 2 * kw) % nx
+        }
+    }
+    for row in 0 to ny {
+        for b in 0 to kw {
+            c.wrapy[row * kw + b] = (row - (b - R) + ny * 2 * kw) % ny
+        }
+    }
+
+    if c.kind == CAN_RING {
+        for p in 0 to 2 {
+            for a in 0 to kw {
+                # Source column parity is the target's, flipped by the tap
+                # offset's parity.
+                let d: i32 = (p + a + R) % 2
+                c.mkern[p * c.kern_size + a] = c.kern[d * c.kern_size + a]
+            }
+        }
+        return
+    }
+
+    for p in 0 to 4 {
+        let pc: i32 = p % 2
+        let pr: i32 = p / 2
+        for b in 0 to kw {
+            for a in 0 to kw {
+                let d: i32 = ((pc + a + R) % 2) + 2 * (((pr + b + R) % 2))
+                c.mkern[p * c.kern_size + b * kw + a] =
+                    c.kern[d * c.kern_size + b * kw + a]
+            }
+        }
+    }
+}
+
+# Scale the kernel so the largest non-uniform eigenvalue equals gain_target,
+# then solve for the global inhibition that puts the uniform eigenvalue at
+# dc_gain.
+#
+# The transform is taken over the unshifted kernel. A per-direction shift is
+# a translation, which changes the phase of each Fourier coefficient and not
+# its magnitude, so it cannot move the stability boundary.
+#
+# lambda_second is reported alongside. On a square sheet the leading mode is
+# degenerate: (1,0) and (0,1) have identical eigenvalues, and a bump needs
+# both. So the useful diagnostic is the largest eigenvalue strictly below the
+# leading one, which on this kernel is the (1,1) mode. That is the number to
+# watch: above one, extra bumps appear and the sheet moves from a single-bump
+# position code into the grid regime.
+export function can_normalise_kernel(c: ptr<Can>) -> void {
+    let R: i32 = c.radius
+    let kw: i32 = c.kern_w
+    let nxf: f64 = c.nx as f64
+    let nyf: f64 = c.ny as f64
+
+    let mut dc: f64 = 0.0
+    let mut best: f64 = -1000000.0
+    let mut second: f64 = -1000000.0
+
+    if c.kind == CAN_RING {
+        for a in 0 to kw {
+            dc = dc + excite(c, (a - R) as f64, 0.0)
+        }
+        for m in 1 to c.nx {
+            let w: f64 = TAU * (m as f64) / nxf
+            let mut re: f64 = 0.0
+            for a in 0 to kw {
+                let dx: f64 = (a - R) as f64
+                re = re + excite(c, dx, 0.0) * cos(w * dx)
+            }
+            if re > best + 0.000001 {
+                second = best
+                best = re
+            } else {
+                if re < best - 0.000001 and re > second { second = re }
+            }
+        }
+    } else {
+        for b in 0 to kw {
+            for a in 0 to kw {
+                dc = dc + excite(c, (a - R) as f64, (b - R) as f64)
+            }
+        }
+        for my in 0 to c.ny {
+            for mx in 0 to c.nx {
+                if mx != 0 or my != 0 {
+                    let wx: f64 = TAU * (mx as f64) / nxf
+                    let wy: f64 = TAU * (my as f64) / nyf
+                    let mut re: f64 = 0.0
+                    for b in 0 to kw {
+                        let dy: f64 = (b - R) as f64
+                        for a in 0 to kw {
+                            let dx: f64 = (a - R) as f64
+                            re = re + excite(c, dx, dy)
+                                 * cos(wx * dx + wy * dy)
+                        }
+                    }
+                    if re > best + 0.000001 {
+                        second = best
+                        best = re
+                    } else {
+                        if re < best - 0.000001 and re > second {
+                            second = re
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if best < 0.000001 {
+        c.kernel_scale = 1.0
+        c.w_global = 0.0
+        return
+    }
+    let scale: f64 = c.gain_target / best
+    c.kernel_scale = scale
+    c.lambda_bump = c.gain_target
+    c.lambda_second = second * scale
+
+    let total: i32 = c.kern_size * c.n_dirs
+    for i in 0 to total {
+        c.kern[i] = c.kern[i] * scale
+    }
+
+    # The uniform mode sees the whole kernel sum minus the global term, so
+    # w_global is whatever moves it from dc * scale down to dc_gain.
+    c.w_global = dc * scale - c.dc_gain
+}
+
+# --- dynamics --------------------------------------------------------------
+
+function phi(c: ptr<Can>, x: f64) -> f64 {
+    let v: f64 = x * c.phi_gain
+    if v <= 0.0 { return 0.0 }
+    if c.phi_kind == PHI_SATURATING {
+        # Rectified hyperbola: linear near zero, approaching phi_sat.
+        return c.phi_sat * v / (c.phi_sat + v)
+    }
+    if c.phi_kind == PHI_TANH {
+        let e2: f64 = exp(-2.0 * v / c.phi_sat)
+        return c.phi_sat * (1.0 - e2) / (1.0 + e2)
+    }
+    return v
+}
+
+export function can_reset(c: ptr<Can>, seed: u32) -> void {
+    # Small positive noise. A network started at exactly zero has nothing for
+    # the recurrence to amplify and would stay flat, so no bump would form.
+    for i in 0 to c.n {
+        c.r[i] = 0.10 + 0.10 * rng_u01(seed, 30011, (i as u32) + 1)
+        c.r_next[i] = c.r[i]
+        c.inp[i] = c.base_input
+    }
+    c.bump_x = 0.0
+    c.bump_y = 0.0
+    c.bump_strength = 0.0
+}
+
+export function can_mean(c: ptr<Can>) -> f64 {
+    let mut s: f64 = 0.0
+    for i in 0 to c.n {
+        s = s + c.r[i]
+    }
+    return s / (c.n as f64)
+}
+
+# One Euler step of the dynamics with structured connectivity.
+#
+# This is the kernel the whole module exists for. Reads are a local gather
+# over a fixed window of the previous state plus one shared scalar; writes go
+# to a separate buffer. The loop is parallel over target cells with no
+# dependencies between them, which is what a GPU port would map to one thread
+# per cell.
+export function can_step(c: ptr<Can>, dt: f64) -> void {
+    if c.use_dense and c.has_dense {
+        can_step_dense(c, dt)
+        return
+    }
+    let R: i32 = c.radius
+    let kw: i32 = c.kern_w
+    let nx: i32 = c.nx
+    let ny: i32 = c.ny
+    let k: f64 = dt / c.tau
+    # One reduction, then every cell subtracts the same number. This is the
+    # entire inhibitory half of the connectivity.
+    let inhib: f64 = c.w_global * can_mean(c)
+
+    if c.kind == CAN_RING {
+        parallel for i in 0 to c.n {
+            let mk: i32 = (i % 2) * c.kern_size
+            let wx: i32 = i * kw
+            let mut s: f64 = 0.0
+            for a in 0 to kw {
+                s = s + c.mkern[mk + a] * c.r[c.wrapx[wx + a]]
+            }
+            let target: f64 = phi(c, s - inhib + c.inp[i])
+            c.r_next[i] = c.r[i] + k * (target - c.r[i])
+        }
+    } else {
+        parallel for i in 0 to c.n {
+            let col: i32 = i % nx
+            let row: i32 = i / nx
+            let mk: i32 = ((col % 2) + 2 * (row % 2)) * c.kern_size
+            let wx: i32 = col * kw
+            let wy: i32 = row * kw
+            let mut s: f64 = 0.0
+            for b in 0 to kw {
+                let rowbase: i32 = c.wrapy[wy + b] * nx
+                let krow: i32 = mk + b * kw
+                for a in 0 to kw {
+                    s = s + c.mkern[krow + a] * c.r[rowbase + c.wrapx[wx + a]]
+                }
+            }
+            let target: f64 = phi(c, s - inhib + c.inp[i])
+            c.r_next[i] = c.r[i] + k * (target - c.r[i])
+        }
+    }
+
+    can_swap(c)
+}
+
+function can_swap(c: ptr<Can>) -> void {
+    let tmp: ptr<f64> = c.r
+    c.r = c.r_next
+    c.r_next = tmp
+}
+
+# --- drive -----------------------------------------------------------------
+
+# Shortest signed difference on a ring of circumference n.
+export function torus_delta(a: f64, b: f64, n: f64) -> f64 {
+    let mut d: f64 = a - b
+    while d > n * 0.5 { d = d - n }
+    while d < -n * 0.5 { d = d + n }
+    return d
+}
+
+# I_i = base * max(0, 1 + velocity_gain * (v . e_i))
+#
+# A cell whose preferred direction agrees with the movement is driven harder
+# and pushes the bump that way; a cell pointing the other way is driven less.
+# That asymmetry is what carries the bump, and the clamp is what stops the
+# opposing half of the network being driven to silence at high speed.
+#
+# Velocity arrives in cells per second, the sheet's own units.
+export function can_set_input_sheet(c: ptr<Can>, vx: f64, vy: f64,
+                                    anchor_x: f64, anchor_y: f64,
+                                    anchor_on: bool) -> void {
+    let g: f64 = c.velocity_gain
+    let base: f64 = c.base_input
+    parallel for i in 0 to c.n {
+        let d: i32 = can_dir_index(c, i)
+        let ex: f64 = can_dir_dx(c, d)
+        let ey: f64 = can_dir_dy(c, d)
+        let mut m: f64 = 1.0 + g * (vx * ex + vy * ey)
+        # Never let a cell's drive go negative. Beyond that point the
+        # opposing half of the network stops firing and the bump it was
+        # holding up falls apart, which showed up as bump_strength dropping
+        # to zero at high speed. Clamping costs the linearity of the
+        # response up there and keeps the bump, which is the better trade:
+        # a bump that lags is still a position estimate, a bump that has
+        # dissolved is not.
+        if m < 0.0 { m = 0.0 }
+        c.inp[i] = base * m
+    }
+    if anchor_on and c.anchor_gain > 0.0 {
+        let cxw: f64 = anchor_x / c.scale
+        let cyw: f64 = anchor_y / c.scale
+        let sig: f64 = c.anchor_sigma
+        for i in 0 to c.n {
+            let col: f64 = (i % c.nx) as f64
+            let row: f64 = (i / c.nx) as f64
+            let dx: f64 = torus_delta(col, cxw, c.nx as f64)
+            let dy: f64 = torus_delta(row, cyw, c.ny as f64)
+            let d2: f64 = dx * dx + dy * dy
+            c.inp[i] = c.inp[i] + c.anchor_gain * base
+                       * exp(-d2 / (2.0 * sig * sig))
+        }
+    }
+}
+
+export function can_set_input_ring(c: ptr<Can>, ang_vel: f64,
+                                   heading: f64, anchor_on: bool) -> void {
+    let g: f64 = c.velocity_gain
+    let base: f64 = c.base_input
+    parallel for i in 0 to c.n {
+        let ex: f64 = can_dir_dx(c, can_dir_index(c, i))
+        let mut m: f64 = 1.0 + g * ang_vel * ex
+        if m < 0.0 { m = 0.0 }
+        c.inp[i] = base * m
+    }
+    if anchor_on and c.anchor_gain > 0.0 {
+        # Cell 0 is heading -pi and cell n is +pi.
+        let target: f64 = (heading + PI) / TAU * (c.n as f64)
+        let sig: f64 = c.anchor_sigma
+        for i in 0 to c.n {
+            let d: f64 = torus_delta(i as f64, target, c.n as f64)
+            c.inp[i] = c.inp[i] + c.anchor_gain * base
+                       * exp(-d * d / (2.0 * sig * sig))
+        }
+    }
+}
+
+export function can_set_input_flat(c: ptr<Can>) -> void {
+    for i in 0 to c.n {
+        c.inp[i] = c.base_input
+    }
+}
+
+# --- readout ---------------------------------------------------------------
+
+# Locate the bump by a circular centre of mass, the right average on a torus:
+# a plain mean of indices would place a bump straddling the seam in the
+# middle of the sheet.
+#
+# bump_strength is the resultant length of that average. Near one means a
+# single tight bump and the position estimate is trustworthy. Near zero means
+# activity is spread out or has broken into several bumps, and the position
+# estimate is not.
+export function can_decode(c: ptr<Can>) -> void {
+    let mut sxr: f64 = 0.0
+    let mut sxi: f64 = 0.0
+    let mut syr: f64 = 0.0
+    let mut syi: f64 = 0.0
+    let mut total: f64 = 0.0
+    let mut mx: f64 = 0.0
+    let nxf: f64 = c.nx as f64
+    let nyf: f64 = c.ny as f64
+    for i in 0 to c.n {
+        let v: f64 = c.r[i]
+        if v > mx { mx = v }
+        total = total + v
+        let ax: f64 = ((i % c.nx) as f64) / nxf * TAU
+        sxr = sxr + v * cos(ax)
+        sxi = sxi + v * sin(ax)
+        if c.kind == CAN_SHEET {
+            let ay: f64 = ((i / c.nx) as f64) / nyf * TAU
+            syr = syr + v * cos(ay)
+            syi = syi + v * sin(ay)
+        }
+    }
+    c.max_rate = mx
+    if total < 0.000001 {
+        c.mean_rate = 0.0
+        c.bump_strength = 0.0
+        return
+    }
+    c.mean_rate = total / (c.n as f64)
+    c.bump_x = wrap_tau(atan2(sxi, sxr)) / TAU * nxf
+    let rx: f64 = sqrt(sxr * sxr + sxi * sxi) / total
+    if c.kind == CAN_SHEET {
+        c.bump_y = wrap_tau(atan2(syi, syr)) / TAU * nyf
+        let ry: f64 = sqrt(syr * syr + syi * syi) / total
+        # The weaker axis governs: a bump smeared along one direction is not
+        # a usable position estimate however tight the other axis looks.
+        if rx < ry { c.bump_strength = rx } else { c.bump_strength = ry }
+    } else {
+        c.bump_y = 0.0
+        c.bump_strength = rx
+    }
+}
+
+# Run the network with flat drive until the bump has formed, so the UI shows
+# a settled network immediately rather than several seconds of noise.
+export function can_settle(c: ptr<Can>, steps: i32, dt: f64) -> void {
+    can_set_input_flat(c)
+    for s in 0 to steps {
+        can_step(c, dt)
+    }
+    can_decode(c)
+}
+
+# Push the bump to a chosen lattice position by driving it there with a
+# strong local input. Used when the recurrent network is re-anchored to the
+# rat, and by the validation entry point to set a known starting state.
+export function can_force_bump(c: ptr<Can>, cx: f64, cy: f64,
+                               steps: i32, dt: f64) -> void {
+    let sig: f64 = c.anchor_sigma
+    for s in 0 to steps {
+        for i in 0 to c.n {
+            let col: f64 = (i % c.nx) as f64
+            let row: f64 = (i / c.nx) as f64
+            let dx: f64 = torus_delta(col, cx, c.nx as f64)
+            let mut dy: f64 = 0.0
+            if c.kind == CAN_SHEET {
+                dy = torus_delta(row, cy, c.ny as f64)
+            }
+            let d2: f64 = dx * dx + dy * dy
+            c.inp[i] = c.base_input
+                       * (1.0 + 2.0 * exp(-d2 / (2.0 * sig * sig)))
+        }
+        can_step(c, dt)
+    }
+    can_decode(c)
+}
+
+# Substeps needed to keep an explicit Euler step of `dt` stable for this time
+# constant. The ratio dt/tau is the whole story: at a half the integration is
+# comfortable, at one it is marginal, and well above one it diverges. Capped,
+# because a caller asking for an absurd timestep should get a slow answer
+# rather than an endless one.
+export function can_substeps_for(dt: f64, tau: f64) -> i32 {
+    if tau <= 0.000001 { return 64 }
+    let n: i32 = ((dt / (tau * 0.5)) as i32) + 1
+    if n < 1 { return 1 }
+    if n > 64 { return 64 }
+    return n
+}
+
+# --- velocity calibration --------------------------------------------------
+#
+# How fast the bump moves for a given drive depends on the kernel width, the
+# gain, the time constant and the nonlinearity, all of which the control panel
+# can change. Rather than derive that relationship and get it wrong, measure
+# it: drive the network at a known rate, see how far the bump actually
+# travelled, and scale velocity_gain by the ratio. Two passes are enough
+# because the response is close to linear once the bump has formed.
+#
+# The result is that path integration is metrically correct by construction.
+# When the decoded position drifts from the truth, that drift is the
+# network's, not a units error in the drive.
+
+# Travel is accumulated one step at a time rather than compared end to end.
+# A bump that laps the torus during the probe would otherwise read as a small
+# move in the opposite direction, and the correction would be applied with
+# the wrong sign. Per-step displacement is a fraction of a cell, so summing
+# it cannot alias.
+#
+# The first stretch of the drive is discarded. A bump starting from rest
+# takes a few time constants to reach its steady travel rate, and including
+# that ramp in the average makes the network look slower than it is, so the
+# calibration would then overshoot.
+function calibrate_pass(c: ptr<Can>, dt: f64, probe: f64,
+                        warmup: i32, steps: i32, is_ring: bool) -> f64 {
+    for k in 0 to warmup {
+        if is_ring {
+            can_set_input_ring(c, probe, 0.0, false)
+        } else {
+            can_set_input_sheet(c, probe, 0.0, 0.0, 0.0, false)
+        }
+        can_step(c, dt)
+    }
+    can_decode(c)
+    let mut prev: f64 = c.bump_x
+    let mut travelled: f64 = 0.0
+    for k in 0 to steps {
+        if is_ring {
+            can_set_input_ring(c, probe, 0.0, false)
+        } else {
+            can_set_input_sheet(c, probe, 0.0, 0.0, 0.0, false)
+        }
+        can_step(c, dt)
+        can_decode(c)
+        travelled = travelled + torus_delta(c.bump_x, prev, c.nx as f64)
+        prev = c.bump_x
+    }
+    let elapsed: f64 = (steps as f64) * dt
+    if elapsed < 0.000001 { return 0.0 }
+    return travelled / elapsed
+}
+
+# Calibrate the sheet so a drive of v cells per second moves the bump at v
+# cells per second.
+# Calibration results, remembered across networks.
+#
+# The velocity gain is a pure function of the signature below: the kernel's
+# shape and size, the time constant and the timestep. Nothing else enters it,
+# and in particular the reset noise decides where the bump forms but not how
+# fast it travels. So two networks built from the same parameters have the
+# same answer, and the second one does not have to spend a thousand steps
+# finding it again.
+#
+# This is what makes the validation suite bearable. It builds dozens of
+# simulations from identical defaults, and without the memo every one of them
+# paid one and three quarter seconds to arrive at the same number.
+const CALIB_MEMO_MAX: i32 = 32
+let mut memo_sig: array<f64, 32> = [0.0]
+let mut memo_gain: array<f64, 32> = [0.0]
+let mut memo_count: i32 = 0
+
+function memo_find(sig: f64) -> f64 {
+    for i in 0 to memo_count {
+        if memo_sig[i] == sig { return memo_gain[i] }
+    }
+    return -1.0
+}
+
+function memo_store(sig: f64, gain: f64) -> void {
+    for i in 0 to memo_count {
+        if memo_sig[i] == sig {
+            memo_gain[i] = gain
+            return
+        }
+    }
+    if memo_count >= CALIB_MEMO_MAX { return }
+    memo_sig[memo_count] = sig
+    memo_gain[memo_count] = gain
+    memo_count = memo_count + 1
+}
+
+function can_signature(c: ptr<Can>, dt: f64) -> f64 {
+    return c.sigma_excite * 1.0 + c.gain_target * 131.0 + c.dc_gain * 17.0
+           + c.shift * 7919.0 + c.tau * 104729.0 + (c.nx as f64) * 3.0
+           + (c.ny as f64) * 11.0 + dt * 1299709.0
+}
+
+export function can_calibrate_sheet(c: ptr<Can>, dt: f64) -> void {
+    let sig: f64 = can_signature(c, dt)
+    if c.calib_sig == sig { return }
+    c.calib_sig = sig
+    let remembered: f64 = memo_find(sig)
+    if remembered > 0.0 {
+        c.velocity_gain = remembered
+        return
+    }
+    let probe: f64 = 2.0
+    let steps: i32 = 120
+    for pass in 0 to 3 {
+        # The first pass grows the bump out of the reset noise, which takes a
+        # few hundred steps. Later passes start from a bump that already
+        # exists and only need it to re-centre after the previous probe.
+        let mut settle: i32 = 90
+        if pass == 0 { settle = 400 }
+        can_settle(c, settle, dt)
+        let measured: f64 = calibrate_pass(c, dt, probe, 60, steps, false)
+        if measured > 0.05 {
+            c.velocity_gain = c.velocity_gain * probe / measured
+        }
+    }
+    memo_store(sig, c.velocity_gain)
+}
+
+# Calibrate the ring so a drive of w radians per second turns the bump at w
+# radians per second. One turn of the ring is n cells, so the target rate in
+# cells per second is w * n / 2pi.
+export function can_calibrate_ring(c: ptr<Can>, dt: f64) -> void {
+    let sig: f64 = can_signature(c, dt)
+    if c.calib_sig == sig { return }
+    c.calib_sig = sig
+    let remembered: f64 = memo_find(sig)
+    if remembered > 0.0 {
+        c.velocity_gain = remembered
+        return
+    }
+    # Probe in the linear part of the response. Shift-driven networks have a
+    # maximum trackable rate, above which the bump falls behind the drive,
+    # and calibrating up there would bias the gain for every ordinary turn.
+    let probe: f64 = 0.8
+    let steps: i32 = 120
+    let target: f64 = probe * (c.n as f64) / TAU
+    for pass in 0 to 3 {
+        let mut settle: i32 = 90
+        if pass == 0 { settle = 400 }
+        can_settle(c, settle, dt)
+        let measured: f64 = calibrate_pass(c, dt, probe, 60, steps, true)
+        if measured > 0.05 {
+            c.velocity_gain = c.velocity_gain * target / measured
+        }
+    }
+    memo_store(sig, c.velocity_gain)
+}
+
+# --- dense reference -------------------------------------------------------
+#
+# Everything below is the O(N^2) baseline. It exists so the structured path
+# can be checked against a direct implementation of the same equations, and
+# it is never used for a live run.
+
+export function can_build_dense(c: ptr<Can>) -> bool {
+    if c.n > CAN_DENSE_MAX { return false }
+    if c.has_dense { mem_release(c.dense as ptr<void>) }
+    let total: i64 = (c.n as i64) * (c.n as i64)
+    c.dense = mem_alloc(total * 8, "attractor state") as ptr<f64>
+    c.has_dense = true
+    let nxf: f64 = c.nx as f64
+    let nyf: f64 = c.ny as f64
+    let rf: f64 = c.radius as f64
+    for j in 0 to c.n {
+        let d: i32 = can_dir_index(c, j)
+        let sx: f64 = can_dir_dx(c, d) * c.shift
+        let sy: f64 = can_dir_dy(c, d) * c.shift
+        let jcol: f64 = (j % c.nx) as f64
+        let jrow: f64 = (j / c.nx) as f64
+        for i in 0 to c.n {
+            let icol: f64 = (i % c.nx) as f64
+            let irow: f64 = (i / c.nx) as f64
+            let dx: f64 = torus_delta(icol, jcol, nxf)
+            let mut dy: f64 = 0.0
+            if c.kind == CAN_SHEET { dy = torus_delta(irow, jrow, nyf) }
+            # Outside the kernel radius the structured path contributes
+            # nothing, so the reference truncates in exactly the same place.
+            # Otherwise the two would differ by the kernel's tail and the
+            # comparison would prove nothing.
+            let mut w: f64 = 0.0
+            if fabs(dx) <= rf and fabs(dy) <= rf {
+                w = excite(c, dx - sx, dy - sy) * c.kernel_scale
+            }
+            c.dense[(i as i64) * (c.n as i64) + (j as i64)] = w
+        }
+    }
+    return true
+}
+
+export function can_step_dense(c: ptr<Can>, dt: f64) -> void {
+    let k: f64 = dt / c.tau
+    let inhib: f64 = c.w_global * can_mean(c)
+    parallel for i in 0 to c.n {
+        let row: i64 = (i as i64) * (c.n as i64)
+        let mut s: f64 = 0.0
+        for j in 0 to c.n {
+            s = s + c.dense[row + (j as i64)] * c.r[j]
+        }
+        let target: f64 = phi(c, s - inhib + c.inp[i])
+        c.r_next[i] = c.r[i] + k * (target - c.r[i])
+    }
+    can_swap(c)
+}
+
+# --- helpers ---------------------------------------------------------------
+
+export function can_max_abs_diff(a: ptr<f64>, b: ptr<f64>, n: i32) -> f64 {
+    let mut m: f64 = 0.0
+    for i in 0 to n {
+        let d: f64 = fabs(a[i] - b[i])
+        if d > m { m = d }
+    }
+    return m
+}
+
+export function can_copy_state(src: ptr<f64>, dst: ptr<f64>, n: i32) -> void {
+    for i in 0 to n {
+        dst[i] = src[i]
+    }
+}
+
+export function can_kind_name(c: ptr<Can>) -> string {
+    if c.kind == CAN_RING { return "ring" }
+    return "sheet"
+}
+
+export function can_phi_name(kind: i32) -> string {
+    if kind == PHI_SATURATING { return "saturating" }
+    if kind == PHI_TANH { return "tanh" }
+    return "relu"
+}
+
+# Taps per cell on the structured path, against cells per cell on the dense
+# path. The performance panel prints both.
+export function can_taps(c: ptr<Can>) -> i32 {
+    return c.kern_size
+}

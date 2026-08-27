@@ -1,0 +1,297 @@
+# Recording runs to disk.
+#
+# Three streams, opened together and closed together:
+#
+#   trajectory.csv  one row per rat per recorded step
+#   neural.csv      one row per recorded cell per recorded step, long format
+#   recurrent.csv   one row per recorded step, summarising both attractors
+#
+# Long format for the neural stream rather than one column per cell: the
+# number of cells changes when the operator moves a slider, and a CSV whose
+# column count changes halfway down is not a CSV. Long format also loads into
+# a dataframe without a reshape.
+#
+# WRITING
+#   Flow has no file library, so this goes through libc directly. `fprintf`
+#   is variadic in C but a Flow `extern` declaration is fixed arity, so it is
+#   declared once with eight f64 arguments and every row is written as eight
+#   doubles against a format string that consumes exactly eight. Integers go
+#   through as %.0f. One declaration, one call shape, no chance of a format
+#   and an argument list drifting apart.
+#
+# COST
+#   Recording is timed into its own profiler slot, so the cost of writing is
+#   visible next to the cost of simulating rather than hidden inside it.
+
+extern {
+    function fopen(path: string, mode: string) -> ptr<void>
+    function fclose(f: ptr<void>) -> i32
+    function fputs(s: string, f: ptr<void>) -> i32
+    function fflush(f: ptr<void>) -> i32
+    function fprintf(f: ptr<void>, fmt: string,
+                     a: f64, b: f64, c: f64, d: f64,
+                     e: f64, g: f64, h: f64, i: f64, j: f64) -> i32
+    function flow_rt_mkdir(path: string, mode: i32) -> i32
+    function sqrt(x: f64) -> f64
+    function cos(x: f64) -> f64
+    function sin(x: f64) -> f64
+}
+
+export struct Recorder {
+    active: bool,
+    rows: i32,
+    stride: i32,
+    # Cap on how many rats and cells are written per recorded step. A
+    # thousand rats at sixty hertz is three million rows a minute, which is
+    # not a useful file. The caps are reported in the panel so a truncated
+    # recording is never mistaken for a complete one.
+    max_rats: i32,
+    cell_stride: i32,
+    traj: ptr<void>,
+    neural: ptr<void>,
+    recur: ptr<void>,
+    start_step: i32,
+}
+
+export function rec_new() -> Recorder {
+    return Recorder {
+        active: false, rows: 0, stride: 6,
+        max_rats: 16, cell_stride: 1,
+        traj: null, neural: null, recur: null, start_step: 0
+    }
+}
+
+export function rec_ensure_dirs() -> void {
+    let a: i32 = flow_rt_mkdir("data", 493)
+    let b: i32 = flow_rt_mkdir("data/out", 493)
+    let c: i32 = flow_rt_mkdir("data/configs", 493)
+}
+
+export function rec_start(r: ptr<Recorder>, s: ptr<Sim>) -> bool {
+    if r.active { return true }
+    rec_ensure_dirs()
+    r.traj = fopen("data/out/trajectory.csv", "w")
+    r.neural = fopen("data/out/neural.csv", "w")
+    r.recur = fopen("data/out/recurrent.csv", "w")
+    if r.traj == null or r.neural == null or r.recur == null {
+        rec_stop(r)
+        return false
+    }
+    let a: i32 = fputs(
+        "step,time,rat,x,y,heading,speed,hunger,eaten\n", r.traj)
+    let b: i32 = fputs("step,time,population,cell,rate,spike\n", r.neural)
+    let c: i32 = fputs(
+        "step,time,sheet_x_m,sheet_y_m,sheet_strength,ring_rad,ring_strength,ring_error\n",
+        r.recur)
+    r.rows = 0
+    r.active = true
+    r.start_step = s.step_index
+    return true
+}
+
+export function rec_stop(r: ptr<Recorder>) -> void {
+    if r.traj != null {
+        let a: i32 = fclose(r.traj)
+        r.traj = null
+    }
+    if r.neural != null {
+        let b: i32 = fclose(r.neural)
+        r.neural = null
+    }
+    if r.recur != null {
+        let c: i32 = fclose(r.recur)
+        r.recur = null
+    }
+    r.active = false
+}
+
+# Called once per simulation frame. Writes nothing between strides, so the
+# stride is what controls file size rather than the display rate.
+export function rec_step(r: ptr<Recorder>, s: ptr<Sim>) -> void {
+    if !r.active { return }
+    if s.step_index % r.stride != 0 { return }
+    let t0: i64 = prof_begin()
+
+    let step: f64 = s.step_index as f64
+    let time: f64 = s.time
+
+    let mut nr: i32 = s.agents.n
+    if nr > r.max_rats { nr = r.max_rats }
+    for i in 0 to nr {
+        let w: i32 = fprintf(r.traj,
+            "%.0f,%.4f,%.0f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f\n",
+            step, time, i as f64, s.agents.x[i], s.agents.y[i],
+            s.agents.heading[i], s.agents.speed[i],
+            s.agents.hunger[i], s.agents.eaten[i])
+    }
+
+    let sel: i32 = sim_selected(s)
+    for k in 0 to SIM_POP_COUNT {
+        let p: ptr<Pop> = sim_pop(s, k)
+        if !p.enabled { continue }
+        let base: i32 = pop_base(p, sel)
+        let mut cell: i32 = 0
+        while cell < p.n {
+            let sp: f64 = 0.0
+            let w: i32 = fprintf(r.neural,
+                "%.0f,%.4f,%.0f,%.0f,%.5f,%.0f,%.0f,%.0f\n",
+                step, time, k as f64, cell as f64,
+                p.rates[base + cell], p.spikes[base + cell] as f64,
+                0.0, 0.0, 0.0)
+            cell = cell + r.cell_stride
+        }
+    }
+
+    let mut ix: f64 = 0.0
+    let mut iy: f64 = 0.0
+    sim_sheet_position(s, &ix, &iy)
+    let w2: i32 = fprintf(r.recur,
+        "%.0f,%.4f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f\n",
+        step, time, ix, iy, s.sheet.bump_strength,
+        sim_ring_heading(s), s.ring.bump_strength, sim_ring_error(s), 0.0)
+
+    r.rows = r.rows + 1
+    prof_end(PROF_RECORD, t0)
+}
+
+# --- rate map export -------------------------------------------------------
+
+# Dump the tuning of one cell as a CSV.
+#
+# What "tuning" means depends on the population, so the file's second column
+# does too: a spatial population gets a grid over the arena, a directional one
+# gets a sweep over angle, a velocity one a sweep over speed. Each file names
+# its own axes in the header, so nothing downstream has to guess.
+export function export_ratemap(s: ptr<Sim>, pop_index: i32,
+                               cell_index: i32, path: string) -> bool {
+    rec_ensure_dirs()
+    let f: ptr<void> = fopen(path, "w")
+    if f == null { return false }
+
+    let p: ptr<Pop> = sim_pop(s, pop_index)
+    let cell: i32 = clamp_cell(cell_index, p.n)
+
+    if p.kind == POP_HEAD_DIR {
+        let h: i32 = fputs("heading_rad,rate\n", f)
+        for i in 0 to 361 {
+            let ang: f64 = -PI + (i as f64) * TAU / 360.0
+            let w: i32 = fprintf(f, "%.5f,%.5f\n", ang,
+                                 hd_rate_at(p, cell, ang),
+                                 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        }
+        let c: i32 = fclose(f)
+        return true
+    }
+
+    if p.kind == POP_VELOCITY {
+        let h: i32 = fputs("speed_m_s,direction_rad,rate\n", f)
+        for i in 0 to 121 {
+            let sp: f64 = (i as f64) * 0.005
+            for d in 0 to 25 {
+                let ang: f64 = -PI + (d as f64) * TAU / 24.0
+                let w: i32 = fprintf(f, "%.5f,%.5f,%.5f\n", sp, ang,
+                                     velocity_rate_at(p, cell, sp, ang),
+                                     0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            }
+        }
+        let c: i32 = fclose(f)
+        return true
+    }
+
+    # Spatial populations: a grid over the arena's bounding box. Points
+    # outside free space are written with an empty rate so a plot shows the
+    # obstacle rather than a zero.
+    let h: i32 = fputs("x_m,y_m,rate,free\n", f)
+    let n: i32 = 96
+    let w0: f64 = s.env.x1 - s.env.x0
+    let h0: f64 = s.env.y1 - s.env.y0
+    for j in 0 to n {
+        let y: f64 = s.env.y0 + ((j as f64) + 0.5) / (n as f64) * h0
+        for i in 0 to n {
+            let x: f64 = s.env.x0 + ((i as f64) + 0.5) / (n as f64) * w0
+            let free: bool = env_is_free(&s.env, x, y)
+            let mut rate: f64 = 0.0
+            if free {
+                if p.kind == POP_PLACE {
+                    rate = place_rate_at(p, cell, x, y)
+                }
+                if p.kind == POP_GRID {
+                    rate = grid_rate_at(p, cell, &s.grid_p, x, y)
+                }
+                if p.kind == POP_BOUNDARY {
+                    # A boundary cell's rate depends on the head direction as
+                    # well as the place, so the map is taken at a fixed
+                    # heading of zero and the header says so.
+                    rate = boundary_rate_at(p, cell, &s.env, x, y, 0.0,
+                                            s.bvc_p.allocentric, s.scratch)
+                }
+            }
+            let mut fr: f64 = 0.0
+            if free { fr = 1.0 }
+            let w: i32 = fprintf(f, "%.5f,%.5f,%.5f,%.0f\n", x, y, rate, fr,
+                                 0.0, 0.0, 0.0, 0.0, 0.0)
+        }
+    }
+    let c: i32 = fclose(f)
+    return true
+}
+
+function clamp_cell(cell: i32, n: i32) -> i32 {
+    if n <= 0 { return 0 }
+    if cell < 0 { return 0 }
+    if cell >= n { return n - 1 }
+    return cell
+}
+
+# Occupancy and mean-rate maps built from the run so far, which is the
+# measurement an experiment actually wants: where the animal went, and what a
+# cell did there. Binned on a grid over the arena from the recorded trail.
+export function export_occupancy(s: ptr<Sim>, path: string,
+                                 bins: i32) -> bool {
+    rec_ensure_dirs()
+    let f: ptr<void> = fopen(path, "w")
+    if f == null { return false }
+    let h: i32 = fputs("x_m,y_m,samples\n", f)
+
+    let w0: f64 = s.env.x1 - s.env.x0
+    let h0: f64 = s.env.y1 - s.env.y0
+    let total: i32 = bins * bins
+    let counts: ptr<i32> = alloc_counts(total)
+    for i in 0 to total {
+        counts[i] = 0
+    }
+
+    let mut tx: f64 = 0.0
+    let mut ty: f64 = 0.0
+    for i in 0 to s.agents.n {
+        for k in 0 to s.agents.trail_fill {
+            let ok: bool = agents_trail_at(&s.agents, i, k, &tx, &ty)
+            let bx: i32 = (((tx - s.env.x0) / w0) * (bins as f64)) as i32
+            let by: i32 = (((ty - s.env.y0) / h0) * (bins as f64)) as i32
+            if bx >= 0 and bx < bins and by >= 0 and by < bins {
+                counts[by * bins + bx] = counts[by * bins + bx] + 1
+            }
+        }
+    }
+
+    for j in 0 to bins {
+        let y: f64 = s.env.y0 + ((j as f64) + 0.5) / (bins as f64) * h0
+        for i in 0 to bins {
+            let x: f64 = s.env.x0 + ((i as f64) + 0.5) / (bins as f64) * w0
+            let w: i32 = fprintf(f, "%.5f,%.5f,%.0f\n", x, y,
+                                 counts[j * bins + i] as f64,
+                                 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        }
+    }
+    free_counts(counts)
+    let c: i32 = fclose(f)
+    return true
+}
+
+function alloc_counts(n: i32) -> ptr<i32> {
+    return mem_alloc((n as i64) * 4, "export buffer") as ptr<i32>
+}
+
+function free_counts(p: ptr<i32>) -> void {
+    mem_release(p as ptr<void>)
+}

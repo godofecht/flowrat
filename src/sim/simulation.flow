@@ -1,0 +1,822 @@
+# The whole simulation, in one owned object.
+#
+# Sim holds the environment, the agent batch, every population, both
+# recurrent networks and the run control. The UI reads and writes it through
+# the functions here and never reaches past them into a population's arrays,
+# so the headless entry points drive exactly the same code the window does.
+#
+# STEP ORDER
+#   1. motion, using the sensory cache filled at the end of the previous step
+#   2. sense, at the new positions
+#   3. populations, from the new positions and the fresh cache
+#   4. recurrent networks
+#
+#   Everything a panel displays after a step is therefore the state at the
+#   same instant. Only the motion model's input is one step old, which is a
+#   fair description of an animal reacting to what it just saw rather than to
+#   where it already is. Reset primes the cache so step one is not blind.
+#
+# THE RECURRENT NETWORKS FOLLOW ONE RAT
+#   A continuous attractor per rat would multiply the recurrent cost by the
+#   batch size, and there is nothing to learn from a thousand copies of the
+#   same dynamics. Both networks track the selected rat, and switching
+#   selection carries them over rather than resetting them, so the bump keeps
+#   integrating from wherever it was.
+
+extern {
+    function sin(x: f64) -> f64
+    function cos(x: f64) -> f64
+    function sqrt(x: f64) -> f64
+    function fabs(x: f64) -> f64
+}
+
+# How long a rat waits before trying a patch again after one gave it nothing.
+export const FOOD_RETRY_SECONDS: f64 = 1.5
+
+export const MAX_RATS: i32 = 4096
+export const TRAIL_LEN: i32 = 512
+export const POP_HIST_LEN: i32 = 256
+
+export struct Sim {
+    env: Env,
+    agents: Agents,
+    # Who is near whom, rebuilt every step. Named `near` rather than `grid`
+    # because `grid` on a Sim is already the grid-cell population, and the
+    # two share a word by accident. Flow took the duplicate field without
+    # complaint and every use resolved to the neural one.
+    near: Grid,
+    motion: MotionParams,
+    behaviour: BehaviourParams,
+    memory: MemoryParams,
+    novelty: NoveltyParams,
+    etho: Ethogram,
+
+    place: Pop,
+    hd: Pop,
+    vel: Pop,
+    grid: Pop,
+    bvc: Pop,
+
+    place_p: PlaceParams,
+    hd_p: HeadDirParams,
+    vel_p: VelocityParams,
+    grid_p: GridParams,
+    bvc_p: BoundaryParams,
+
+    circuit: Circuit,
+
+    ring: Can,
+    sheet: Can,
+    can_enabled: bool,
+    can_substeps: i32,
+    can_anchor: bool,
+
+    # Everything ever removed from a patch, and everything ever swallowed.
+    # Kept so the two can be compared: food is conserved, and a difference
+    # between them is food that went nowhere.
+    food_taken: f64,
+    water_taken: f64,
+
+    running: bool,
+    step_index: i32,
+    time: f64,
+    dt: f64,
+    seed: u32,
+    integrator: i32,
+    steps_per_frame: i32,
+    selected: i32,
+    require_sight: bool,
+    spiking: bool,
+    trail_stride: i32,
+
+    # Scratch for boundary tuning previews, one fan's worth.
+    scratch: ptr<f64>,
+}
+
+# Every value a control can be double-clicked back to.
+#
+# Taken from the same *_params_default functions the simulation is built
+# from, once, at startup, rather than written out again as literals in the
+# interface. A default that lives in two places is a default that will
+# eventually disagree with itself.
+export struct Defaults {
+    motion: MotionParams,
+    behaviour: BehaviourParams,
+    memory: MemoryParams,
+    novelty: NoveltyParams,
+    etho: Ethogram,
+    place: PlaceParams,
+    hd: HeadDirParams,
+    vel: VelocityParams,
+    grid: GridParams,
+    bvc: BoundaryParams,
+    sheet_sigma: f64,
+    sheet_gain: f64,
+    tau: f64,
+    substeps: i32,
+    rats: i32,
+    seed: i32,
+    steps_per_frame: i32,
+    sim_hz: f64,
+    zone_radius: f64,
+    trail_len: i32,
+}
+
+export const DEFAULT_RATS: i32 = 24
+export const DEFAULT_SEED: i32 = 1337
+
+export function defaults_new(sheet_nx: i32) -> Defaults {
+    let probe: Can = can_params_sheet(sheet_nx, sheet_nx)
+    let d: Defaults = Defaults {
+        motion: motion_params_default(),
+        behaviour: behaviour_params_default(),
+        memory: memory_params_default(),
+        novelty: novelty_params_default(),
+        etho: ethogram_new(),
+        place: place_params_default(),
+        hd: hd_params_default(),
+        vel: velocity_params_default(),
+        grid: grid_params_default(),
+        bvc: boundary_params_default(),
+        sheet_sigma: probe.sigma_excite,
+        sheet_gain: probe.gain_target,
+        tau: probe.tau,
+        substeps: 2,
+        rats: DEFAULT_RATS,
+        seed: DEFAULT_SEED,
+        steps_per_frame: 1,
+        sim_hz: 60.0,
+        zone_radius: 0.14,
+        trail_len: 300
+    }
+    return d
+}
+
+export function sim_create(n_rats: i32, preset: i32, seed: u32) -> Sim {
+    let mut s: Sim = Sim {
+        env: env_create(),
+        agents: agents_create(MAX_RATS, TRAIL_LEN),
+        near: grid_create(MAX_RATS),
+        motion: motion_params_default(),
+        behaviour: behaviour_params_default(),
+        memory: memory_params_default(),
+        novelty: novelty_params_default(),
+        etho: ethogram_new(),
+        place: pop_create(POP_PLACE, 256, MAX_RATS, POP_HIST_LEN),
+        hd: pop_create(POP_HEAD_DIR, 36, MAX_RATS, POP_HIST_LEN),
+        vel: pop_create(POP_VELOCITY, 32, MAX_RATS, POP_HIST_LEN),
+        grid: pop_create(POP_GRID, 48, MAX_RATS, POP_HIST_LEN),
+        bvc: pop_create(POP_BOUNDARY, 48, MAX_RATS, POP_HIST_LEN),
+        place_p: place_params_default(),
+        hd_p: hd_params_default(),
+        vel_p: velocity_params_default(),
+        grid_p: grid_params_default(),
+        bvc_p: boundary_params_default(),
+        circuit: circuit_create(256, 16),
+        ring: can_params_ring(64),
+        sheet: can_params_sheet(32, 32),
+        can_enabled: true,
+        can_substeps: 2,
+        can_anchor: false,
+        food_taken: 0.0,
+        water_taken: 0.0,
+        running: true,
+        step_index: 0,
+        time: 0.0,
+        dt: 0.016666666666666666,
+        seed: seed,
+        integrator: INT_SEMI,
+        steps_per_frame: 1,
+        selected: 0,
+        require_sight: true,
+        spiking: false,
+        trail_stride: 1,
+        scratch: null
+    }
+    s.scratch = mem_alloc((RAY_COUNT as i64) * 8, "simulation scratch") as ptr<f64>
+    env_preset_apply(&s.env, preset)
+    sim_configure_populations(&s)
+    can_build_kernel(&s.ring)
+    can_build_kernel(&s.sheet)
+    sim_reset(&s, n_rats)
+    return s
+}
+
+export function sim_destroy(s: ptr<Sim>) -> void {
+    env_destroy(&s.env)
+    agents_destroy(&s.agents)
+    grid_destroy(&s.near)
+    pop_destroy(&s.place)
+    pop_destroy(&s.hd)
+    pop_destroy(&s.vel)
+    pop_destroy(&s.grid)
+    pop_destroy(&s.bvc)
+    circuit_destroy(&s.circuit)
+    can_destroy(&s.ring)
+    can_destroy(&s.sheet)
+    mem_release(s.scratch as ptr<void>)
+}
+
+# Rebuild every population's per-cell properties. Called at startup, after an
+# environment change that moved free space, and after any parameter edit that
+# affects tuning rather than just gain.
+export function sim_configure_populations(s: ptr<Sim>) -> void {
+    place_configure(&s.place, &s.env, &s.place_p, s.seed)
+    hd_configure(&s.hd, &s.hd_p)
+    velocity_configure(&s.vel, &s.vel_p, s.seed)
+    grid_configure(&s.grid, &s.grid_p, s.seed)
+    boundary_configure(&s.bvc, &s.bvc_p)
+    sim_rewire(s)
+}
+
+# Rebuild the place cells' input connections. Only needed when the circuit is
+# switched on, and expensive enough at a few hundred cells that it is not
+# done speculatively: every place cell probes every boundary and grid cell.
+export function sim_rewire(s: ptr<Sim>) -> void {
+    if !s.circuit.enabled { return }
+    circuit_wire(&s.circuit, &s.place, &s.bvc, &s.grid, &s.env,
+                 &s.grid_p, &s.bvc_p, s.scratch)
+}
+
+# Switching the circuit on wires it; switching it off leaves the analytic
+# place fields in charge.
+export function sim_set_circuit(s: ptr<Sim>, on: bool) -> void {
+    s.circuit.enabled = on
+    if on { sim_rewire(s) }
+}
+
+# Put every rat back in a start zone, or in free space when the arena has
+# none, and clear all derived state.
+export function sim_reset(s: ptr<Sim>, n_rats: i32) -> void {
+    agents_set_count(&s.agents, n_rats)
+    let start: i32 = env_zone_at(&s.env, s.env.cx, s.env.cy, ZONE_START)
+    let mut zx: f64 = s.env.cx
+    let mut zy: f64 = s.env.cy
+    let mut has_start: bool = false
+    for z in 0 to s.env.n_zones {
+        if s.env.zone_kind[z] == ZONE_START and !has_start {
+            env_zone_center(&s.env, z, &zx, &zy)
+            has_start = true
+        }
+    }
+
+    for i in 0 to s.agents.n {
+        let mut x: f64 = zx
+        let mut y: f64 = zy
+        if has_start {
+            # Scatter around the start zone so a batch does not begin as a
+            # single point, which would make every rat's noise stream the
+            # only thing separating them for the first few seconds.
+            let jx: f64 = rng_sym(s.seed, 811, (i as u32) + 1, 0.06)
+            let jy: f64 = rng_sym(s.seed, 812, (i as u32) + 1, 0.06)
+            x = zx + jx
+            y = zy + jy
+            if !env_is_free(&s.env, x, y) {
+                let ok: bool = env_sample_free(&s.env, s.seed, 813,
+                                               (i as u32) + 1, 64, &x, &y)
+            }
+        } else {
+            let ok: bool = env_sample_free(&s.env, s.seed, 813,
+                                           (i as u32) + 1, 64, &x, &y)
+        }
+        let h: f64 = rng_range(s.seed, 814, (i as u32) + 1, -PI, PI)
+        agents_place(&s.agents, i, x, y, h, s.motion.speed_mean)
+    }
+
+    agents_clear_trails(&s.agents)
+    # A run starts with the arena as it was drawn, not as the last run left
+    # it, so two runs of one seed see the same food.
+    env_refill_food(&s.env)
+    ethogram_reset(&s.etho)
+    s.food_taken = 0.0
+    s.water_taken = 0.0
+    s.step_index = 0
+    s.time = 0.0
+
+    pop_zero(&s.place)
+    pop_zero(&s.hd)
+    pop_zero(&s.vel)
+    pop_zero(&s.grid)
+    pop_zero(&s.bvc)
+    pop_clear_history(&s.place)
+    pop_clear_history(&s.hd)
+    pop_clear_history(&s.vel)
+    pop_clear_history(&s.grid)
+    pop_clear_history(&s.bvc)
+
+    # The sheet spans the arena: one trip across the torus is one trip across
+    # the longest side, so the bump's position reads directly as the rat's.
+    let w: f64 = env_width(&s.env)
+    let h: f64 = env_height(&s.env)
+    let mut span: f64 = w
+    if h > span { span = h }
+    s.sheet.scale = span / (s.sheet.nx as f64)
+
+    can_reset(&s.ring, s.seed)
+    can_reset(&s.sheet, s.seed + 7)
+    # Fit the velocity gain to this network's actual response, so a metre of
+    # movement moves the bump by a metre's worth of cells. Skipped when
+    # nothing it depends on has changed, which is every reset after the
+    # first: it costs a couple of thousand steps and a reset does not change
+    # the kernel.
+    can_calibrate_ring(&s.ring, s.dt)
+    can_calibrate_sheet(&s.sheet, s.dt)
+
+    # Start both networks aligned with the rat they follow, which also grows
+    # the bump out of the reset noise, so no separate settling pass is
+    # needed. Left where a settle happened to put it, the sheet's bump would
+    # sit at an arbitrary offset and the path-integration readout would be
+    # dominated by that constant rather than by drift.
+    sim_reanchor(s)
+
+    if s.selected >= s.agents.n { s.selected = 0 }
+
+    # Prime the sensory cache so the first motion step is not blind.
+    agents_sense(&s.agents, &s.env, s.require_sight)
+    prof_clear_peaks()
+}
+
+# Drive both bumps to the selected rat's current state. Called at reset, and
+# available from the control panel so a drifted network can be re-pinned
+# without restarting the run.
+export function sim_reanchor(s: ptr<Sim>) -> void {
+    let i: i32 = sim_selected(s)
+    if s.agents.n == 0 { return }
+    # Long enough to both grow the bump out of reset noise and drag it into
+    # place. A settled network needs far fewer, but this is also the path a
+    # fresh one takes, so it is sized for that.
+    can_force_bump(&s.sheet, s.agents.x[i] / s.sheet.scale,
+                   s.agents.y[i] / s.sheet.scale, 260, s.dt)
+    let target: f64 = (s.agents.heading[i] + PI) / TAU * (s.ring.n as f64)
+    can_force_bump(&s.ring, target, 0.0, 260, s.dt)
+}
+
+export function sim_set_rat_count(s: ptr<Sim>, n: i32) -> void {
+    let mut k: i32 = n
+    if k < 1 { k = 1 }
+    if k > MAX_RATS { k = MAX_RATS }
+    sim_reset(s, k)
+}
+
+# Swap in a different arena. Populations whose tuning depends on the arena's
+# free space are rebuilt; the rest keep their configuration, so switching
+# back and forth does not silently reshuffle head-direction tuning.
+export function sim_set_preset(s: ptr<Sim>, preset: i32) -> void {
+    env_preset_apply(&s.env, preset)
+    place_configure(&s.place, &s.env, &s.place_p, s.seed)
+    sim_rewire(s)
+    sim_reset(s, s.agents.n)
+}
+
+# Called by the editor after any change to walls, cues or zones. Place fields
+# may now sit inside an obstacle, and rats may be trapped in one.
+export function sim_env_changed(s: ptr<Sim>) -> void {
+    place_configure(&s.place, &s.env, &s.place_p, s.seed)
+    for i in 0 to s.agents.n {
+        if !env_is_free(&s.env, s.agents.x[i], s.agents.y[i]) {
+            let mut x: f64 = s.agents.x[i]
+            let mut y: f64 = s.agents.y[i]
+            let moved: bool = env_push_inside(&s.env, s.motion.margin, &x, &y)
+            if !env_is_free(&s.env, x, y) {
+                let ok: bool = env_sample_free(&s.env, s.seed, 999,
+                                               (i as u32) + 1, 64, &x, &y)
+            }
+            s.agents.x[i] = x
+            s.agents.y[i] = y
+        }
+    }
+    agents_sense(&s.agents, &s.env, s.require_sight)
+    # Boundary responses have changed, so the connections built from them are
+    # stale. This is the point of the circuit: a wall moves and the fields
+    # that depended on it move with it.
+    sim_rewire(s)
+}
+
+# --- the step --------------------------------------------------------------
+
+export function sim_step(s: ptr<Sim>) -> void {
+    let t_sim: i64 = prof_begin()
+
+    # Who is near whom, before anyone moves. Serial and O(n), so the
+    # parallel pass below can read it without racing, and so every rat sees
+    # the same snapshot of the colony rather than a mixture of before and
+    # after depending on which thread got there first.
+    let t_nb: i64 = prof_begin()
+    grid_build(&s.near, &s.agents, &s.env, sim_social_radius(s))
+    prof_end(PROF_NEIGH, t_nb)
+
+    let t_ag: i64 = prof_begin()
+    motion_step_all(&s.agents, &s.env, &s.motion, &s.behaviour, &s.memory,
+                    &s.novelty, &s.near, s.step_index, s.seed, s.dt, s.integrator)
+    prof_end(PROF_AGENTS, t_ag)
+
+    # The time budget and the bout histogram, folded in rat order. Same
+    # reason as the feeding pass: a shared histogram written from the
+    # parallel loop would be a race, and the counts would stop being
+    # reproducible.
+    ethogram_fold(&s.etho, &s.agents, s.dt)
+
+    # Feeding is serial, on purpose.
+    #
+    # Several rats can be eating from one patch, and a patch is a single
+    # number they are all removing from. Doing that inside the parallel
+    # motion pass would be a race on it, and the batch would stop being
+    # reproducible. Instead the parallel pass records what each rat wants and
+    # this pass hands it out in rat order, which is race-free, deterministic,
+    # and models the competition properly: when a patch runs low, whoever
+    # comes first in the batch gets the last of it.
+    sim_feed(s)
+    env_regrow_food(&s.env, s.dt)
+
+    let t_env: i64 = prof_begin()
+    agents_sense(&s.agents, &s.env, s.require_sight)
+    prof_end(PROF_ENVQ, t_env)
+
+    if s.step_index % s.trail_stride == 0 {
+        agents_push_trail(&s.agents)
+    }
+
+    let t_hd: i64 = prof_begin()
+    hd_update(&s.hd, &s.agents, &s.hd_p)
+    prof_end(PROF_HD, t_hd)
+
+    let t_ve: i64 = prof_begin()
+    velocity_update(&s.vel, &s.agents)
+    prof_end(PROF_VEL, t_ve)
+
+    let t_gr: i64 = prof_begin()
+    grid_update(&s.grid, &s.agents, &s.grid_p)
+    prof_end(PROF_NEIGH, t_gr)
+
+    let t_bv: i64 = prof_begin()
+    boundary_update(&s.bvc, &s.agents, &s.bvc_p)
+    prof_end(PROF_BVC, t_bv)
+
+    # Place last. In circuit mode it reads the boundary and grid rates this
+    # step produced, so it cannot run before them; in analytic mode the order
+    # makes no difference, and having one order rather than two is worth more
+    # than the nothing it costs.
+    let t_pl: i64 = prof_begin()
+    if s.circuit.enabled {
+        circuit_update(&s.circuit, &s.place, &s.bvc, &s.grid,
+                       s.agents.n, sim_selected(s))
+    } else {
+        place_update(&s.place, &s.agents, &s.env, &s.place_p)
+    }
+    prof_end(PROF_PLACE, t_pl)
+
+    if s.spiking {
+        pop_spikes_from_rates(&s.place, s.agents.n, s.dt, s.seed, s.step_index)
+        pop_spikes_from_rates(&s.hd, s.agents.n, s.dt, s.seed, s.step_index)
+        pop_spikes_from_rates(&s.vel, s.agents.n, s.dt, s.seed, s.step_index)
+        pop_spikes_from_rates(&s.grid, s.agents.n, s.dt, s.seed, s.step_index)
+        pop_spikes_from_rates(&s.bvc, s.agents.n, s.dt, s.seed, s.step_index)
+    }
+
+    if s.can_enabled {
+        let t_can: i64 = prof_begin()
+        sim_step_attractors(s)
+        prof_end(PROF_CAN, t_can)
+    }
+
+    let sel: i32 = sim_selected(s)
+    pop_summarise(&s.place, sel)
+    pop_summarise(&s.hd, sel)
+    pop_summarise(&s.vel, sel)
+    pop_summarise(&s.grid, sel)
+    pop_summarise(&s.bvc, sel)
+    pop_push_history(&s.place, sel)
+    pop_push_history(&s.hd, sel)
+    pop_push_history(&s.vel, sel)
+    pop_push_history(&s.grid, sel)
+    pop_push_history(&s.bvc, sel)
+
+    s.step_index = s.step_index + 1
+    s.time = s.time + s.dt
+    prof_end(PROF_SIM, t_sim)
+}
+
+# Hand out what the patches actually hold.
+function sim_feed(s: ptr<Sim>) -> void {
+    let p: ptr<MotionParams> = &s.motion
+    let a: ptr<Agents> = &s.agents
+    for i in 0 to a.n {
+        # A hoarder that has reached the nest eats what it brought back.
+        if p.hoard and a.carrying[i] > 0.0 {
+            let mut nx: f64 = 0.0
+            let mut ny: f64 = 0.0
+            if sim_nest(s, &nx, &ny) {
+                if dist(a.x[i], a.y[i], nx, ny) < p.eat_reach + 0.08 {
+                    let mut bite: f64 = p.eat_rate * s.dt
+                    if bite > a.carrying[i] { bite = a.carrying[i] }
+                    a.carrying[i] = a.carrying[i] - bite
+                    a.eaten[i] = a.eaten[i] + bite
+                    sate(a, i, bite * p.sate_per_unit)
+                }
+            }
+        }
+
+        # One request is one whole item. A bite is a discrete act now: the
+        # rat finishes a mouthful and exactly one pellet leaves the arena,
+        # from the spot nearest its nose. Asking for a fraction of a pellet
+        # per step was what made feeding invisible to watch.
+        let want: f64 = a.eat_request[i]
+        if want <= 0.0 { continue }
+        a.eat_request[i] = 0.0
+        let patch: i32 = a.food_target[i]
+        let took: i32 = env_take_from_zone(&s.env, patch, a.x[i], a.y[i])
+        let mut got: f64 = 0.0
+        if took >= 0 { got = 1.0 }
+        if got <= 0.0 {
+            # The patch emptied while this rat had its head in it, or someone
+            # earlier in the batch took the last of it.
+            #
+            # The mouthful is not aborted. An animal that has its head down
+            # does not stop mid-bite the instant the last crumb goes, and
+            # cutting the bout short here produced eating bouts averaging a
+            # tenth of a second, which is not a bout of anything. Instead the
+            # target is dropped, so nothing more is requested, and a cooldown
+            # stops the rat coming straight back. The bite ends on its own
+            # timer and the machine moves on.
+            # Walking to a remembered patch and finding nothing is what
+            # clears the memory of it.
+            memory_disappoint(a, &s.memory, i, patch)
+            a.food_target[i] = -1
+            a.food_cooldown[i] = FOOD_RETRY_SECONDS
+            continue
+        }
+        # Water is drunk where it is found. A rat does not carry water home,
+        # so hoarding does not apply to it.
+        if s.env.zone_kind[patch] == ZONE_WATER {
+            s.water_taken = s.water_taken + got
+            a.drunk[i] = a.drunk[i] + got
+            slake(a, i, got * p.slake_per_unit)
+            continue
+        }
+        s.food_taken = s.food_taken + got
+        if p.hoard and a.carrying[i] < p.carry_capacity {
+            a.carrying[i] = a.carrying[i] + got
+        } else {
+            a.eaten[i] = a.eaten[i] + got
+            sate(a, i, got * p.sate_per_unit)
+        }
+    }
+}
+
+function sate(a: ptr<Agents>, i: i32, by: f64) -> void {
+    let mut h: f64 = a.hunger[i] - by
+    if h < 0.0 { h = 0.0 }
+    a.hunger[i] = h
+}
+
+function slake(a: ptr<Agents>, i: i32, by: f64) -> void {
+    let mut t: f64 = a.thirst[i] - by
+    if t < 0.0 { t = 0.0 }
+    a.thirst[i] = t
+}
+
+# The grid's cell size has to cover the widest question anyone will ask of
+# it, because a query only looks at the 3 by 3 block around the asker. The
+# widest is the following radius, which is three times the personal space.
+export function sim_social_radius(s: ptr<Sim>) -> f64 {
+    let mut r: f64 = s.motion.social_range
+    if s.motion.follow_gain > 0.0 { r = s.motion.social_range * 3.0 }
+    # Crowding asks who is within eating reach, which in a big-nosed arena
+    # can be wider than personal space. A cell narrower than the widest
+    # question makes the 3 by 3 block miss rats that are genuinely in range,
+    # and the answer would be quietly short rather than wrong in a way
+    # anything would notice.
+    if s.motion.crowd_share > 0.0 and s.motion.eat_reach > r {
+        r = s.motion.eat_reach
+    }
+    if r < 0.02 { r = 0.02 }
+    return r
+}
+
+export function sim_nest(s: ptr<Sim>, x_out: ptr<f64>,
+                         y_out: ptr<f64>) -> bool {
+    for z in 0 to s.env.n_zones {
+        if s.env.zone_kind[z] == ZONE_START {
+            env_zone_center(&s.env, z, x_out, y_out)
+            return true
+        }
+    }
+    return false
+}
+
+# Food removed from the arena that is not accounted for by what the rats
+# have eaten or are still carrying. Should be zero: the feeding pass is the
+# only thing that takes food, and everything it takes goes into a rat.
+export function sim_food_unaccounted(s: ptr<Sim>) -> f64 {
+    let held: f64 = agents_total_eaten(&s.agents)
+                    + agents_total_carried(&s.agents)
+    return s.food_taken - held
+}
+
+# The same sum for water. Nothing carries water, so everything taken should
+# be inside a rat.
+export function sim_water_unaccounted(s: ptr<Sim>) -> f64 {
+    return s.water_taken - agents_total_drunk(&s.agents)
+}
+
+function sim_step_attractors(s: ptr<Sim>) -> void {
+    let i: i32 = sim_selected(s)
+    let h: f64 = s.agents.heading[i]
+    let v: f64 = s.agents.speed[i]
+    let w: f64 = s.agents.ang_vel[i]
+    # Substeps keep dt / tau small enough for explicit Euler to be stable.
+    #
+    # Two is enough at 60 Hz and tau = 30 ms, but the timestep and the time
+    # constant are both adjustable, and the product is what matters. At
+    # dt = 0.5 s the ratio reaches sixteen and the network diverges to
+    # nothing but non-numbers within a few hundred steps, silently. So the
+    # requested substep count is a floor, not the answer: whatever is needed
+    # to hold dt/tau under a half is used instead when that is more.
+    let need: i32 = can_substeps_for(s.dt, s.ring.tau)
+    let need2: i32 = can_substeps_for(s.dt, s.sheet.tau)
+    let mut subs: i32 = s.can_substeps
+    if need > subs { subs = need }
+    if need2 > subs { subs = need2 }
+    let sub: f64 = (subs as f64)
+    let sdt: f64 = s.dt / sub
+
+    can_set_input_ring(&s.ring, w, h, s.can_anchor)
+    for k in 0 to subs {
+        can_step(&s.ring, sdt)
+    }
+    can_decode(&s.ring)
+
+    # Velocity in cells per second: the sheet's own units.
+    let vx: f64 = v * cos(h) / s.sheet.scale
+    let vy: f64 = v * sin(h) / s.sheet.scale
+    can_set_input_sheet(&s.sheet, vx, vy,
+                        s.agents.x[i], s.agents.y[i], s.can_anchor)
+    for k in 0 to subs {
+        can_step(&s.sheet, sdt)
+    }
+    can_decode(&s.sheet)
+}
+
+# Advance by whatever the control panel asked for this frame.
+export function sim_advance(s: ptr<Sim>) -> void {
+    if !s.running { return }
+    for k in 0 to s.steps_per_frame {
+        sim_step(s)
+    }
+}
+
+export function sim_single_step(s: ptr<Sim>) -> void {
+    sim_step(s)
+}
+
+export function sim_selected(s: ptr<Sim>) -> i32 {
+    if s.selected < 0 { return 0 }
+    if s.selected >= s.agents.n {
+        if s.agents.n == 0 { return 0 }
+        return s.agents.n - 1
+    }
+    return s.selected
+}
+
+export function sim_select(s: ptr<Sim>, i: i32) -> void {
+    if i < 0 or i >= s.agents.n { return }
+    s.selected = i
+}
+
+# --- population access by index -------------------------------------------
+#
+# The panels iterate over populations rather than naming each one, so adding
+# a population means adding it here and in sim_step and nowhere else in the
+# UI.
+
+export const SIM_POP_COUNT: i32 = 5
+
+export function sim_pop(s: ptr<Sim>, which: i32) -> ptr<Pop> {
+    if which == 1 { return &s.hd }
+    if which == 2 { return &s.vel }
+    if which == 3 { return &s.grid }
+    if which == 4 { return &s.bvc }
+    return &s.place
+}
+
+export function sim_pop_enabled(s: ptr<Sim>, which: i32) -> bool {
+    let p: ptr<Pop> = sim_pop(s, which)
+    return p.enabled
+}
+
+export function sim_pop_toggle(s: ptr<Sim>, which: i32) -> void {
+    let p: ptr<Pop> = sim_pop(s, which)
+    p.enabled = !p.enabled
+    if !p.enabled { pop_zero(p) }
+}
+
+# Profiler slot for a population, so the performance panel can attribute the
+# cost of each one without a lookup table of its own.
+export function sim_pop_slot(which: i32) -> i32 {
+    if which == 1 { return PROF_HD }
+    if which == 2 { return PROF_VEL }
+    if which == 3 { return PROF_GRID }
+    if which == 4 { return PROF_BVC }
+    return PROF_PLACE
+}
+
+# Total cells currently being updated.
+export function sim_total_cells(s: ptr<Sim>) -> i32 {
+    let mut t: i32 = 0
+    for k in 0 to SIM_POP_COUNT {
+        let p: ptr<Pop> = sim_pop(s, k)
+        if p.enabled { t = t + p.n }
+    }
+    return t
+}
+
+# Cheap check that the run still holds numbers.
+#
+# Returns how many of a small sample of values are not finite. A full sweep
+# would be a million comparisons a frame at four thousand rats, so this reads
+# the selected rat, each population's summary and both networks' peaks, which
+# is where divergence shows first: a population whose peak has become a
+# non-number got there from a rat whose state already had.
+#
+# The point is to say so on screen rather than let a run quietly produce
+# nothing. A parameter combination that breaks the model is a legitimate
+# thing to try; not knowing it broke is not.
+export function sim_health(s: ptr<Sim>) -> i32 {
+    let mut bad: i32 = 0
+    let i: i32 = sim_selected(s)
+    if s.agents.n > 0 {
+        if !finite(s.agents.x[i]) { bad = bad + 1 }
+        if !finite(s.agents.y[i]) { bad = bad + 1 }
+        if !finite(s.agents.heading[i]) { bad = bad + 1 }
+        if !finite(s.agents.speed[i]) { bad = bad + 1 }
+        if !finite(s.agents.ang_vel[i]) { bad = bad + 1 }
+        if !env_is_free(&s.env, s.agents.x[i], s.agents.y[i]) {
+            bad = bad + 1
+        }
+    }
+    for k in 0 to SIM_POP_COUNT {
+        let p: ptr<Pop> = sim_pop(s, k)
+        if p.enabled {
+            if !finite(p.last_max) { bad = bad + 1 }
+            if !finite(p.last_mean) { bad = bad + 1 }
+        }
+    }
+    if s.can_enabled {
+        if !finite(s.sheet.max_rate) { bad = bad + 1 }
+        if !finite(s.sheet.bump_strength) { bad = bad + 1 }
+        if !finite(s.ring.max_rate) { bad = bad + 1 }
+        if !finite(s.ring.bump_strength) { bad = bad + 1 }
+    }
+    return bad
+}
+
+# A value is not equal to itself only when it is not a number.
+function finite(v: f64) -> bool {
+    if v != v { return false }
+    if v > 1.0e300 or v < -1.0e300 { return false }
+    return true
+}
+
+export function sim_hz(s: ptr<Sim>) -> f64 {
+    if s.dt <= 0.0 { return 0.0 }
+    return 1.0 / s.dt
+}
+
+# Error of the place-cell population vector against the true position, in
+# metres. The single number that says whether the spatial code is working.
+export function sim_place_error(s: ptr<Sim>) -> f64 {
+    let i: i32 = sim_selected(s)
+    let mut dx: f64 = 0.0
+    let mut dy: f64 = 0.0
+    let w: f64 = place_decode(&s.place, i, &dx, &dy)
+    if w < 0.000001 { return -1.0 }
+    return dist(dx, dy, s.agents.x[i], s.agents.y[i])
+}
+
+# Error of the head-direction population vector, in radians.
+export function sim_hd_error(s: ptr<Sim>) -> f64 {
+    let i: i32 = sim_selected(s)
+    let mut strength: f64 = 0.0
+    let est: f64 = hd_decode(&s.hd, i, &strength)
+    if strength < 0.000001 { return -1.0 }
+    return fabs(angle_delta(agents_head_dir(&s.agents, i), est))
+}
+
+# Where the sheet attractor thinks the rat is, mapped back into metres. The
+# bump lives on a torus of nx * scale metres, so this is only meaningful
+# modulo that period, which is the same ambiguity a real grid code has.
+export function sim_sheet_position(s: ptr<Sim>, x_out: ptr<f64>,
+                                   y_out: ptr<f64>) -> void {
+    x_out[0] = s.sheet.bump_x * s.sheet.scale
+    y_out[0] = s.sheet.bump_y * s.sheet.scale
+}
+
+# Heading the ring attractor is holding, in radians.
+export function sim_ring_heading(s: ptr<Sim>) -> f64 {
+    return wrap_pi(s.ring.bump_x / (s.ring.n as f64) * TAU - PI)
+}
+
+export function sim_ring_error(s: ptr<Sim>) -> f64 {
+    let i: i32 = sim_selected(s)
+    return fabs(angle_delta(s.agents.heading[i], sim_ring_heading(s)))
+}

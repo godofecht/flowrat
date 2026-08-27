@@ -1,0 +1,320 @@
+# What the rat has already seen of the room.
+#
+# WHY
+#   A rat put in a new arena hugs the wall and ventures into the middle as the
+#   place becomes familiar. FlowRat's thigmotaxis was a constant, so the
+#   animal never learned the room was safe: it hugged the wall for ever, or
+#   never, depending on a slider. The same is true of a landmark. A cue that
+#   is still interesting on the hundredth pass is not a cue, it is a magnet.
+#
+#   So each rat carries a coarse map of where it has been. Standing somewhere
+#   makes that place familiar; familiarity fades. Wall hugging scales with how
+#   unfamiliar the ground underfoot is, exploration pulls toward the least
+#   known corner, and a landmark loses its pull as the part of the room it
+#   stands in becomes ordinary.
+#
+# WHY SIXTEEN BY SIXTEEN
+#   The map is for deciding which way to go next, not for navigating, so it
+#   wants to be coarse. Sixteen across a two metre arena is a cell of about
+#   twelve centimetres, a couple of body lengths, which is the scale at which
+#   "over there is new" is a useful thing to know. A finer map would cost more
+#   and say less.
+#
+# WHY A BYTE PER CELL
+#   Familiarity is a number between nought and one that drives a steering
+#   term. It does not need 64 bits, and at 256 cells a rat the difference
+#   matters: doubles made this the largest array in FlowRat by a wide margin,
+#   8 MB across the maximum batch, and touching one scattered cell per rat per
+#   step cost more than the rest of motion put together. Bare stepping of 4096
+#   rats went from 1.37 ms to 2.10. A byte holds 256 levels, which is finer
+#   than anything here can distinguish, and the array is 1 MB.
+#
+#   The fade has to be coarser to survive the quantisation. At a decay of
+#   0.001 a second, half a second of fading is a hundredth of one level and
+#   would round away to nothing, so the sweep runs every ten seconds instead
+#   of every half second. That is still far faster than the minutes over
+#   which the quantity actually moves.
+#
+# WHY THE DECAY IS PERIODIC
+#   Fading every cell of every rat costs 256 subtractions per rat per step.
+#   At four thousand rats that is a million operations a step, for a term that
+#   changes on a timescale of minutes. So the sweep runs every `decay_every`
+#   steps and applies the whole interval at once.
+#
+# WHAT THIS IS NOT
+#   It is not a cognitive map and it does not support navigation. A rat cannot
+#   plan a route through it, and nothing reads it except the three steering
+#   terms below. Where food was is remembered separately and precisely, in
+#   src/sim/memory.flow, because that is a different kind of knowing.
+
+extern {
+    function sqrt(x: f64) -> f64
+    function atan2(y: f64, x: f64) -> f64
+}
+
+export const FAM_SIDE: i32 = 16
+export const FAM_CELLS: i32 = 256
+# Full familiarity, as stored. One byte per cell.
+export const FAM_FULL: i32 = 255
+
+export struct NoveltyParams {
+    enabled: bool,
+    # Familiarity gained per second standing in one cell. A rat crosses a
+    # twelve centimetre cell in about a second, so the gain has to be high
+    # enough that one pass counts for something: at 2.0 a single crossing
+    # takes a cell most of the way to known. At 0.5, which is where this
+    # started, a rat could not learn a sixteen by sixteen arena inside a
+    # five-minute run and the wall hugging never faded at all.
+    gain: f64,
+    # Lost per second, everywhere. At 0.001 a place the animal has not been
+    # near for a quarter of an hour is new again. Faster than that and the
+    # map decays between visits: with 256 cells and a rat covering half a
+    # cell a second, a full circuit of the arena takes several minutes.
+    decay: f64,
+    # Steps between fade sweeps. See the note above: it also has to be long
+    # enough that one sweep's worth of fading is at least one stored level.
+    decay_every: i32,
+    # How much extra wall hugging a wholly unfamiliar place buys. This is the
+    # thigmotaxis that fades: the constant in MotionParams is what is left
+    # once the room is known, and this is what a naive animal adds on top.
+    wall_hug: f64,
+    # How hard exploration pulls toward the least known cell nearby.
+    seek_new: f64,
+    # How much of a landmark's pull is novelty rather than the landmark. At 1
+    # a cue in a thoroughly known part of the room stops attracting entirely.
+    cue_novelty: f64,
+}
+
+export function novelty_params_default() -> NoveltyParams {
+    return NoveltyParams {
+        enabled: true,
+        gain: 2.0,
+        decay: 0.001,
+        decay_every: 600,
+        wall_hug: 2.5,
+        seek_new: 1.1,
+        cue_novelty: 0.8
+    }
+}
+
+# --- the map ----------------------------------------------------------------
+
+# Which cell of the map a point falls in. The map is laid over the arena's
+# bounding box, so in a maze many of its cells sit inside walls and simply
+# never become familiar.
+export function fam_index(e: ptr<Env>, x: f64, y: f64) -> i32 {
+    let w: f64 = env_width(e)
+    let h: f64 = env_height(e)
+    if w <= 0.0 or h <= 0.0 { return 0 }
+    let mut cx: i32 = (((x - e.x0) / w) * (FAM_SIDE as f64)) as i32
+    let mut cy: i32 = (((y - e.y0) / h) * (FAM_SIDE as f64)) as i32
+    if cx < 0 { cx = 0 }
+    if cy < 0 { cy = 0 }
+    if cx >= FAM_SIDE { cx = FAM_SIDE - 1 }
+    if cy >= FAM_SIDE { cy = FAM_SIDE - 1 }
+    return cy * FAM_SIDE + cx
+}
+
+# Centre of a map cell, in room coordinates.
+export function fam_center(e: ptr<Env>, cell: i32, x_out: ptr<f64>,
+                           y_out: ptr<f64>) -> void {
+    let cx: i32 = cell % FAM_SIDE
+    let cy: i32 = cell / FAM_SIDE
+    let w: f64 = env_width(e) / (FAM_SIDE as f64)
+    let h: f64 = env_height(e) / (FAM_SIDE as f64)
+    x_out[0] = e.x0 + ((cx as f64) + 0.5) * w
+    y_out[0] = e.y0 + ((cy as f64) + 0.5) * h
+}
+
+export function familiarity_at(a: ptr<Agents>, e: ptr<Env>, i: i32,
+                               x: f64, y: f64) -> f64 {
+    let v: i32 = a.fam[i * FAM_CELLS + fam_index(e, x, y)] as i32
+    return (v as f64) / (FAM_FULL as f64)
+}
+
+export function familiarity_here(a: ptr<Agents>, e: ptr<Env>, i: i32) -> f64 {
+    return familiarity_at(a, e, i, a.x[i], a.y[i])
+}
+
+export function familiarity_cell(a: ptr<Agents>, i: i32, cell: i32) -> f64 {
+    if cell < 0 or cell >= FAM_CELLS { return 0.0 }
+    return ((a.fam[i * FAM_CELLS + cell] as i32) as f64)
+           / (FAM_FULL as f64)
+}
+
+# Standing somewhere makes it familiar, approaching one asymptotically so a
+# rat that never leaves does not run the number off to infinity.
+export function novelty_visit(a: ptr<Agents>, np: ptr<NoveltyParams>,
+                              e: ptr<Env>, i: i32, dt: f64) -> void {
+    let c: i32 = i * FAM_CELLS + fam_index(e, a.x[i], a.y[i])
+    let cur: i32 = a.fam[c] as i32
+    if cur >= FAM_FULL { return }
+    let f: f64 = (cur as f64) / (FAM_FULL as f64)
+    let want: f64 = f + (1.0 - f) * np.gain * dt
+    # Rounded, and deliberately allowed to stick. The approach to full is
+    # asymptotic, so once the increment is smaller than half a stored level
+    # the cell stops climbing: that happens at about 0.94, which is as known
+    # as anything here needs to be. Forcing it up by one level a step instead,
+    # which is what this did at first, replaced the asymptote with a straight
+    # line to full and quietly halved the wall hugging of a naive rat.
+    let mut v: i32 = (want * (FAM_FULL as f64) + 0.5) as i32
+    if v > FAM_FULL { v = FAM_FULL }
+    a.fam[c] = v as u8
+}
+
+# Everywhere fades, run every decay_every steps for the whole interval.
+export function novelty_fade(a: ptr<Agents>, np: ptr<NoveltyParams>,
+                             i: i32, elapsed: f64) -> void {
+    let base: i32 = i * FAM_CELLS
+    let mut drop: i32 = (np.decay * elapsed * (FAM_FULL as f64) + 0.5) as i32
+    # A fade too small to move a stored level is a fade that never happens.
+    # Rounding it up to one keeps the sweep meaningful at any interval, at
+    # the price of fading faster than asked when the interval is very short.
+    if drop < 1 and np.decay > 0.0 { drop = 1 }
+    for k in 0 to FAM_CELLS {
+        let v: i32 = (a.fam[base + k] as i32) - drop
+        if v <= 0 {
+            a.fam[base + k] = 0 as u8
+        } else {
+            a.fam[base + k] = v as u8
+        }
+    }
+}
+
+export function novelty_forget_all(a: ptr<Agents>, i: i32) -> void {
+    let base: i32 = i * FAM_CELLS
+    for k in 0 to FAM_CELLS {
+        a.fam[base + k] = 0 as u8
+    }
+}
+
+# --- what the map is for ----------------------------------------------------
+
+# Extra wall hugging, by how new the ground is and how little else the animal
+# has on its mind.
+#
+# Thigmotaxis is exploratory caution, and a strong motivation overrides it: a
+# hungry rat crosses the open middle to get to food, and only a rat with
+# nothing pressing spends its time working along the skirting board. Applying
+# it regardless of drive made a naive colony orbit the wall while starving,
+# and it cost eight points of the time budget, because a rat diverted on its
+# way to food is a rat still foraging rather than one back to grooming.
+#
+# The suppression is graded by whichever drive is stronger, the same shape
+# the maintenance behaviours already use, so a peckish rat still hugs a
+# little and a starving one does not hug at all.
+export function novelty_thigmotaxis(a: ptr<Agents>, np: ptr<NoveltyParams>,
+                                    e: ptr<Env>, i: i32) -> f64 {
+    if !np.enabled { return 0.0 }
+    # Only an animal with nowhere to be. A rat walking to a patch it can see
+    # is not exploring, and wall hugging is an exploratory behaviour: the
+    # classic open-field measurement is made in an empty arena for exactly
+    # this reason. Leaving it on during foraging diverted every trip to the
+    # food and cost the colony a third of its leisure.
+    if a.state[i] != ST_EXPLORE { return 0.0 }
+    let mut drive: f64 = a.hunger[i]
+    if a.thirst[i] > drive { drive = a.thirst[i] }
+    if drive > 1.0 { drive = 1.0 }
+    if drive < 0.0 { drive = 0.0 }
+    return np.wall_hug * (1.0 - familiarity_here(a, e, i)) * (1.0 - drive)
+}
+
+# How much a landmark still interests this rat: one when the part of the room
+# it stands in is new, falling toward `1 - cue_novelty` once that part is
+# thoroughly known.
+export function novelty_cue_scale(a: ptr<Agents>, np: ptr<NoveltyParams>,
+                                  e: ptr<Env>, i: i32, cue_x: f64,
+                                  cue_y: f64) -> f64 {
+    if !np.enabled { return 1.0 }
+    let f: f64 = familiarity_at(a, e, i, cue_x, cue_y)
+    return 1.0 - np.cue_novelty * f
+}
+
+# The direction of the least familiar neighbouring cell, or false when every
+# neighbour is as well known as here. Only the eight around the rat are
+# considered: this is which way to step, not where to go.
+export function novelty_bearing(a: ptr<Agents>, e: ptr<Env>, i: i32,
+                                out: ptr<f64>) -> bool {
+    let here: i32 = fam_index(e, a.x[i], a.y[i])
+    let hx: i32 = here % FAM_SIDE
+    let hy: i32 = here / FAM_SIDE
+    let base: i32 = i * FAM_CELLS
+    let mut best: i32 = a.fam[base + here] as i32
+    let mut best_cell: i32 = -1
+    let mut dy: i32 = -1
+    while dy <= 1 {
+        let ny: i32 = hy + dy
+        if ny >= 0 and ny < FAM_SIDE {
+            let mut dx: i32 = -1
+            while dx <= 1 {
+                let nx: i32 = hx + dx
+                if nx >= 0 and nx < FAM_SIDE {
+                    if dx != 0 or dy != 0 {
+                        let cell: i32 = ny * FAM_SIDE + nx
+                        # Strictly less, so ties keep the lower cell index and
+                        # the answer does not depend on scan order.
+                        if (a.fam[base + cell] as i32) < best {
+                            best = a.fam[base + cell] as i32
+                            best_cell = cell
+                        }
+                    }
+                }
+                dx = dx + 1
+            }
+        }
+        dy = dy + 1
+    }
+    if best_cell < 0 { return false }
+    let mut tx: f64 = 0.0
+    let mut ty: f64 = 0.0
+    fam_center(e, best_cell, &tx, &ty)
+    # A cell whose centre is inside a wall is not worth walking at. Checking
+    # here rather than when the map is built keeps the map free of any
+    # knowledge of the arena, and the check is one query.
+    if !env_is_free(e, tx, ty) { return false }
+    out[0] = atan2(ty - a.y[i], tx - a.x[i])
+    return true
+}
+
+# --- measuring what a rat has seen ------------------------------------------
+
+# The fraction of the arena's reachable cells this rat knows to at least
+# `level`. Cells whose centre is inside a wall are left out of both halves of
+# the fraction: in a maze most of the bounding box is not floor, and counting
+# it would make full coverage unreachable and the number meaningless.
+export function novelty_coverage(a: ptr<Agents>, e: ptr<Env>, i: i32,
+                                 level: f64) -> f64 {
+    let base: i32 = i * FAM_CELLS
+    let mut reachable: i32 = 0
+    let mut known: i32 = 0
+    for k in 0 to FAM_CELLS {
+        let mut cx: f64 = 0.0
+        let mut cy: f64 = 0.0
+        fam_center(e, k, &cx, &cy)
+        if env_is_free(e, cx, cy) {
+            reachable = reachable + 1
+            if familiarity_cell(a, i, k) >= level { known = known + 1 }
+        }
+    }
+    if reachable == 0 { return 0.0 }
+    return (known as f64) / (reachable as f64)
+}
+
+# Mean familiarity over the reachable cells, which is what the interface
+# shows as one number for how well the animal knows the room.
+export function novelty_mean(a: ptr<Agents>, e: ptr<Env>, i: i32) -> f64 {
+    let base: i32 = i * FAM_CELLS
+    let mut reachable: i32 = 0
+    let mut total: f64 = 0.0
+    for k in 0 to FAM_CELLS {
+        let mut cx: f64 = 0.0
+        let mut cy: f64 = 0.0
+        fam_center(e, k, &cx, &cy)
+        if env_is_free(e, cx, cy) {
+            reachable = reachable + 1
+            total = total + familiarity_cell(a, i, k)
+        }
+    }
+    if reachable == 0 { return 0.0 }
+    return total / (reachable as f64)
+}

@@ -1,0 +1,473 @@
+# Scores computed from a measured rate map.
+#
+# These are the standard descriptions of a spatial cell, and they are computed
+# here from binned spikes and occupancy without any reference to the model
+# that produced them. That independence is the whole point: when the measured
+# tuning of a place cell recovers the sigma the population was configured
+# with, two separate pieces of code agreed about something, which is a
+# different and better kind of evidence than a function returning what it was
+# told.
+
+import "ratemap.flow"
+
+extern {
+    function sqrt(x: f64) -> f64
+    function log(x: f64) -> f64
+    function exp(x: f64) -> f64
+    function fabs(x: f64) -> f64
+    function cos(x: f64) -> f64
+    function sin(x: f64) -> f64
+    function atan2(y: f64, x: f64) -> f64
+}
+
+const LN2: f64 = 0.6931471805599453
+
+# A lag with too few overlapping bins to correlate. Outside the range any
+# real correlation can take, so a reader can always tell it apart.
+export const CORR_NONE: f64 = -2.0
+
+export function corr_is_none(v: f64) -> bool {
+    return v < -1.5
+}
+
+# --- spatial information ----------------------------------------------------
+
+# Skaggs information, in bits per spike:
+#
+#   I = sum_i p_i * (r_i / r) * log2(r_i / r)
+#
+# where p_i is the fraction of time spent in bin i, r_i the rate there and r
+# the overall mean rate. It answers how much knowing that a spike occurred
+# tells you about where the animal was. A cell that fires everywhere equally
+# tells you nothing and scores zero; a cell that fires in one small place
+# tells you a lot.
+#
+# Bins the animal never visited are left out of both sums. Counting them as
+# silent is the easiest way to inflate this number, because it adds bins with
+# no spikes and no time and makes the firing look more concentrated than the
+# run can support.
+export function spatial_information(m: ptr<RateMap>) -> f64 {
+    let mean: f64 = ratemap_mean(m)
+    if mean <= 0.0 { return 0.0 }
+    let mut total_time: f64 = 0.0
+    for k in 0 to m.n_bins {
+        if ratemap_visited(m, k) { total_time = total_time + m.occupancy[k] }
+    }
+    if total_time <= 0.0 { return 0.0 }
+    let mut info: f64 = 0.0
+    for k in 0 to m.n_bins {
+        if ratemap_visited(m, k) {
+            let r: f64 = m.rate[k]
+            if r > 0.0 {
+                let p: f64 = m.occupancy[k] / total_time
+                info = info + p * (r / mean) * (log(r / mean) / LN2)
+            }
+        }
+    }
+    return info
+}
+
+# Sparsity in the sense used alongside the information score: the fraction of
+# the environment in which a cell is active. Near 1 is a cell that fires
+# everywhere, near 0 one that fires in a corner.
+#
+#   sparsity = (sum p_i r_i)^2 / sum p_i r_i^2
+export function spatial_sparsity(m: ptr<RateMap>) -> f64 {
+    let mut total_time: f64 = 0.0
+    for k in 0 to m.n_bins {
+        if ratemap_visited(m, k) { total_time = total_time + m.occupancy[k] }
+    }
+    if total_time <= 0.0 { return 0.0 }
+    let mut s1: f64 = 0.0
+    let mut s2: f64 = 0.0
+    for k in 0 to m.n_bins {
+        if ratemap_visited(m, k) {
+            let p: f64 = m.occupancy[k] / total_time
+            let r: f64 = m.rate[k]
+            s1 = s1 + p * r
+            s2 = s2 + p * r * r
+        }
+    }
+    if s2 <= 0.0 { return 0.0 }
+    return (s1 * s1) / s2
+}
+
+# --- fields -----------------------------------------------------------------
+
+export struct FieldStats {
+    count: i32,
+    # Area of the largest field in square metres, and of all of them.
+    largest_area: f64,
+    total_area: f64,
+    # Centre of mass of the largest field.
+    peak_x: f64,
+    peak_y: f64,
+    peak_rate: f64,
+}
+
+# Count contiguous runs of bins above a fraction of the peak rate, by flood
+# fill over four-way adjacency. This is how a place field is usually
+# delimited, and counting them is what quantifies the duplicate-field problem
+# that boundary-driven place cells show: a cell driven by wall distance alone
+# cannot tell two corners apart, so it fires in both.
+#
+# `scratch` must hold at least m.n_bins entries and is used as the visited
+# mask and the fill queue.
+export function detect_fields(m: ptr<RateMap>, frac: f64, min_bins: i32,
+                              scratch: ptr<i32>,
+                              queue: ptr<i32>) -> FieldStats {
+    let mut st: FieldStats = FieldStats {
+        count: 0, largest_area: 0.0, total_area: 0.0,
+        peak_x: 0.0, peak_y: 0.0, peak_rate: 0.0
+    }
+    let peak: f64 = ratemap_peak(m)
+    if peak <= 0.0 { return st }
+    let cut: f64 = peak * frac
+    let bin_area: f64 = m.bin_w * m.bin_h
+
+    for k in 0 to m.n_bins {
+        scratch[k] = 0
+    }
+    for seed in 0 to m.n_bins {
+        if scratch[seed] == 0 and ratemap_visited(m, seed)
+           and m.rate[seed] >= cut {
+            # Flood this field, accumulating its size and its weighted
+            # centre as we go.
+            let mut head: i32 = 0
+            let mut tail: i32 = 0
+            queue[tail] = seed
+            tail = tail + 1
+            scratch[seed] = 1
+            let mut n: i32 = 0
+            let mut wsum: f64 = 0.0
+            let mut wx: f64 = 0.0
+            let mut wy: f64 = 0.0
+            let mut fpeak: f64 = 0.0
+            while head < tail {
+                let b: i32 = queue[head]
+                head = head + 1
+                n = n + 1
+                let r: f64 = m.rate[b]
+                let mut cx: f64 = 0.0
+                let mut cy: f64 = 0.0
+                ratemap_center(m, b, &cx, &cy)
+                wsum = wsum + r
+                wx = wx + r * cx
+                wy = wy + r * cy
+                if r > fpeak { fpeak = r }
+
+                let bx: i32 = b % m.nx
+                let by: i32 = b / m.nx
+                # Four-way, which is the usual choice: eight-way joins fields
+                # that touch only at a corner and undercounts.
+                let mut d: i32 = 0
+                while d < 4 {
+                    let mut nx2: i32 = bx
+                    let mut ny2: i32 = by
+                    if d == 0 { nx2 = bx - 1 }
+                    if d == 1 { nx2 = bx + 1 }
+                    if d == 2 { ny2 = by - 1 }
+                    if d == 3 { ny2 = by + 1 }
+                    if nx2 >= 0 and nx2 < m.nx and ny2 >= 0 and ny2 < m.ny {
+                        let nb: i32 = ny2 * m.nx + nx2
+                        if scratch[nb] == 0 and ratemap_visited(m, nb)
+                           and m.rate[nb] >= cut {
+                            scratch[nb] = 1
+                            queue[tail] = nb
+                            tail = tail + 1
+                        }
+                    }
+                    d = d + 1
+                }
+            }
+            if n >= min_bins {
+                let area: f64 = (n as f64) * bin_area
+                st.count = st.count + 1
+                st.total_area = st.total_area + area
+                if area > st.largest_area {
+                    st.largest_area = area
+                    st.peak_rate = fpeak
+                    if wsum > 0.0 {
+                        st.peak_x = wx / wsum
+                        st.peak_y = wy / wsum
+                    }
+                }
+            }
+        }
+    }
+    return st
+}
+
+# --- gridness ---------------------------------------------------------------
+
+# The spatial autocorrelogram of a rate map, at integer bin lags. This is what
+# a gridness score is computed from: a hexagonal firing pattern produces six
+# peaks around the centre at sixty degree intervals, and rotating the
+# correlogram by sixty degrees leaves it looking the same while thirty degrees
+# does not.
+#
+# Pearson correlation over the overlapping bins at each lag, which is the
+# standard definition and is what makes the centre exactly 1.
+export function autocorrelogram(m: ptr<RateMap>, out: ptr<f64>,
+                                side: i32) -> void {
+    let half: i32 = side / 2
+    for oy in 0 to side {
+        for ox in 0 to side {
+            let lx: i32 = ox - half
+            let ly: i32 = oy - half
+            let mut n: i32 = 0
+            let mut sa: f64 = 0.0
+            let mut sb: f64 = 0.0
+            let mut saa: f64 = 0.0
+            let mut sbb: f64 = 0.0
+            let mut sab: f64 = 0.0
+            for by in 0 to m.ny {
+                for bx in 0 to m.nx {
+                    let jx: i32 = bx + lx
+                    let jy: i32 = by + ly
+                    if jx >= 0 and jx < m.nx and jy >= 0 and jy < m.ny {
+                        let i1: i32 = by * m.nx + bx
+                        let i2: i32 = jy * m.nx + jx
+                        if ratemap_visited(m, i1) and ratemap_visited(m, i2) {
+                            let a: f64 = m.rate[i1]
+                            let b: f64 = m.rate[i2]
+                            n = n + 1
+                            sa = sa + a
+                            sb = sb + b
+                            saa = saa + a * a
+                            sbb = sbb + b * b
+                            sab = sab + a * b
+                        }
+                    }
+                }
+            }
+            # Fewer than twenty overlapping bins is not a correlation, it is
+            # a coincidence, and at large lags there are only a handful.
+            #
+            # Marked with a value no correlation can take, rather than with
+            # zero. Zero is a perfectly good answer that means the map does
+            # not resemble itself at that shift, and conflating the two made
+            # a correlogram from a thinly covered run draw as a solid block
+            # of mid-ramp colour: uniform signal where there was no data.
+            if n < 20 {
+                out[oy * side + ox] = CORR_NONE
+            } else {
+                let nn: f64 = n as f64
+                let cov: f64 = sab / nn - (sa / nn) * (sb / nn)
+                let va: f64 = saa / nn - (sa / nn) * (sa / nn)
+                let vb: f64 = sbb / nn - (sb / nn) * (sb / nn)
+                if va <= 0.0 or vb <= 0.0 {
+                    out[oy * side + ox] = 0.0
+                } else {
+                    out[oy * side + ox] = cov / sqrt(va * vb)
+                }
+            }
+        }
+    }
+}
+
+# Mean correlation over an annulus of the correlogram, rotated by `deg`
+# degrees. Sampled with nearest-neighbour lookup, which is coarse but is what
+# the annulus radii make of it anyway.
+function annulus_rotated(corr: ptr<f64>, side: i32, inner: f64, outer: f64,
+                         deg: f64) -> f64 {
+    let half: f64 = (side / 2) as f64
+    let rad: f64 = deg * 3.141592653589793 / 180.0
+    let cs: f64 = cos(rad)
+    let sn: f64 = sin(rad)
+    let mut sum: f64 = 0.0
+    let mut n: i32 = 0
+    for y in 0 to side {
+        for x in 0 to side {
+            let dx: f64 = (x as f64) - half
+            let dy: f64 = (y as f64) - half
+            let r: f64 = sqrt(dx * dx + dy * dy)
+            if r >= inner and r <= outer {
+                let rx: f64 = dx * cs - dy * sn + half
+                let ry: f64 = dx * sn + dy * cs + half
+                let sx: i32 = (rx + 0.5) as i32
+                let sy: i32 = (ry + 0.5) as i32
+                if sx >= 0 and sx < side and sy >= 0 and sy < side {
+                    let a: f64 = corr[y * side + x]
+                    let b: f64 = corr[sy * side + sx]
+                    if !corr_is_none(a) and !corr_is_none(b) {
+                        sum = sum + a * b
+                        n = n + 1
+                    }
+                }
+            }
+        }
+    }
+    if n == 0 { return 0.0 }
+    return sum / (n as f64)
+}
+
+# Mean correlation at one integer radius from the centre.
+function ring_mean(corr: ptr<f64>, side: i32, radius: f64) -> f64 {
+    let half: f64 = (side / 2) as f64
+    let mut sum: f64 = 0.0
+    let mut n: i32 = 0
+    for y in 0 to side {
+        for x in 0 to side {
+            let dx: f64 = (x as f64) - half
+            let dy: f64 = (y as f64) - half
+            let r: f64 = sqrt(dx * dx + dy * dy)
+            if r >= radius - 0.5 and r < radius + 0.5 {
+                let v: f64 = corr[y * side + x]
+                if !corr_is_none(v) {
+                    sum = sum + v
+                    n = n + 1
+                }
+            }
+        }
+    }
+    if n == 0 { return 0.0 }
+    return sum / (n as f64)
+}
+
+# Where the first ring of off-centre peaks sits, in bins, found from the
+# correlogram rather than assumed.
+#
+# The annulus a gridness score is computed over has to contain that ring. Get
+# it wrong and the score measures nothing: the first attempt here used a fixed
+# fraction of the correlogram's size, which for a 0.35 m grid in a 2 m arena
+# put the inner edge of the annulus outside the very peaks it was supposed to
+# be looking at, and every grid cell scored about zero.
+#
+# The correlation falls away from the central peak and rises again at the
+# first ring, so the ring is the first radius where it starts climbing again
+# after the trough.
+export function first_ring(corr: ptr<f64>, side: i32) -> f64 {
+    let half: i32 = side / 2
+    let mut trough: f64 = 2.0
+    let mut trough_r: i32 = 1
+    let mut r: i32 = 1
+    while r < half {
+        let v: f64 = ring_mean(corr, side, r as f64)
+        if v < trough {
+            trough = v
+            trough_r = r
+        }
+        r = r + 1
+    }
+    # The peak after the trough.
+    let mut peak: f64 = -2.0
+    let mut peak_r: i32 = trough_r + 1
+    let mut r2: i32 = trough_r + 1
+    while r2 < half {
+        let v: f64 = ring_mean(corr, side, r2 as f64)
+        if v > peak {
+            peak = v
+            peak_r = r2
+        }
+        r2 = r2 + 1
+    }
+    if peak_r < 2 { return 2.0 }
+    return peak_r as f64
+}
+
+# Gridness over an annulus placed on the first ring, which is the usual
+# recipe and needs nothing to be told to it.
+export function gridness_auto(corr: ptr<f64>, side: i32) -> f64 {
+    let ring: f64 = first_ring(corr, side)
+    let mut inner: f64 = ring * 0.5
+    if inner < 1.5 { inner = 1.5 }
+    let outer: f64 = ring * 1.5
+    return gridness(corr, side, inner, outer)
+}
+
+# Gridness: how much more the correlogram looks like itself rotated by 60 and
+# 120 degrees than by 30, 90 and 150.
+#
+#   gridness = min(corr at 60, corr at 120) - max(corr at 30, 90, 150)
+#
+# A hexagonal lattice scores well above zero. Anything else, including a
+# single blob, scores at or below it. The annulus excludes the central peak,
+# which correlates perfectly with itself at every rotation and would swamp
+# the result.
+export function gridness(corr: ptr<f64>, side: i32, inner: f64,
+                         outer: f64) -> f64 {
+    let c60: f64 = annulus_rotated(corr, side, inner, outer, 60.0)
+    let c120: f64 = annulus_rotated(corr, side, inner, outer, 120.0)
+    let c30: f64 = annulus_rotated(corr, side, inner, outer, 30.0)
+    let c90: f64 = annulus_rotated(corr, side, inner, outer, 90.0)
+    let c150: f64 = annulus_rotated(corr, side, inner, outer, 150.0)
+    let mut aligned: f64 = c60
+    if c120 < aligned { aligned = c120 }
+    let mut off: f64 = c30
+    if c90 > off { off = c90 }
+    if c150 > off { off = c150 }
+    return aligned - off
+}
+
+# --- head direction ---------------------------------------------------------
+
+export struct TuningStats {
+    # Preferred direction in radians, and the mean resultant length, which is
+    # 1 for a perfectly concentrated cell and 0 for one with no preference.
+    preferred: f64,
+    vector_length: f64,
+    peak_rate: f64,
+    mean_rate: f64,
+    # Rayleigh's test for whether the tuning is directional at all: z, and
+    # the p value from the standard approximation. n is the number of spikes,
+    # because that is the sample size the test is about.
+    rayleigh_z: f64,
+    rayleigh_p: f64,
+    n: f64,
+}
+
+# Circular statistics over a binned head-direction histogram: spikes and
+# occupancy per bin, bins evenly spaced over the circle.
+#
+# The vector is computed over the rate rather than the raw spike count,
+# because uneven sampling of headings would otherwise show up as tuning. A rat
+# that spends longer facing the wall fires more spikes facing the wall
+# whatever its cells prefer.
+export function tuning_stats(spikes: ptr<f64>, occ: ptr<f64>,
+                             bins: i32) -> TuningStats {
+    let mut st: TuningStats = TuningStats {
+        preferred: 0.0, vector_length: 0.0, peak_rate: 0.0, mean_rate: 0.0,
+        rayleigh_z: 0.0, rayleigh_p: 1.0, n: 0.0
+    }
+    let step: f64 = 6.283185307179586 / (bins as f64)
+    let mut sx: f64 = 0.0
+    let mut sy: f64 = 0.0
+    let mut total: f64 = 0.0
+    let mut spike_total: f64 = 0.0
+    let mut used: i32 = 0
+    for b in 0 to bins {
+        if occ[b] > 0.0 {
+            let r: f64 = spikes[b] / occ[b]
+            let ang: f64 = ((b as f64) + 0.5) * step
+            sx = sx + r * cos(ang)
+            sy = sy + r * sin(ang)
+            total = total + r
+            spike_total = spike_total + spikes[b]
+            used = used + 1
+            if r > st.peak_rate { st.peak_rate = r }
+        }
+    }
+    if used == 0 or total <= 0.0 { return st }
+    st.mean_rate = total / (used as f64)
+    st.preferred = atan2(sy, sx)
+    st.vector_length = sqrt(sx * sx + sy * sy) / total
+    st.n = spike_total
+
+    # Rayleigh. z = n R^2, and for moderate n the p value is well
+    # approximated by exp(sqrt(1 + 4n + 4(n^2 - (nR)^2)) - (1 + 2n)).
+    let n: f64 = spike_total
+    if n > 0.0 {
+        let r: f64 = st.vector_length
+        st.rayleigh_z = n * r * r
+        let nr: f64 = n * r
+        let inner: f64 = 1.0 + 4.0 * n + 4.0 * (n * n - nr * nr)
+        if inner >= 0.0 {
+            let mut p: f64 = exp(sqrt(inner) - (1.0 + 2.0 * n))
+            if p > 1.0 { p = 1.0 }
+            if p < 0.0 { p = 0.0 }
+            st.rayleigh_p = p
+        }
+    }
+    return st
+}

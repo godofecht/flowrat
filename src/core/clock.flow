@@ -1,0 +1,27 @@
+# Monotonic wall-clock time.
+#
+# flow_rt_monotonic_timespec is part of the always-linked Flow runtime
+# (runtime/flow_rt_support.c), so this works headless as well as under a
+# window. gfx_time_ms is deliberately not used here: it is virtual in the
+# recorder, which is right for animation and wrong for a benchmark.
+
+extern {
+    function flow_rt_monotonic_timespec(sec_out: ptr<i64>, nsec_out: ptr<i64>) -> i32
+}
+
+export function clock_ns() -> i64 {
+    let mut sec: i64 = 0
+    let mut nsec: i64 = 0
+    let rc: i32 = flow_rt_monotonic_timespec(&sec, &nsec)
+    if rc != 0 { return 0 }
+    return sec * 1000000000 + nsec
+}
+
+export function clock_ms() -> f64 {
+    return (clock_ns() as f64) / 1000000.0
+}
+
+# Milliseconds since a start stamp taken with clock_ns().
+export function clock_since_ms(start_ns: i64) -> f64 {
+    return ((clock_ns() - start_ns) as f64) / 1000000.0
+}

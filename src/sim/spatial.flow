@@ -1,0 +1,402 @@
+# A uniform grid over the arena, so a rat can find its neighbours.
+#
+# WHY THIS EXISTS
+#   Four thousand rats were four thousand independent simulations. They walked
+#   through each other and through crowds at a patch without noticing. Any
+#   behaviour that involves another animal needs the question "who is near
+#   me", and asking it by looping over every rat is quadratic: at the maximum
+#   batch that is sixteen million distance tests per step, which is more work
+#   than everything else in FlowRat put together.
+#
+#   A uniform grid answers it in constant time per query. Bin every rat by
+#   which cell it is standing in, then look only in the cell and its eight
+#   neighbours. That is O(n) to build and O(n) to query the whole batch, and
+#   the whole structure is three integer arrays.
+#
+# WHY A COUNTING SORT
+#   The build is a counting sort by cell index: count how many rats fall in
+#   each cell, prefix sum those counts into start offsets, then place each rat
+#   at its cell's next free slot. No allocation per step, no linked lists, no
+#   pointer chasing. The result is rat indices laid out contiguously by cell,
+#   which is also the order the neighbour scan wants to read them in.
+#
+# WHY THE CELL IS THE QUERY RADIUS
+#   A query looks at the 3 by 3 block of cells around the asking rat. That is
+#   only correct if no rat outside the block can be within the radius, which
+#   means the cell has to be at least as wide as the radius. Making it exactly
+#   the radius keeps the block as small as it can be while staying correct.
+#
+# DETERMINISM, AND WHY THE GRID KEEPS ITS OWN COPY OF THE POSITIONS
+#   The build is serial and the query is read-only, so no two rats race on
+#   the grid itself. That is not enough. The grid holds indices, and the
+#   obvious way to answer "how far is rat j" is to read a.x[j] and a.y[j] --
+#   which is exactly what the parallel motion pass is busy writing. Rat i
+#   would see rat j before or after j moved depending on which thread got
+#   there first, and the batch stopped being bit-identical: two runs of one
+#   seed diverged by most of a metre over four hundred steps.
+#
+#   So the build copies the positions, headings and speeds it binned, and the
+#   queries read the copy. Nothing writes it between the build and the end of
+#   the step. That costs four doubles per rat, 128 KB at the maximum batch,
+#   and it buys the guarantee back.
+#
+#   It is also the more defensible model. Every rat now reacts to the same
+#   instant of the colony rather than to a mixture of before and after, which
+#   is what a simultaneous update is supposed to mean.
+#
+#   Rats within a cell come out in ascending index order, because the
+#   counting sort places them in the order it walks the batch, so a query
+#   returns the same neighbours in the same order on every run.
+#   validate.flow checks the whole thing against a brute-force reference
+#   rather than trusting this comment.
+
+extern {
+    function sqrt(x: f64) -> f64
+    function floor(x: f64) -> f64
+}
+
+# Above this the grid stops subdividing and cells get larger instead. A
+# 256 by 256 grid is 65536 cells, which is 512 KB of offsets: past that the
+# build costs more than the queries save.
+export const GRID_MAX_SIDE: i32 = 256
+
+export struct Grid {
+    nx: i32,
+    ny: i32,
+    n_cells: i32,
+    cell: f64,
+    inv_cell: f64,
+    x0: f64,
+    y0: f64,
+    # n_cells + 1 start offsets, prefix summed. Cell c holds the rats in
+    # items[starts[c] .. starts[c + 1]).
+    starts: ptr<i32>,
+    # A write cursor per cell, used only during the build.
+    cursor: ptr<i32>,
+    # Rat indices, sorted by cell.
+    items: ptr<i32>,
+    # The state the queries read, frozen at build time. Indexed by rat, not
+    # by grid slot, so a query can go straight from an item to its position.
+    px: ptr<f64>,
+    py: ptr<f64>,
+    ph: ptr<f64>,
+    pv: ptr<f64>,
+    cap: i32,
+    n: i32,
+    # Bumped whenever the grid is rebuilt, so a reader can tell whether what
+    # it is holding is still current.
+    revision: i32,
+}
+
+export function grid_create(cap: i32) -> Grid {
+    let cells: i32 = GRID_MAX_SIDE * GRID_MAX_SIDE
+    let g: Grid = Grid {
+        nx: 1, ny: 1, n_cells: 1,
+        cell: 1.0, inv_cell: 1.0,
+        x0: 0.0, y0: 0.0,
+        starts: mem_alloc_i32((cells + 1) as i64, "grid starts"),
+        cursor: mem_alloc_i32(cells as i64, "grid cursor"),
+        items: mem_alloc_i32(cap as i64, "grid items"),
+        px: mem_alloc_f64(cap as i64, "grid x"),
+        py: mem_alloc_f64(cap as i64, "grid y"),
+        ph: mem_alloc_f64(cap as i64, "grid heading"),
+        pv: mem_alloc_f64(cap as i64, "grid speed"),
+        cap: cap,
+        n: 0,
+        revision: 0
+    }
+    # An empty single cell, so a query before the first build reads a valid
+    # empty range rather than whatever malloc happened to return. Nothing in
+    # FlowRat queries an unbuilt grid today, and this is here so that a future
+    # caller that does gets no neighbours instead of a wild read.
+    if g.starts != null {
+        g.starts[0] = 0
+        g.starts[1] = 0
+    }
+    if g.cursor != null { g.cursor[0] = 0 }
+    return g
+}
+
+export function grid_destroy(g: ptr<Grid>) -> void {
+    mem_release(g.starts as ptr<void>)
+    mem_release(g.cursor as ptr<void>)
+    mem_release(g.items as ptr<void>)
+    mem_release(g.px as ptr<void>)
+    mem_release(g.py as ptr<void>)
+    mem_release(g.ph as ptr<void>)
+    mem_release(g.pv as ptr<void>)
+    g.starts = null
+    g.cursor = null
+    g.items = null
+    g.px = null
+    g.py = null
+    g.ph = null
+    g.pv = null
+    g.n = 0
+}
+
+export function grid_ready(g: ptr<Grid>) -> bool {
+    if g.starts == null or g.cursor == null or g.items == null {
+        return false
+    }
+    return g.px != null and g.py != null and g.ph != null and g.pv != null
+}
+
+# Which cell a point falls in, clamped to the grid. Clamping rather than
+# rejecting matters: a rat pushed a hair outside the arena by a collision
+# still has to be findable, and a rat that vanished from the grid would be
+# invisible to its neighbours while remaining visible to itself.
+function grid_cell_of(g: ptr<Grid>, x: f64, y: f64) -> i32 {
+    let mut cx: i32 = ((x - g.x0) * g.inv_cell) as i32
+    let mut cy: i32 = ((y - g.y0) * g.inv_cell) as i32
+    if cx < 0 { cx = 0 }
+    if cy < 0 { cy = 0 }
+    if cx >= g.nx { cx = g.nx - 1 }
+    if cy >= g.ny { cy = g.ny - 1 }
+    return cy * g.nx + cx
+}
+
+# Lay the grid over the arena at a cell size of `radius`, then bin the batch.
+# Serial, once per step, before the parallel motion pass reads it.
+export function grid_build(g: ptr<Grid>, a: ptr<Agents>, e: ptr<Env>,
+                           radius: f64) -> void {
+    if !grid_ready(g) { return }
+    g.revision = g.revision + 1
+    g.n = a.n
+
+    let mut r: f64 = radius
+    if r < 0.01 { r = 0.01 }
+    let w: f64 = env_width(e)
+    let h: f64 = env_height(e)
+
+    # Cells across, capped. Past the cap the cell grows instead, which keeps
+    # the query correct at the price of scanning more rats per block.
+    let mut nx: i32 = ((w / r) as i32) + 1
+    let mut ny: i32 = ((h / r) as i32) + 1
+    if nx < 1 { nx = 1 }
+    if ny < 1 { ny = 1 }
+    if nx > GRID_MAX_SIDE { nx = GRID_MAX_SIDE }
+    if ny > GRID_MAX_SIDE { ny = GRID_MAX_SIDE }
+    # The cell has to cover the radius or the 3 by 3 block is not enough. If
+    # the cap forced fewer cells than the radius wants, widen the cell to
+    # match rather than return wrong answers.
+    let need_x: f64 = w / (nx as f64)
+    let need_y: f64 = h / (ny as f64)
+    let mut cell: f64 = r
+    if need_x > cell { cell = need_x }
+    if need_y > cell { cell = need_y }
+
+    g.nx = nx
+    g.ny = ny
+    g.n_cells = nx * ny
+    g.cell = cell
+    g.inv_cell = 1.0 / cell
+    g.x0 = e.x0
+    g.y0 = e.y0
+
+    for c in 0 to g.n_cells + 1 {
+        g.starts[c] = 0
+    }
+    # Counts land one slot to the right, so the prefix sum below turns them
+    # into start offsets in place.
+    for i in 0 to a.n {
+        let c: i32 = grid_cell_of(g, a.x[i], a.y[i])
+        g.starts[c + 1] = g.starts[c + 1] + 1
+    }
+    for c in 0 to g.n_cells {
+        g.starts[c + 1] = g.starts[c + 1] + g.starts[c]
+        g.cursor[c] = g.starts[c]
+    }
+    # Walking the batch in index order is what makes each cell's contents
+    # come out sorted, and that ordering is what the determinism check rests
+    # on.
+    for i in 0 to a.n {
+        let c: i32 = grid_cell_of(g, a.x[i], a.y[i])
+        if g.cursor[c] < g.cap {
+            g.items[g.cursor[c]] = i
+            g.cursor[c] = g.cursor[c] + 1
+        }
+        # Freeze what the queries will read. See the note at the top: reading
+        # a.x[j] from the parallel pass is a race against rat j's own thread.
+        g.px[i] = a.x[i]
+        g.py[i] = a.y[i]
+        g.ph[i] = a.heading[i]
+        g.pv[i] = a.speed[i]
+    }
+}
+
+# --- queries ----------------------------------------------------------------
+
+# The nearest other rat within `radius`, or -1. Writes the distance and the
+# bearing from `self` to it.
+# Takes no Agents. It cannot: reading live agent state from inside the
+# parallel pass is the race this whole snapshot exists to prevent, and the
+# surest way to not do it by accident is to not have the pointer.
+export function grid_nearest(g: ptr<Grid>, me: i32,
+                             radius: f64, dist_out: ptr<f64>,
+                             dx_out: ptr<f64>, dy_out: ptr<f64>) -> i32 {
+    dist_out[0] = GEO_FAR
+    dx_out[0] = 0.0
+    dy_out[0] = 0.0
+    if !grid_ready(g) or g.n_cells <= 0 { return -1 }
+    let px: f64 = g.px[me]
+    let py: f64 = g.py[me]
+    let c: i32 = grid_cell_of(g, px, py)
+    let cx: i32 = c % g.nx
+    let cy: i32 = c / g.nx
+    let r2: f64 = radius * radius
+    let mut best: f64 = r2
+    let mut best_i: i32 = -1
+
+    let mut gy: i32 = cy - 1
+    while gy <= cy + 1 {
+        if gy >= 0 and gy < g.ny {
+            let mut gx: i32 = cx - 1
+            while gx <= cx + 1 {
+                if gx >= 0 and gx < g.nx {
+                    let cc: i32 = gy * g.nx + gx
+                    let s: i32 = g.starts[cc]
+                    let en: i32 = g.starts[cc + 1]
+                    for k in s to en {
+                        let j: i32 = g.items[k]
+                        if j != me {
+                            let ddx: f64 = g.px[j] - px
+                            let ddy: f64 = g.py[j] - py
+                            let d2: f64 = ddx * ddx + ddy * ddy
+                            # Strictly closer, so ties resolve to the lower
+                            # index. Without that the answer would depend on
+                            # scan order, which is exactly what a determinism
+                            # check would catch later and harder.
+                            if d2 < best {
+                                best = d2
+                                best_i = j
+                                dx_out[0] = ddx
+                                dy_out[0] = ddy
+                            }
+                        }
+                    }
+                }
+                gx = gx + 1
+            }
+        }
+        gy = gy + 1
+    }
+    if best_i < 0 { return -1 }
+    dist_out[0] = sqrt(best)
+    return best_i
+}
+
+# How many other rats are within `radius`, and the mean heading of the ones
+# that are moving. The count is what crowding reads; the heading is what
+# following steers by.
+export function grid_neighbours(g: ptr<Grid>, me: i32,
+                                radius: f64, hx_out: ptr<f64>,
+                                hy_out: ptr<f64>) -> i32 {
+    hx_out[0] = 0.0
+    hy_out[0] = 0.0
+    if !grid_ready(g) or g.n_cells <= 0 { return 0 }
+    let px: f64 = g.px[me]
+    let py: f64 = g.py[me]
+    let c: i32 = grid_cell_of(g, px, py)
+    let cx: i32 = c % g.nx
+    let cy: i32 = c / g.nx
+    let r2: f64 = radius * radius
+    let mut n: i32 = 0
+    let mut sx: f64 = 0.0
+    let mut sy: f64 = 0.0
+
+    let mut gy: i32 = cy - 1
+    while gy <= cy + 1 {
+        if gy >= 0 and gy < g.ny {
+            let mut gx: i32 = cx - 1
+            while gx <= cx + 1 {
+                if gx >= 0 and gx < g.nx {
+                    let cc: i32 = gy * g.nx + gx
+                    let s: i32 = g.starts[cc]
+                    let en: i32 = g.starts[cc + 1]
+                    for k in s to en {
+                        let j: i32 = g.items[k]
+                        if j != me {
+                            let ddx: f64 = g.px[j] - px
+                            let ddy: f64 = g.py[j] - py
+                            if ddx * ddx + ddy * ddy <= r2 {
+                                n = n + 1
+                                # Summed as a unit vector per neighbour, so a
+                                # fast rat does not outvote a slow one. The
+                                # mean of angles has to be taken this way:
+                                # averaging the numbers themselves puts the
+                                # mean of 3.1 and -3.1 radians at zero, which
+                                # is the opposite direction.
+                                if g.pv[j] > 0.0001 {
+                                    sx = sx + cos(g.ph[j])
+                                    sy = sy + sin(g.ph[j])
+                                }
+                            }
+                        }
+                    }
+                }
+                gx = gx + 1
+            }
+        }
+        gy = gy + 1
+    }
+    hx_out[0] = sx
+    hy_out[0] = sy
+    return n
+}
+
+# How many rats currently have someone inside their personal space. A live
+# number for the interface: `crowd` on an agent is only written when it takes
+# a mouthful, so it reads zero whenever nobody happens to be eating, which
+# says nothing about whether the colony is packed together.
+export function grid_touching(g: ptr<Grid>, radius: f64) -> i32 {
+    if !grid_ready(g) { return 0 }
+    let mut n: i32 = 0
+    for i in 0 to g.n {
+        let mut d: f64 = 0.0
+        let mut dx: f64 = 0.0
+        let mut dy: f64 = 0.0
+        if grid_nearest(g, i, radius, &d, &dx, &dy) >= 0 { n = n + 1 }
+    }
+    return n
+}
+
+# --- the brute-force reference ---------------------------------------------
+
+# What the grid is supposed to agree with. Kept here rather than in the test
+# so the two live next to each other and the reference cannot drift into
+# asking a different question from the thing it is checking.
+export function grid_nearest_brute(a: ptr<Agents>, me: i32, radius: f64,
+                                   dist_out: ptr<f64>) -> i32 {
+    dist_out[0] = GEO_FAR
+    let mut best: f64 = radius * radius
+    let mut best_i: i32 = -1
+    for j in 0 to a.n {
+        if j != me {
+            let ddx: f64 = a.x[j] - a.x[me]
+            let ddy: f64 = a.y[j] - a.y[me]
+            let d2: f64 = ddx * ddx + ddy * ddy
+            if d2 < best {
+                best = d2
+                best_i = j
+            }
+        }
+    }
+    if best_i < 0 { return -1 }
+    dist_out[0] = sqrt(best)
+    return best_i
+}
+
+export function grid_count_brute(a: ptr<Agents>, me: i32,
+                                 radius: f64) -> i32 {
+    let r2: f64 = radius * radius
+    let mut n: i32 = 0
+    for j in 0 to a.n {
+        if j != me {
+            let ddx: f64 = a.x[j] - a.x[me]
+            let ddy: f64 = a.y[j] - a.y[me]
+            if ddx * ddx + ddy * ddy <= r2 { n = n + 1 }
+        }
+    }
+    return n
+}

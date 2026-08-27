@@ -1,0 +1,153 @@
+# Grid cells, analytic.
+#
+# The sum of three plane waves 60 degrees apart is a hexagonal lattice. That
+# is the standard closed form for a grid field and it is exact, so this
+# population is the reference the recurrent attractor in attractor.flow is
+# checked against.
+#
+#   g(r) = (1/3) * sum_{i=0..2} cos( k_i . (r - phase) )
+#   k_i  = (4 pi) / (sqrt(3) * spacing) * ( cos(theta + 60 i), sin(theta + 60 i) )
+#
+# g runs from -0.5 to 1. Rescaling to [0, 1] and cubing sharpens the peaks
+# into something that looks like a recorded rate map instead of a smooth
+# ripple; the exponent is the one free choice here and it is stated as a
+# parameter rather than buried.
+#
+# MODULES
+#   Real grid cells come in discrete modules whose spacings step up by a
+#   roughly constant ratio. Cells are assigned to modules in equal blocks,
+#   each module gets its own spacing and orientation, and phases are
+#   scattered within a module. Without modules a "grid population" is just
+#   one cell drawn many times.
+#
+# PROPERTIES
+#   p0  spacing in metres
+#   p1  orientation in radians
+#   p2  phase x
+#   p3  phase y
+#   p4  peak rate in Hz
+
+extern {
+    function exp(x: f64) -> f64
+    function cos(x: f64) -> f64
+    function sin(x: f64) -> f64
+    function sqrt(x: f64) -> f64
+}
+
+const STREAM_GRID_PX: u32 = 70001
+const STREAM_GRID_PY: u32 = 70003
+const STREAM_GRID_OR: u32 = 70009
+
+const DEG60: f64 = 1.0471975511965976
+
+export struct GridParams {
+    n_modules: i32,
+    base_spacing: f64,
+    # Ratio between consecutive module spacings. Around 1.42 is what the
+    # recordings report, and it is close enough to sqrt(2) to be memorable.
+    spacing_ratio: f64,
+    base_orientation: f64,
+    orientation_jitter: f64,
+    peak_rate: f64,
+    # Exponent applied to the normalised lattice. 1 is the raw cosine sum,
+    # higher values sharpen the fields.
+    sharpness: f64,
+}
+
+export function grid_params_default() -> GridParams {
+    return GridParams {
+        n_modules: 3,
+        base_spacing: 0.35,
+        spacing_ratio: 1.42,
+        base_orientation: 0.2,
+        orientation_jitter: 0.12,
+        peak_rate: 18.0,
+        sharpness: 3.0
+    }
+}
+
+export function grid_configure(p: ptr<Pop>, gp: ptr<GridParams>,
+                               seed: u32) -> void {
+    let mut nm: i32 = gp.n_modules
+    if nm < 1 { nm = 1 }
+    let per: i32 = (p.n + nm - 1) / nm
+    for c in 0 to p.n {
+        let m: i32 = c / per
+        let mut spacing: f64 = gp.base_spacing
+        for k in 0 to m {
+            spacing = spacing * gp.spacing_ratio
+        }
+        p.p0[c] = spacing
+        # One orientation per module, jittered per cell by a small amount so
+        # a module reads as a family rather than as identical copies.
+        p.p1[c] = gp.base_orientation + (m as f64) * 0.15
+                  + rng_sym(seed, STREAM_GRID_OR, (c as u32) + 1,
+                            gp.orientation_jitter)
+        # Phases scattered over one lattice cell. Anything beyond that is a
+        # repeat of a phase already present.
+        p.p2[c] = rng_u01(seed, STREAM_GRID_PX, (c as u32) + 1) * spacing
+        p.p3[c] = rng_u01(seed, STREAM_GRID_PY, (c as u32) + 1) * spacing
+        p.p4[c] = gp.peak_rate
+    }
+    p.revision = p.revision + 1
+}
+
+# The lattice value at a point, normalised to [0, 1].
+export function grid_lattice(spacing: f64, orientation: f64,
+                             phase_x: f64, phase_y: f64,
+                             x: f64, y: f64) -> f64 {
+    let kmag: f64 = 12.566370614359172 / (1.7320508075688772 * spacing)
+    let dx: f64 = x - phase_x
+    let dy: f64 = y - phase_y
+    let mut s: f64 = 0.0
+    for i in 0 to 3 {
+        let ang: f64 = orientation + (i as f64) * DEG60
+        s = s + cos(kmag * (dx * cos(ang) + dy * sin(ang)))
+    }
+    s = s / 3.0
+    # s is in [-0.5, 1]; map to [0, 1].
+    return (s + 0.5) / 1.5
+}
+
+export function grid_rate_at(p: ptr<Pop>, cell: i32, gp: ptr<GridParams>,
+                             x: f64, y: f64) -> f64 {
+    let n: f64 = grid_lattice(p.p0[cell], p.p1[cell], p.p2[cell],
+                              p.p3[cell], x, y)
+    let mut v: f64 = n
+    # Integer sharpening by repeated multiplication: the exponent is small
+    # and fixed, and this avoids a pow call in the inner loop.
+    let e: i32 = gp.sharpness as i32
+    for k in 1 to e {
+        v = v * n
+    }
+    return p.p4[cell] * v
+}
+
+export function grid_update(p: ptr<Pop>, a: ptr<Agents>,
+                            gp: ptr<GridParams>) -> void {
+    if !p.enabled { return }
+    let e: i32 = gp.sharpness as i32
+    parallel for r in 0 to a.n {
+        let base: i32 = r * p.n
+        let rx: f64 = a.x[r]
+        let ry: f64 = a.y[r]
+        for c in 0 to p.n {
+            let n: f64 = grid_lattice(p.p0[c], p.p1[c], p.p2[c], p.p3[c],
+                                      rx, ry)
+            let mut v: f64 = n
+            for k in 1 to e {
+                v = v * n
+            }
+            p.rates[base + c] = p.p4[c] * v
+        }
+    }
+}
+
+# Number of distinct module spacings present, for the inspector.
+export function grid_module_of(p: ptr<Pop>, cell: i32,
+                               gp: ptr<GridParams>) -> i32 {
+    let mut nm: i32 = gp.n_modules
+    if nm < 1 { nm = 1 }
+    let per: i32 = (p.n + nm - 1) / nm
+    return cell / per
+}

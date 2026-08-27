@@ -1,0 +1,307 @@
+# The neural population framework.
+#
+# A population is N cells whose firing rates are a function of the batched rat
+# state. Every population, whatever it encodes, has the same shape:
+#
+#   rates       N per rat, laid out rat-major
+#   properties  five per-cell f64 arrays whose meaning the population type
+#               chooses
+#   spikes      optional Poisson draws from the rates
+#   history     optional ring of past population vectors for one rat
+#
+# WHY FIVE UNTYPED PROPERTY ARRAYS
+#   A place cell needs a centre, a width and a peak rate. A head-direction
+#   cell needs a preferred angle, a width and a gain. A boundary cell needs a
+#   preferred distance and a preferred bearing. Giving each type its own
+#   struct would mean a separate allocation path, a separate serialiser and a
+#   separate inspector for each. Instead every population gets the same five
+#   dense arrays and documents what it stores in them. Adding a population is
+#   then a configure function and an update function and nothing else.
+#
+#   The cost is that the arrays are not self-describing, so pop_prop_name
+#   exists to label them in the UI, and each population module states its
+#   mapping at the top of the file.
+#
+# LAYOUT
+#   rates[rat * n + cell]. A single rat's population vector is contiguous,
+#   which is what both the update loop and every panel that draws one rat
+#   want. The update parallelises over rats, so two threads never write the
+#   same cache line unless N is very small.
+
+extern {
+    function exp(x: f64) -> f64
+}
+
+export const POP_PLACE: i32 = 0
+export const POP_HEAD_DIR: i32 = 1
+export const POP_VELOCITY: i32 = 2
+export const POP_GRID: i32 = 3
+export const POP_BOUNDARY: i32 = 4
+export const POP_KINDS: i32 = 5
+
+# Streams for Poisson spiking, kept clear of the motion model's streams.
+const STREAM_SPIKE: u32 = 91711
+
+export struct Pop {
+    kind: i32,
+    n: i32,
+    cap_rats: i32,
+    enabled: bool,
+    # Bumped whenever the per-cell properties are rebuilt, so a panel can
+    # tell that the tuning it drew last frame is no longer current.
+    revision: i32,
+
+    rates: ptr<f64>,
+    spikes: ptr<i32>,
+
+    # Per-cell properties. Meaning is set by the population type; see
+    # pop_prop_name and the header of each population module.
+    p0: ptr<f64>,
+    p1: ptr<f64>,
+    p2: ptr<f64>,
+    p3: ptr<f64>,
+    p4: ptr<f64>,
+
+    # History of one rat's population vector, newest at hist_head.
+    hist_len: i32,
+    hist_head: i32,
+    hist_fill: i32,
+    hist_rat: i32,
+    hist: ptr<f64>,
+
+    # Summary of the last update, for the inspector.
+    last_max: f64,
+    last_mean: f64,
+    last_argmax: i32,
+}
+
+export function pop_create(kind: i32, n: i32, cap_rats: i32,
+                           hist_len: i32) -> Pop {
+    let cells: i64 = (n as i64) * (cap_rats as i64)
+    let mut p: Pop = Pop {
+        kind: kind, n: n, cap_rats: cap_rats, enabled: true, revision: 0,
+        rates: null, spikes: null,
+        p0: null, p1: null, p2: null, p3: null, p4: null,
+        hist_len: hist_len, hist_head: 0, hist_fill: 0, hist_rat: 0,
+        hist: null,
+        last_max: 0.0, last_mean: 0.0, last_argmax: 0
+    }
+    p.rates = mem_alloc(cells * 8, "population rates") as ptr<f64>
+    p.spikes = mem_alloc(cells * 4, "population rates") as ptr<i32>
+    let np: i64 = (n as i64) * 8
+    p.p0 = mem_alloc(np, "population rates") as ptr<f64>
+    p.p1 = mem_alloc(np, "population rates") as ptr<f64>
+    p.p2 = mem_alloc(np, "population rates") as ptr<f64>
+    p.p3 = mem_alloc(np, "population rates") as ptr<f64>
+    p.p4 = mem_alloc(np, "population rates") as ptr<f64>
+    p.hist = mem_alloc((n as i64) * (hist_len as i64) * 8, "population rates") as ptr<f64>
+    for i in 0 to n {
+        p.p0[i] = 0.0
+        p.p1[i] = 0.0
+        p.p2[i] = 0.0
+        p.p3[i] = 0.0
+        p.p4[i] = 0.0
+    }
+    pop_zero(&p)
+    pop_clear_history(&p)
+    return p
+}
+
+export function pop_destroy(p: ptr<Pop>) -> void {
+    mem_release(p.rates as ptr<void>)
+    mem_release(p.spikes as ptr<void>)
+    mem_release(p.p0 as ptr<void>)
+    mem_release(p.p1 as ptr<void>)
+    mem_release(p.p2 as ptr<void>)
+    mem_release(p.p3 as ptr<void>)
+    mem_release(p.p4 as ptr<void>)
+    mem_release(p.hist as ptr<void>)
+}
+
+export function pop_zero(p: ptr<Pop>) -> void {
+    let total: i32 = p.n * p.cap_rats
+    for i in 0 to total {
+        p.rates[i] = 0.0
+        p.spikes[i] = 0
+    }
+    p.last_max = 0.0
+    p.last_mean = 0.0
+    p.last_argmax = 0
+}
+
+export function pop_clear_history(p: ptr<Pop>) -> void {
+    p.hist_head = 0
+    p.hist_fill = 0
+    let total: i32 = p.n * p.hist_len
+    for i in 0 to total {
+        p.hist[i] = 0.0
+    }
+}
+
+# Index of the first rate belonging to `rat`.
+export function pop_base(p: ptr<Pop>, rat: i32) -> i32 {
+    return rat * p.n
+}
+
+export function pop_rate(p: ptr<Pop>, rat: i32, cell: i32) -> f64 {
+    if rat < 0 or rat >= p.cap_rats { return 0.0 }
+    if cell < 0 or cell >= p.n { return 0.0 }
+    return p.rates[rat * p.n + cell]
+}
+
+export function pop_spike(p: ptr<Pop>, rat: i32, cell: i32) -> i32 {
+    if rat < 0 or rat >= p.cap_rats { return 0 }
+    if cell < 0 or cell >= p.n { return 0 }
+    return p.spikes[rat * p.n + cell]
+}
+
+# Refresh last_max / last_mean / last_argmax for one rat. Called at the end
+# of every population update; the panels read the result rather than sweeping
+# the array again.
+export function pop_summarise(p: ptr<Pop>, rat: i32) -> void {
+    if rat < 0 or rat >= p.cap_rats or p.n <= 0 { return }
+    let base: i32 = rat * p.n
+    let mut mx: f64 = p.rates[base]
+    let mut am: i32 = 0
+    let mut sum: f64 = 0.0
+    for c in 0 to p.n {
+        let v: f64 = p.rates[base + c]
+        sum = sum + v
+        if v > mx {
+            mx = v
+            am = c
+        }
+    }
+    p.last_max = mx
+    p.last_mean = sum / (p.n as f64)
+    p.last_argmax = am
+}
+
+# Draw Poisson spikes for every rat from the current rates. Deterministic in
+# (rat, cell, step) so a rerun with the same seed gives the same spike train.
+export function pop_spikes_from_rates(p: ptr<Pop>, n_rats: i32,
+                                      dt: f64, seed: u32,
+                                      step_index: i32) -> void {
+    if !p.enabled { return }
+    parallel for r in 0 to n_rats {
+        let base: i32 = r * p.n
+        for c in 0 to p.n {
+            let lam: f64 = p.rates[base + c] * dt
+            let u: f64 = rng_u01(seed,
+                                 STREAM_SPIKE + (r as u32) * 7919 + (c as u32),
+                                 step_index as u32)
+            # Bernoulli approximation to Poisson, exact enough while
+            # rate * dt stays well under one, which it does at 60 Hz and
+            # biological rates.
+            if u < lam { p.spikes[base + c] = 1 } else { p.spikes[base + c] = 0 }
+        }
+    }
+}
+
+# Append the current population vector for `rat` to the history ring.
+# Switching rat clears the ring, because a plot mixing two rats' activity
+# would be misleading.
+export function pop_push_history(p: ptr<Pop>, rat: i32) -> void {
+    if p.hist_len <= 0 { return }
+    if rat != p.hist_rat {
+        p.hist_rat = rat
+        pop_clear_history(p)
+    }
+    let base: i32 = rat * p.n
+    let dst: i32 = p.hist_head * p.n
+    for c in 0 to p.n {
+        p.hist[dst + c] = p.rates[base + c]
+    }
+    p.hist_head = (p.hist_head + 1) % p.hist_len
+    if p.hist_fill < p.hist_len { p.hist_fill = p.hist_fill + 1 }
+}
+
+# Rate of `cell` k steps ago. k = 0 is the newest sample.
+export function pop_hist_at(p: ptr<Pop>, cell: i32, k: i32) -> f64 {
+    if k >= p.hist_fill { return 0.0 }
+    let slot: i32 = (p.hist_head - 1 - k + p.hist_len * 2) % p.hist_len
+    return p.hist[slot * p.n + cell]
+}
+
+# The cell firing hardest for one rat right now. What you want when picking a
+# cell to record: choosing one of two hundred and fifty-six by index gets you
+# a cell whose field is somewhere the animal has never been, and a recording
+# of it counts no spikes at all.
+export function pop_strongest(p: ptr<Pop>, rat: i32) -> i32 {
+    if p.n <= 0 { return 0 }
+    let base: i32 = pop_base(p, rat)
+    let mut best: f64 = -1.0
+    let mut best_i: i32 = 0
+    for c in 0 to p.n {
+        if p.rates[base + c] > best {
+            best = p.rates[base + c]
+            best_i = c
+        }
+    }
+    return best_i
+}
+
+export function pop_kind_name(kind: i32) -> string {
+    if kind == POP_HEAD_DIR { return "head direction" }
+    if kind == POP_VELOCITY { return "velocity" }
+    if kind == POP_GRID { return "grid" }
+    if kind == POP_BOUNDARY { return "boundary" }
+    return "place"
+}
+
+export function pop_short_name(kind: i32) -> string {
+    if kind == POP_HEAD_DIR { return "HD" }
+    if kind == POP_VELOCITY { return "VEL" }
+    if kind == POP_GRID { return "GRID" }
+    if kind == POP_BOUNDARY { return "BVC" }
+    return "PLACE"
+}
+
+# What each property array means, per population type. The inspector prints
+# these next to the numbers so the untyped arrays stay readable.
+export function pop_prop_name(kind: i32, which: i32) -> string {
+    if kind == POP_PLACE {
+        if which == 0 { return "centre x" }
+        if which == 1 { return "centre y" }
+        if which == 2 { return "sigma" }
+        if which == 3 { return "peak rate" }
+        return "unused"
+    }
+    if kind == POP_HEAD_DIR {
+        if which == 0 { return "pref angle" }
+        if which == 1 { return "kappa" }
+        if which == 2 { return "peak rate" }
+        return "unused"
+    }
+    if kind == POP_VELOCITY {
+        if which == 0 { return "pref dir" }
+        if which == 1 { return "pref speed" }
+        if which == 2 { return "sigma" }
+        if which == 3 { return "peak rate" }
+        return "unused"
+    }
+    if kind == POP_GRID {
+        if which == 0 { return "spacing" }
+        if which == 1 { return "orientation" }
+        if which == 2 { return "phase x" }
+        if which == 3 { return "phase y" }
+        return "peak rate"
+    }
+    if kind == POP_BOUNDARY {
+        if which == 0 { return "pref bearing" }
+        if which == 1 { return "pref distance" }
+        if which == 2 { return "sigma dist" }
+        if which == 3 { return "sigma angle" }
+        return "peak rate"
+    }
+    return "unused"
+}
+
+export function pop_prop(p: ptr<Pop>, which: i32, cell: i32) -> f64 {
+    if cell < 0 or cell >= p.n { return 0.0 }
+    if which == 0 { return p.p0[cell] }
+    if which == 1 { return p.p1[cell] }
+    if which == 2 { return p.p2[cell] }
+    if which == 3 { return p.p3[cell] }
+    return p.p4[cell]
+}

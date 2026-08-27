@@ -1,0 +1,124 @@
+# Velocity cells.
+#
+# Each cell is tuned jointly to running speed and to the allocentric
+# direction of travel:
+#
+#   rate = peak * exp( -(s - s_pref)^2 / (2 sigma^2) )
+#               * exp( kappa * (cos(phi - phi_pref) - 1) )
+#
+# The speed factor is a Gaussian, the direction factor von Mises, and cells
+# with kappa = 0 are pure speed cells, which is how the population is set up:
+# a configurable fraction is left direction-agnostic so both cell types are
+# present.
+#
+# Direction of travel is taken from the heading rather than from a finite
+# difference of position, because the two agree for this motion model and the
+# heading does not blow up when the rat is nearly stationary.
+#
+# PROPERTIES
+#   p0  preferred direction, radians
+#   p1  preferred speed, m/s
+#   p2  speed tuning width, m/s
+#   p3  peak rate in Hz
+#   p4  kappa, 0 for a pure speed cell
+
+extern {
+    function exp(x: f64) -> f64
+    function cos(x: f64) -> f64
+    function fabs(x: f64) -> f64
+}
+
+const STREAM_VEL: u32 = 60013
+
+export struct VelocityParams {
+    speed_min: f64,
+    speed_max: f64,
+    sigma: f64,
+    peak_rate: f64,
+    kappa: f64,
+    # Fraction of the population with no directional tuning.
+    speed_only_fraction: f64,
+}
+
+export function velocity_params_default() -> VelocityParams {
+    return VelocityParams {
+        speed_min: 0.0,
+        speed_max: 0.45,
+        sigma: 0.07,
+        peak_rate: 15.0,
+        kappa: 2.0,
+        speed_only_fraction: 0.25
+    }
+}
+
+# Preferred speeds tile the range, preferred directions tile the circle, and
+# the two tilings run at different rates so the joint coverage is even rather
+# than a diagonal stripe through the space.
+export function velocity_configure(p: ptr<Pop>, vp: ptr<VelocityParams>,
+                                   seed: u32) -> void {
+    let n_dir: i32 = 8
+    let dir_step: f64 = TAU / (n_dir as f64)
+    for c in 0 to p.n {
+        let frac: f64 = ((c as f64) + 0.5) / (p.n as f64)
+        p.p1[c] = vp.speed_min + frac * (vp.speed_max - vp.speed_min)
+        p.p0[c] = wrap_pi(((c % n_dir) as f64) * dir_step)
+        p.p2[c] = vp.sigma
+        p.p3[c] = vp.peak_rate
+        let u: f64 = rng_u01(seed, STREAM_VEL, (c as u32) + 1)
+        if u < vp.speed_only_fraction {
+            p.p4[c] = 0.0
+        } else {
+            p.p4[c] = vp.kappa
+        }
+    }
+    p.revision = p.revision + 1
+}
+
+export function velocity_rate_at(p: ptr<Pop>, cell: i32,
+                                 speed: f64, direction: f64) -> f64 {
+    let ds: f64 = speed - p.p1[cell]
+    let sg: f64 = p.p2[cell]
+    let mut v: f64 = p.p3[cell] * exp(-ds * ds / (2.0 * sg * sg))
+    let k: f64 = p.p4[cell]
+    if k > 0.0 {
+        let da: f64 = angle_delta(p.p0[cell], direction)
+        v = v * exp(k * (cos(da) - 1.0))
+    }
+    return v
+}
+
+export function velocity_update(p: ptr<Pop>, a: ptr<Agents>) -> void {
+    if !p.enabled { return }
+    parallel for r in 0 to a.n {
+        let base: i32 = r * p.n
+        let s: f64 = a.speed[r]
+        let h: f64 = a.heading[r]
+        for c in 0 to p.n {
+            let ds: f64 = s - p.p1[c]
+            let sg: f64 = p.p2[c]
+            let mut v: f64 = p.p3[c] * exp(-ds * ds / (2.0 * sg * sg))
+            let k: f64 = p.p4[c]
+            if k > 0.0 {
+                let da: f64 = angle_delta(p.p0[c], h)
+                v = v * exp(k * (cos(da) - 1.0))
+            }
+            p.rates[base + c] = v
+        }
+    }
+}
+
+# Rate-weighted mean preferred speed: the population's estimate of how fast
+# it thinks the rat is going. Compared against the true speed in the
+# inspector, it shows the code working or failing in one line.
+export function velocity_decode_speed(p: ptr<Pop>, rat: i32) -> f64 {
+    let base: i32 = rat * p.n
+    let mut w: f64 = 0.0
+    let mut ws: f64 = 0.0
+    for c in 0 to p.n {
+        let v: f64 = p.rates[base + c]
+        ws = ws + v * p.p1[c]
+        w = w + v
+    }
+    if w < 0.000001 { return 0.0 }
+    return ws / w
+}

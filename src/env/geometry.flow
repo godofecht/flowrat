@@ -1,0 +1,172 @@
+# Plane geometry used by both motion and the sensory populations.
+#
+# Everything here is a pure function over scalars. No allocation, no state,
+# nothing that reads the environment. That keeps these callable from inside a
+# `parallel for` body and makes them the obvious first candidates for a GPU
+# port: they are branch-light and operate on values already in registers.
+#
+# Units are metres and radians throughout. World space has +x right and +y up.
+
+extern {
+    function sqrt(x: f64) -> f64
+    function fabs(x: f64) -> f64
+    function atan2(y: f64, x: f64) -> f64
+    function sin(x: f64) -> f64
+    function cos(x: f64) -> f64
+    function floor(x: f64) -> f64
+}
+
+export const PI: f64 = 3.141592653589793
+export const TAU: f64 = 6.283185307179586
+export const HALF_PI: f64 = 1.5707963267948966
+
+# A distance returned when a ray hits nothing. Large enough to lose against
+# any real arena, finite so arithmetic on it stays well behaved.
+export const GEO_FAR: f64 = 1000000.0
+const EPS: f64 = 0.000000001
+
+export function geo_min(a: f64, b: f64) -> f64 {
+    if a < b { return a }
+    return b
+}
+
+export function geo_max(a: f64, b: f64) -> f64 {
+    if a > b { return a }
+    return b
+}
+
+export function geo_clamp(v: f64, lo: f64, hi: f64) -> f64 {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+export function geo_clamp_i32(v: i32, lo: i32, hi: i32) -> i32 {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+export function geo_lerp(a: f64, b: f64, t: f64) -> f64 {
+    return a + (b - a) * t
+}
+
+# Wrap an angle into [-pi, pi). Used for every heading difference, so it is
+# written as arithmetic rather than a while loop: a rat spun by a large
+# angular velocity should not cost a variable number of iterations.
+export function wrap_pi(a: f64) -> f64 {
+    let k: f64 = floor((a + PI) / TAU)
+    return a - k * TAU
+}
+
+# Wrap an angle into [0, 2pi).
+export function wrap_tau(a: f64) -> f64 {
+    let k: f64 = floor(a / TAU)
+    return a - k * TAU
+}
+
+# Signed smallest rotation carrying `from` onto `to`.
+export function angle_delta(from: f64, to: f64) -> f64 {
+    return wrap_pi(to - from)
+}
+
+export function dist2(x0: f64, y0: f64, x1: f64, y1: f64) -> f64 {
+    let dx: f64 = x1 - x0
+    let dy: f64 = y1 - y0
+    return dx * dx + dy * dy
+}
+
+export function dist(x0: f64, y0: f64, x1: f64, y1: f64) -> f64 {
+    return sqrt(dist2(x0, y0, x1, y1))
+}
+
+# Shortest distance from a point to a segment, and the parameter t in [0,1]
+# of the closest point along it. t is written through `t_out` because callers
+# that need the foot of the perpendicular would otherwise recompute it.
+export function point_seg_dist(px: f64, py: f64,
+                               ax: f64, ay: f64, bx: f64, by: f64,
+                               t_out: ptr<f64>) -> f64 {
+    let vx: f64 = bx - ax
+    let vy: f64 = by - ay
+    let len2: f64 = vx * vx + vy * vy
+    if len2 < EPS {
+        t_out[0] = 0.0
+        return dist(px, py, ax, ay)
+    }
+    let mut t: f64 = ((px - ax) * vx + (py - ay) * vy) / len2
+    if t < 0.0 { t = 0.0 }
+    if t > 1.0 { t = 1.0 }
+    t_out[0] = t
+    let qx: f64 = ax + t * vx
+    let qy: f64 = ay + t * vy
+    return dist(px, py, qx, qy)
+}
+
+# Unit normal of a segment, pointing to the left of a->b.
+export function seg_normal(ax: f64, ay: f64, bx: f64, by: f64,
+                           nx_out: ptr<f64>, ny_out: ptr<f64>) -> void {
+    let vx: f64 = bx - ax
+    let vy: f64 = by - ay
+    let len: f64 = sqrt(vx * vx + vy * vy)
+    if len < EPS {
+        nx_out[0] = 0.0
+        ny_out[0] = 1.0
+        return
+    }
+    nx_out[0] = -vy / len
+    ny_out[0] = vx / len
+}
+
+# Distance along a ray from (ox, oy) in direction (dx, dy) to a segment, or
+# GEO_FAR if the ray misses. The direction does not need to be normalised;
+# the returned distance is in units of the direction vector's length, so pass
+# a unit vector when you want metres.
+export function ray_seg(ox: f64, oy: f64, dx: f64, dy: f64,
+                        ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
+    let ex: f64 = bx - ax
+    let ey: f64 = by - ay
+    # 2-D cross product of the ray direction with the segment direction.
+    # Zero means parallel, which counts as a miss.
+    let denom: f64 = dx * ey - dy * ex
+    if fabs(denom) < EPS { return GEO_FAR }
+    let rx: f64 = ax - ox
+    let ry: f64 = ay - oy
+    let t: f64 = (rx * ey - ry * ex) / denom
+    let u: f64 = (rx * dy - ry * dx) / denom
+    if t < 0.0 { return GEO_FAR }
+    if u < 0.0 or u > 1.0 { return GEO_FAR }
+    return t
+}
+
+# True when segments p0->p1 and q0->q1 cross. Used for line of sight, where
+# only the yes/no matters and the crossing point does not.
+export function seg_seg_hit(p0x: f64, p0y: f64, p1x: f64, p1y: f64,
+                            q0x: f64, q0y: f64, q1x: f64, q1y: f64) -> bool {
+    let dx: f64 = p1x - p0x
+    let dy: f64 = p1y - p0y
+    let t: f64 = ray_seg(p0x, p0y, dx, dy, q0x, q0y, q1x, q1y)
+    if t >= GEO_FAR { return false }
+    return t <= 1.0
+}
+
+# Reflect a heading off a wall whose unit normal is (nx, ny).
+export function reflect_heading(heading: f64, nx: f64, ny: f64) -> f64 {
+    let vx: f64 = cos(heading)
+    let vy: f64 = sin(heading)
+    let d: f64 = vx * nx + vy * ny
+    let rx: f64 = vx - 2.0 * d * nx
+    let ry: f64 = vy - 2.0 * d * ny
+    return atan2(ry, rx)
+}
+
+export function point_in_rect(px: f64, py: f64,
+                              x: f64, y: f64, w: f64, h: f64) -> bool {
+    if px < x or px > x + w { return false }
+    if py < y or py > y + h { return false }
+    return true
+}
+
+export function point_in_circle(px: f64, py: f64,
+                                cx: f64, cy: f64, r: f64) -> bool {
+    return dist2(px, py, cx, cy) <= r * r
+}

@@ -1,0 +1,792 @@
+# The environment view, and the editor that runs inside it.
+#
+# This is the main view: the arena, what is in it, where the rats are and
+# where they have been. It is also where editing happens, because an editor
+# in a separate pane would mean drawing the arena twice and keeping two
+# transforms in step.
+#
+# DRAW ORDER
+#   floor, zones, solids, walls, cues, trails, rats, overlays. Anything the
+#   operator needs to click is drawn last so it is never buried, and the
+#   selected rat is drawn after the others so a crowd cannot hide it.
+#
+# TRAILS
+#   Drawn from oldest to newest with alpha rising along the trail, so recency
+#   reads without needing a legend. Only the selected rat gets a full-length
+#   trail; the rest get a short one, because a thousand full trails is a
+#   solid block of colour that says nothing.
+
+import "draw.flow"
+import "widgets.flow"
+import "layout.flow"
+
+extern {
+    function sin(x: f64) -> f64
+    function cos(x: f64) -> f64
+    function sqrt(x: f64) -> f64
+    function fabs(x: f64) -> f64
+    function atan2(y: f64, x: f64) -> f64
+    function exp(x: f64) -> f64
+    function log(x: f64) -> f64
+}
+
+# Zoom factor for a wheel delta. Exponential, so two notches zoom by the
+# square of one notch and the gesture composes the way a scale should:
+# scrolling out then back in returns to exactly where it started.
+const ZOOM_PER_NOTCH: f64 = 1.10
+
+function pow_zoom(notches: i32) -> f64 {
+    return exp((notches as f64) * log(ZOOM_PER_NOTCH))
+}
+
+# How big a pellet and a drop are, in metres. A rat is about five centimetres
+# across, so a pellet at a centimetre and a half is a mouthful and reads as
+# one next to the animal eating it.
+export const PELLET_R: f64 = 0.017
+export const DROP_R: f64 = 0.015
+
+export const TOOL_SELECT: i32 = 0
+export const TOOL_PAN: i32 = 1
+export const TOOL_WALL: i32 = 2
+export const TOOL_BOX: i32 = 3
+export const TOOL_CUE: i32 = 4
+export const TOOL_REWARD: i32 = 5
+export const TOOL_WATER: i32 = 6
+export const TOOL_START: i32 = 7
+export const TOOL_ERASE: i32 = 8
+export const TOOL_COUNT: i32 = 9
+
+export function tool_name(t: i32) -> string {
+    if t == TOOL_PAN { return "pan" }
+    if t == TOOL_WALL { return "wall" }
+    if t == TOOL_BOX { return "box" }
+    if t == TOOL_CUE { return "cue" }
+    if t == TOOL_REWARD { return "reward" }
+    if t == TOOL_WATER { return "water" }
+    if t == TOOL_START { return "start" }
+    if t == TOOL_ERASE { return "erase" }
+    return "select"
+}
+
+export function tool_hint(t: i32) -> string {
+    if t == TOOL_PAN { return "drag to pan, wheel to zoom" }
+    if t == TOOL_WALL { return "drag to draw a barrier" }
+    if t == TOOL_BOX { return "drag to place a solid block" }
+    if t == TOOL_CUE { return "click to drop a landmark" }
+    if t == TOOL_REWARD { return "click to place a reward zone" }
+    if t == TOOL_WATER { return "click to place a puddle" }
+    if t == TOOL_START { return "click to place the start zone" }
+    if t == TOOL_ERASE { return "click a wall, block, cue or zone" }
+    return "click a rat to follow it"
+}
+
+export struct Editor {
+    tool: i32,
+    dragging: bool,
+    wx0: f64,
+    wy0: f64,
+    sx0: i32,
+    sy0: i32,
+    # Radius used for new circular zones, in metres, and what a new reward
+    # patch is stocked with.
+    zone_radius: f64,
+    food_amount: f64,
+    food_regrow: f64,
+    water_amount: f64,
+    water_regrow: f64,
+    cue_strength: f64,
+    show_trails: bool,
+    show_rays: bool,
+    show_cells: bool,
+    show_decode: bool,
+    show_known: bool,
+    # Which cell of which population the analysis tab is recording.
+    ana_pop: i32,
+    ana_cell: i32,
+    trail_len: i32,
+    # Which population the activity panel is showing in detail, and which
+    # cell of it the tuning preview is drawing.
+    sel_pop: i32,
+    sel_cell: i32,
+    # True while the secondary button is dragging the view.
+    panning: bool,
+    # Which of the row-two panels is showing.
+    tab: i32,
+}
+
+export function editor_new() -> Editor {
+    return Editor {
+        tool: TOOL_SELECT, dragging: false,
+        wx0: 0.0, wy0: 0.0, sx0: 0, sy0: 0,
+        zone_radius: 0.14, water_amount: 30.0, water_regrow: 3.0,
+        food_amount: DEFAULT_FOOD,
+        food_regrow: DEFAULT_REGROW, cue_strength: 1.0,
+        show_trails: true, show_rays: true,
+        show_cells: false, show_decode: true, show_known: false,
+        ana_pop: POP_PLACE, ana_cell: 0,
+        trail_len: 300,
+        sel_pop: 0, sel_cell: 0, panning: false, tab: 0
+    }
+}
+
+# --- drawing ---------------------------------------------------------------
+
+function draw_arena_floor(c: ptr<Canvas>, v: ptr<View>, e: ptr<Env>) -> void {
+    if e.kind == ENV_CIRCLE {
+        let cx: i32 = view_sx(v, e.cx)
+        let cy: i32 = view_sy(v, e.cy)
+        dr_disc(c, cx, cy, view_px(v, e.radius), rgb(24, 27, 38))
+    } else {
+        let x0: i32 = view_sx(v, e.x0)
+        let y0: i32 = view_sy(v, e.y1)
+        let x1: i32 = view_sx(v, e.x1)
+        let y1: i32 = view_sy(v, e.y0)
+        dr_rect(c, x0, y0, x1 - x0, y1 - y0, rgb(24, 27, 38))
+    }
+    # A metre grid, so distances in the view are readable without a ruler.
+    let step: f64 = 0.5
+    let mut gx: f64 = floor_to(e.x0, step)
+    while gx <= e.x1 {
+        let sx: i32 = view_sx(v, gx)
+        dr_vline(c, sx, view_sy(v, e.y1), view_sy(v, e.y0), rgb(32, 36, 50))
+        gx = gx + step
+    }
+    let mut gy: f64 = floor_to(e.y0, step)
+    while gy <= e.y1 {
+        let sy: i32 = view_sy(v, gy)
+        dr_hline(c, view_sx(v, e.x0), view_sx(v, e.x1), sy, rgb(32, 36, 50))
+        gy = gy + step
+    }
+}
+
+extern { function floor(x: f64) -> f64 }
+
+function floor_to(v: f64, step: f64) -> f64 {
+    return floor(v / step) * step
+}
+
+# Zones, and the food in them.
+#
+# A patch is drawn as the pellets it still holds rather than as a fixed
+# marker, so an arena being eaten empty is visible without reading a number.
+# The pellets sit at fixed places within the patch, chosen from the zone's
+# index, so they do not shuffle from frame to frame as the count drops.
+# One pellet, drawn where it actually is.
+#
+# The size is in world units, so it scales with the zoom and a pellet stays
+# the same size relative to the rat that is eating it. A fixed pixel size made
+# food look like dust when zoomed out and like boulders when zoomed in.
+function draw_pellet(c: ptr<Canvas>, v: ptr<View>, wx: f64, wy: f64) -> void {
+    let px: i32 = view_sx(v, wx)
+    let py: i32 = view_sy(v, wy)
+    let mut r: i32 = view_px(v, PELLET_R)
+    if r < 3 { r = 3 }
+    # One solid body and one lit pixel. Stacking three discs of shrinking
+    # radius, which is what this did first, rasterises at four or five pixels
+    # into a little cross: a patch of food looked like a scatter of sparkles
+    # rather than a pile of seeds.
+    dr_blob(c, px, py, r, rgb(150, 112, 52))
+    dr_blob(c, px, py, r - 1, rgb(222, 176, 92))
+    dr_rect(c, px - r / 3, py - r / 3, 1, 1, rgb(252, 236, 196))
+}
+
+# One drop. Round below and pointed above, which is the shape everyone reads
+# as water and which cannot be confused with a pellet at any zoom.
+function draw_drop(c: ptr<Canvas>, v: ptr<View>, wx: f64, wy: f64) -> void {
+    let px: i32 = view_sx(v, wx)
+    let py: i32 = view_sy(v, wy)
+    let mut r: i32 = view_px(v, DROP_R)
+    if r < 3 { r = 3 }
+    # Round body, one pixel of point above it, one lit pixel. Enough for the
+    # eye to call it a drop and never a seed, and the colour carries the rest
+    # of the distinction at any size.
+    dr_blob(c, px, py, r, rgb(46, 96, 140))
+    dr_blob(c, px, py, r - 1, rgb(104, 178, 222))
+    # One pixel of point above the body, which is the whole difference in
+    # silhouette between a drop and a seed at this size. The colour does the
+    # rest of the work.
+    dr_rect(c, px, py - r, 1, 1, rgb(104, 178, 222))
+    dr_rect(c, px - r / 3, py - r / 3, 1, 1, rgb(220, 244, 254))
+}
+
+# Every item in the arena. Drawn after the patches and before the rats, so a
+# rat with its nose in a pile is on top of what it is eating.
+function draw_items(c: ptr<Canvas>, v: ptr<View>, e: ptr<Env>) -> void {
+    for i in 0 to e.n_items {
+        if e.item_kind[i] == ZONE_WATER {
+            draw_drop(c, v, e.item_x[i], e.item_y[i])
+        } else {
+            draw_pellet(c, v, e.item_x[i], e.item_y[i])
+        }
+    }
+}
+
+# The nest, which unlike a food patch really is a region: being inside it is
+# what "home" means to the reckoning and to a rat that walked back to sleep.
+# So it keeps an outline, and gains a roof so it is nameable at a glance.
+function draw_nest(c: ptr<Canvas>, v: ptr<View>, e: ptr<Env>,
+                   zone: i32) -> void {
+    let cx: i32 = view_sx(v, e.zone_x[zone])
+    let cy: i32 = view_sy(v, e.zone_y[zone])
+    let r: i32 = view_px(v, e.zone_a[zone])
+    let col: i32 = rgb(104, 132, 200)
+    dr_disc_alpha(c, cx, cy, r, col, 0.16)
+    dr_circle(c, cx, cy, r, col)
+
+    # A gabled roof over a doorway. Small, centred, and the only thing in the
+    # arena drawn with straight lines, which is what makes it findable.
+    let mut h: i32 = r / 2
+    if h < 4 { h = 4 }
+    if h > 14 { h = 14 }
+    let w: i32 = h
+    let bright: i32 = rgb(168, 194, 245)
+    dr_line(c, cx - w, cy, cx, cy - h, bright)
+    dr_line(c, cx, cy - h, cx + w, cy, bright)
+    dr_line(c, cx - w + w / 3, cy, cx - w + w / 3, cy + h / 2, bright)
+    dr_line(c, cx + w - w / 3, cy, cx + w - w / 3, cy + h / 2, bright)
+    dr_line(c, cx - w + w / 3, cy + h / 2, cx + w - w / 3, cy + h / 2,
+            bright)
+}
+
+# What the selected rat knows of the room, as a wash over the floor.
+#
+# It doubles as a coverage plot: after a long run the unlit cells are the
+# places the animal never went, which is a thing worth being able to see
+# rather than infer from a trajectory that has been overdrawn a thousand
+# times.
+function draw_familiar(c: ptr<Canvas>, v: ptr<View>, s: ptr<Sim>,
+                       rat: i32) -> void {
+    let e: ptr<Env> = &s.env
+    let cw: f64 = env_width(e) / (FAM_SIDE as f64)
+    let ch: f64 = env_height(e) / (FAM_SIDE as f64)
+    for k in 0 to FAM_CELLS {
+        let f: f64 = familiarity_cell(&s.agents, rat, k)
+        if f > 0.01 {
+            let cx: i32 = k % FAM_SIDE
+            let cy: i32 = k / FAM_SIDE
+            let x0: i32 = view_sx(v, e.x0 + (cx as f64) * cw)
+            let y0: i32 = view_sy(v, e.y0 + ((cy + 1) as f64) * ch)
+            let x1: i32 = view_sx(v, e.x0 + ((cx + 1) as f64) * cw)
+            let y1: i32 = view_sy(v, e.y0 + (cy as f64) * ch)
+            let mut al: f64 = f * 0.45
+            if al > 0.45 { al = 0.45 }
+            dr_rect_alpha(c, x0, y0, x1 - x0, y1 - y0,
+                          rgb(120, 170, 210), al)
+        }
+    }
+}
+
+# Patches, but not as coloured regions.
+#
+# A food patch used to be a translucent green disc with decorative pellets
+# floating in it, and the disc meant nothing a reader could name: not a wall,
+# not a thing, just an area that was somehow foodish. The food itself is now
+# drawn as objects, and the patch is reduced to what it still genuinely is,
+# which is the place regrowth happens and the place a rat remembers. When it
+# holds something, the items say where it is and it needs no outline at all.
+# When it is bare, a faint ring is all that marks it, because "there was food
+# here and it has gone" is worth seeing.
+function draw_zones(c: ptr<Canvas>, v: ptr<View>, e: ptr<Env>) -> void {
+    for i in 0 to e.n_zones {
+        let mut col: i32 = rgb(70, 150, 90)
+        if e.zone_kind[i] == ZONE_START { col = rgb(80, 110, 190) }
+        if e.zone_kind[i] == ZONE_TEXTURE { col = rgb(120, 100, 150) }
+        if e.zone_kind[i] == ZONE_WATER { col = rgb(70, 130, 165) }
+        if e.zone_shape[i] == SHAPE_CIRCLE {
+            let cx: i32 = view_sx(v, e.zone_x[i])
+            let cy: i32 = view_sy(v, e.zone_y[i])
+            let r: i32 = view_px(v, e.zone_a[i])
+            if e.zone_kind[i] == ZONE_START {
+                draw_nest(c, v, e, i)
+            } else {
+                if zone_is_consumable(e.zone_kind[i]) {
+                    if e.zone_amount[i] <= 0.0 {
+                        dr_circle(c, cx, cy, r, col_scale(col, 0.45))
+                    }
+                } else {
+                    dr_disc_alpha(c, cx, cy, r, col, 0.25)
+                    dr_circle(c, cx, cy, r, col)
+                }
+            }
+        } else {
+            let x0: i32 = view_sx(v, e.zone_x[i])
+            let y0: i32 = view_sy(v, e.zone_y[i] + e.zone_b[i])
+            let x1: i32 = view_sx(v, e.zone_x[i] + e.zone_a[i])
+            let y1: i32 = view_sy(v, e.zone_y[i])
+            dr_rect_alpha(c, x0, y0, x1 - x0, y1 - y0, col, 0.25)
+            dr_frame(c, x0, y0, x1 - x0, y1 - y0, col)
+        }
+    }
+}
+
+function draw_solids(c: ptr<Canvas>, v: ptr<View>, e: ptr<Env>) -> void {
+    for i in 0 to e.n_solids {
+        let x0: i32 = view_sx(v, e.solid_x[i])
+        let y0: i32 = view_sy(v, e.solid_y[i] + e.solid_h[i])
+        let x1: i32 = view_sx(v, e.solid_x[i] + e.solid_w[i])
+        let y1: i32 = view_sy(v, e.solid_y[i])
+        dr_rect(c, x0, y0, x1 - x0, y1 - y0, rgb(38, 42, 56))
+    }
+}
+
+function draw_walls(c: ptr<Canvas>, v: ptr<View>, e: ptr<Env>) -> void {
+    for i in 0 to e.n_walls {
+        let x0: i32 = view_sx(v, e.wx0[i])
+        let y0: i32 = view_sy(v, e.wy0[i])
+        let x1: i32 = view_sx(v, e.wx1[i])
+        let y1: i32 = view_sy(v, e.wy1[i])
+        # Boundary segments are drawn brighter than internal ones so the
+        # outline of the arena stays legible in a cluttered maze.
+        let mut col: i32 = rgb(96, 106, 130)
+        if i < e.n_boundary { col = rgb(140, 152, 178) }
+        dr_line_thick(c, x0, y0, x1, y1, col, 3)
+    }
+}
+
+function draw_cues(c: ptr<Canvas>, v: ptr<View>, e: ptr<Env>) -> void {
+    for i in 0 to e.n_cues {
+        let cx: i32 = view_sx(v, e.cue_x[i])
+        let cy: i32 = view_sy(v, e.cue_y[i])
+        let col: i32 = rgb(230, 200, 120)
+        dr_disc(c, cx, cy, 4, col)
+        dr_circle(c, cx, cy, 7, col_scale(col, 0.6))
+        # Four ticks: reads as a landmark rather than as another rat.
+        dr_hline(c, cx - 10, cx - 8, cy, col)
+        dr_hline(c, cx + 8, cx + 10, cy, col)
+        dr_vline(c, cx, cy - 10, cy - 8, col)
+        dr_vline(c, cx, cy + 8, cy + 10, col)
+    }
+}
+
+# Scatter of place-field centres, sized by field width. Turned on from the
+# overlays toggle; it is the quickest way to see that the tiling actually
+# avoided the obstacles.
+function draw_place_centres(c: ptr<Canvas>, v: ptr<View>,
+                            p: ptr<Pop>) -> void {
+    for i in 0 to p.n {
+        let cx: i32 = view_sx(v, p.p0[i])
+        let cy: i32 = view_sy(v, p.p1[i])
+        dr_circle(c, cx, cy, view_px(v, p.p2[i]), rgb(48, 68, 78))
+    }
+}
+
+function draw_trails(c: ptr<Canvas>, v: ptr<View>, a: ptr<Agents>,
+                     selected: i32, max_len: i32) -> void {
+    let mut x0: f64 = 0.0
+    let mut y0: f64 = 0.0
+    let mut x1: f64 = 0.0
+    let mut y1: f64 = 0.0
+    for i in 0 to a.n {
+        # A full trail for the selected rat, a stub for the rest. Drawing
+        # every rat's full history turns the arena into a solid block.
+        let mut n: i32 = 40
+        if i == selected { n = max_len }
+        if n > a.trail_fill { n = a.trail_fill }
+        if n < 2 { continue }
+        let base: i32 = map_agent(i)
+        for k in 0 to n - 1 {
+            let ok0: bool = agents_trail_at(a, i, k, &x0, &y0)
+            let ok1: bool = agents_trail_at(a, i, k + 1, &x1, &y1)
+            # Fade with age. The square keeps the newest part of the trail
+            # clearly brighter instead of a flat ramp.
+            let t: f64 = 1.0 - ((k as f64) / (n as f64))
+            let mut alpha: f64 = t * t * 0.65
+            if i != selected { alpha = alpha * 0.45 }
+            dr_line_alpha(c, view_sx(v, x0), view_sy(v, y0),
+                          view_sx(v, x1), view_sy(v, y1), base, alpha)
+        }
+    }
+}
+
+function draw_rays(c: ptr<Canvas>, v: ptr<View>, a: ptr<Agents>,
+                   i: i32) -> void {
+    let step: f64 = TAU / (RAY_COUNT as f64)
+    let x: f64 = a.x[i]
+    let y: f64 = a.y[i]
+    let sx: i32 = view_sx(v, x)
+    let sy: i32 = view_sy(v, y)
+    let look: f64 = agents_head_dir(a, i)
+    for r in 0 to RAY_COUNT {
+        let d: f64 = agents_ray(a, i, r)
+        if d >= GEO_FAR { continue }
+        let ang: f64 = look + (r as f64) * step
+        let ex: i32 = view_sx(v, x + cos(ang) * d)
+        let ey: i32 = view_sy(v, y + sin(ang) * d)
+        # Near rays brighter: this is the sensory picture the boundary cells
+        # are reading, and closeness is what they respond to.
+        let mut a2: f64 = 0.30 - d * 0.18
+        if a2 < 0.05 { a2 = 0.05 }
+        dr_line_alpha(c, sx, sy, ex, ey, rgb(120, 190, 210), a2)
+        dr_blend(c, ex, ey, rgb(180, 230, 240), 0.7)
+    }
+}
+
+function draw_rat(c: ptr<Canvas>, v: ptr<View>, a: ptr<Agents>,
+                  i: i32, selected: bool) -> void {
+    let sx: i32 = view_sx(v, a.x[i])
+    let sy: i32 = view_sy(v, a.y[i])
+    let mut col: i32 = map_agent(i)
+    if selected { col = C_ACCENT }
+    # Hunger reddens the body. A batch that has not eaten for a while is a
+    # field of red dots, which says more at a glance than any number.
+    col = col_mix(col, rgb(226, 88, 72), a.hunger[i] * 0.75)
+    let mut r: i32 = 3
+    if selected { r = 5 }
+    # Heading tick, length proportional to speed so the batch's speed
+    # distribution is visible at a glance.
+    let h: f64 = a.heading[i]
+    let len: f64 = 0.05 + a.speed[i] * 0.25
+    dr_line(c, sx, sy, view_sx(v, a.x[i] + cos(h) * len),
+            view_sy(v, a.y[i] + sin(h) * len), col)
+    # And a shorter, paler tick for where the head points, which is what the
+    # head-direction cells encode and where the whiskers are aimed. During a
+    # scan it sweeps while the body tick stays put.
+    let hd: f64 = agents_head_dir(a, i)
+    let hlen: f64 = 0.075
+    dr_line(c, sx, sy, view_sx(v, a.x[i] + cos(hd) * hlen),
+            view_sy(v, a.y[i] + sin(hd) * hlen), col_scale(col, 0.55))
+    dr_disc(c, sx, sy, r, col)
+
+    # A scanning rat gets a marker, because a stopped rat looks the same as a
+    # resting one otherwise and the head sweep is small on screen.
+    if a.state[i] == ST_SCAN {
+        dr_circle(c, sx, sy, r + 5, rgb(150, 200, 230))
+    }
+
+    # A rat with its head down gets a ring in the colour of whatever it is
+    # taking, so you can see at a distance whether it is at the food or at
+    # the water without reading a panel.
+    if agents_is_eating(a, i) {
+        let mut ring: i32 = rgb(240, 214, 150)
+        if a.state[i] == ST_DRINK { ring = rgb(150, 210, 236) }
+        dr_circle(c, sx, sy, r + 3, ring)
+        dr_circle(c, sx, sy, r + 4, col_scale(ring, 0.5))
+    }
+    # What it is carrying rides on its back, one pellet drawn per unit, so a
+    # hoarder's load is countable rather than a dot that means "some".
+    if a.carrying[i] > 0.0 {
+        let mut n: i32 = (a.carrying[i] + 0.5) as i32
+        if n > 4 { n = 4 }
+        for k in 0 to n {
+            dr_disc(c, sx + r + k * 4, sy - r - 2, 2, rgb(226, 186, 104))
+        }
+    }
+
+    if selected {
+        dr_circle(c, sx, sy, r + 4, col)
+        dr_circle(c, sx, sy, r + 5, col_scale(col, 0.4))
+    }
+}
+
+# The place-cell population's own estimate of where the rat is. Drawn as a
+# cross so it reads as a readout rather than as another animal, with a line
+# back to the truth: the length of that line is the decode error.
+function draw_decode(c: ptr<Canvas>, v: ptr<View>, s: ptr<Sim>) -> void {
+    let i: i32 = sim_selected(s)
+    let mut dx: f64 = 0.0
+    let mut dy: f64 = 0.0
+    let w: f64 = place_decode(&s.place, i, &dx, &dy)
+    if w < 0.000001 { return }
+    let sx: i32 = view_sx(v, dx)
+    let sy: i32 = view_sy(v, dy)
+    let col: i32 = rgb(120, 220, 190)
+    dr_hline(c, sx - 6, sx + 6, sy, col)
+    dr_vline(c, sx, sy - 6, sy + 6, col)
+    dr_line_alpha(c, sx, sy, view_sx(v, s.agents.x[i]),
+                  view_sy(v, s.agents.y[i]), col, 0.5)
+}
+
+# Where the selected rat is trying to get to, which is the difference between
+# a random walk and behaviour with a reason.
+function draw_intent(c: ptr<Canvas>, v: ptr<View>, s: ptr<Sim>,
+                     i: i32) -> void {
+    let target: i32 = s.agents.food_target[i]
+    if target < 0 { return }
+    if agents_is_eating(&s.agents, i) { return }
+    let mut cx: f64 = 0.0
+    let mut cy: f64 = 0.0
+    env_zone_center(&s.env, target, &cx, &cy)
+    dr_line_alpha(c, view_sx(v, s.agents.x[i]), view_sy(v, s.agents.y[i]),
+                  view_sx(v, cx), view_sy(v, cy), rgb(214, 176, 96), 0.35)
+}
+
+# Rubber band for a drag in progress.
+function draw_pending(c: ptr<Canvas>, v: ptr<View>, ed: ptr<Editor>,
+                      mx: i32, my: i32) -> void {
+    if !ed.dragging { return }
+    let x0: i32 = view_sx(v, ed.wx0)
+    let y0: i32 = view_sy(v, ed.wy0)
+    if ed.tool == TOOL_WALL {
+        dr_line_thick(c, x0, y0, mx, my, C_ACCENT, 3)
+    }
+    if ed.tool == TOOL_BOX {
+        let ax: i32 = min_i(x0, mx)
+        let ay: i32 = min_i(y0, my)
+        dr_rect_alpha(c, ax, ay, abs_i(mx - x0), abs_i(my - y0),
+                      C_ACCENT, 0.3)
+        dr_frame(c, ax, ay, abs_i(mx - x0), abs_i(my - y0), C_ACCENT)
+    }
+}
+
+function min_i(a: i32, b: i32) -> i32 {
+    if a < b { return a }
+    return b
+}
+
+function abs_i(a: i32) -> i32 {
+    if a < 0 { return -a }
+    return a
+}
+
+export function view_env_draw(c: ptr<Canvas>, u: ptr<Ui>, v: ptr<View>,
+                              s: ptr<Sim>, ed: ptr<Editor>,
+                              lay: ptr<Layout>) -> void {
+    ui_panel(c, lay.env_x, lay.env_y, lay.env_w, lay.env_h, "")
+    canvas_clip(c, lay.env_x + 1, lay.env_y + 1,
+                lay.env_w - 2, lay.env_h - 2)
+
+    draw_arena_floor(c, v, &s.env)
+    # Under everything else, because it is ground rather than an object.
+    if ed.show_known and s.agents.n > 0 {
+        draw_familiar(c, v, s, sim_selected(s))
+    }
+    draw_zones(c, v, &s.env)
+    draw_items(c, v, &s.env)
+    draw_solids(c, v, &s.env)
+    if ed.show_cells { draw_place_centres(c, v, &s.place) }
+    draw_walls(c, v, &s.env)
+    draw_cues(c, v, &s.env)
+    if ed.show_trails {
+        draw_trails(c, v, &s.agents, sim_selected(s), ed.trail_len)
+    }
+
+    let sel: i32 = sim_selected(s)
+    if ed.show_rays and s.agents.n > 0 { draw_rays(c, v, &s.agents, sel) }
+    for i in 0 to s.agents.n {
+        if i != sel { draw_rat(c, v, &s.agents, i, false) }
+    }
+    if s.agents.n > 0 { draw_rat(c, v, &s.agents, sel, true) }
+    if ed.show_decode { draw_decode(c, v, s) }
+    if s.agents.n > 0 { draw_intent(c, v, s, sel) }
+    draw_pending(c, v, ed, u.mx, u.my)
+
+    # Scale bar. One clean number, sized to whatever round distance fits.
+    let bar_m: f64 = nice_scale(((lay.env_w / 5) as f64) / v.zoom)
+    let bar_px: i32 = (bar_m * v.zoom) as i32
+    let bx: i32 = lay.env_x + 12
+    let by: i32 = lay.env_y + lay.env_h - 18
+    dr_rect(c, bx, by, bar_px, 2, C_LABEL)
+    dr_vline(c, bx, by - 3, by + 3, C_LABEL)
+    dr_vline(c, bx + bar_px, by - 3, by + 3, C_LABEL)
+    let tw: i32 = dr_fixed(c, bx + bar_px + 6, by - 3, bar_m, 2, 1, C_LABEL)
+    let tm: i32 = dr_text(c, bx + bar_px + 6 + tw + 3, by - 3, "m", 1, C_DIM)
+
+    # Tool hint, bottom right.
+    dr_text_right(c, lay.env_x + lay.env_w - 12, by - 3,
+                  tool_hint(ed.tool), 1, C_DIM)
+
+    canvas_clip_reset(c)
+}
+
+function nice_scale(raw: f64) -> f64 {
+    if raw >= 2.0 { return 2.0 }
+    if raw >= 1.0 { return 1.0 }
+    if raw >= 0.5 { return 0.5 }
+    if raw >= 0.2 { return 0.2 }
+    if raw >= 0.1 { return 0.1 }
+    return 0.05
+}
+
+# --- interaction -----------------------------------------------------------
+
+# Returns true when the environment changed and downstream state has to be
+# rebuilt.
+export function view_env_input(u: ptr<Ui>, v: ptr<View>, s: ptr<Sim>,
+                               ed: ptr<Editor>, lay: ptr<Layout>) -> bool {
+    if !ui_hit(u, lay.env_x, lay.env_y, lay.env_w, lay.env_h) {
+        # A drag that left the view is abandoned rather than committed at
+        # whatever point the cursor happened to be over.
+        if !u.down { ed.dragging = false }
+        return false
+    }
+    if u.consumed { return false }
+
+    # Zoom in proportion to how far the wheel actually turned. A fixed step
+    # per frame ignores the size of the gesture, so a firm flick and a nudge
+    # do the same thing and a trackpad, which reports many small deltas,
+    # feels disconnected from the result.
+    if u.wheel != 0 {
+        view_zoom_at(v, u.mx, u.my, pow_zoom(u.wheel))
+    }
+
+    # The secondary button pans whatever tool is selected. Having to switch
+    # to the pan tool to move the view, and back again to keep editing, is
+    # the kind of thing that makes an editor tiring to use.
+    if u.right {
+        if !ed.panning {
+            ed.panning = true
+            ed.sx0 = u.mx
+            ed.sy0 = u.my
+        }
+        view_pan(v, u.mx - ed.sx0, u.my - ed.sy0)
+        ed.sx0 = u.mx
+        ed.sy0 = u.my
+        return false
+    }
+    ed.panning = false
+
+    let wx: f64 = view_wx(v, u.mx)
+    let wy: f64 = view_wy(v, u.my)
+    let mut changed: bool = false
+
+    if ed.tool == TOOL_SELECT {
+        if u.pressed {
+            let pick: i32 = agents_pick(&s.agents, wx, wy, 14.0 / v.zoom)
+            if pick >= 0 {
+                sim_select(s, pick)
+            } else {
+                # Double clicking empty floor refits the arena, matching the
+                # double-click-restores-the-default rule the sliders follow.
+                if ui_is_double_at(u, 909) {
+                    view_fit(v, s.env.x0, s.env.y0, s.env.x1, s.env.y1)
+                }
+            }
+        }
+        return false
+    }
+
+    if ed.tool == TOOL_PAN {
+        if u.pressed {
+            ed.dragging = true
+            ed.sx0 = u.mx
+            ed.sy0 = u.my
+        }
+        if ed.dragging and u.down {
+            view_pan(v, u.mx - ed.sx0, u.my - ed.sy0)
+            ed.sx0 = u.mx
+            ed.sy0 = u.my
+        }
+        if !u.down { ed.dragging = false }
+        return false
+    }
+
+    if ed.tool == TOOL_CUE {
+        if u.pressed {
+            let idx: i32 = env_add_cue(&s.env, wx, wy, ed.cue_strength)
+            changed = idx >= 0
+        }
+        return changed
+    }
+
+    if ed.tool == TOOL_REWARD {
+        if u.pressed {
+            let idx: i32 = env_add_zone_food(&s.env, ZONE_REWARD,
+                                             SHAPE_CIRCLE, wx, wy,
+                                             ed.zone_radius, 0.0,
+                                             ed.food_amount, ed.food_regrow)
+            changed = idx >= 0
+        }
+        return changed
+    }
+
+    if ed.tool == TOOL_WATER {
+        if u.pressed {
+            let idx: i32 = env_add_zone_food(&s.env, ZONE_WATER,
+                                             SHAPE_CIRCLE, wx, wy,
+                                             ed.zone_radius, 0.0,
+                                             ed.water_amount,
+                                             ed.water_regrow)
+            changed = idx >= 0
+        }
+        return changed
+    }
+
+    if ed.tool == TOOL_START {
+        if u.pressed {
+            # One start zone at a time: two would make reset ambiguous.
+            let mut k: i32 = s.env.n_zones - 1
+            while k >= 0 {
+                if s.env.zone_kind[k] == ZONE_START {
+                    let removed: bool = env_remove_zone(&s.env, k)
+                }
+                k = k - 1
+            }
+            let idx: i32 = env_add_zone(&s.env, ZONE_START, SHAPE_CIRCLE,
+                                        wx, wy, ed.zone_radius, 0.0)
+            changed = idx >= 0
+        }
+        return changed
+    }
+
+    if ed.tool == TOOL_ERASE {
+        if u.pressed {
+            changed = erase_at(&s.env, wx, wy, 12.0 / v.zoom)
+        }
+        return changed
+    }
+
+    # Wall and box are both drags.
+    if u.pressed {
+        ed.dragging = true
+        ed.wx0 = wx
+        ed.wy0 = wy
+    }
+    if ed.dragging and u.released {
+        ed.dragging = false
+        if ed.tool == TOOL_WALL {
+            # Reject a click that never moved: a zero-length wall is
+            # invisible and would still cost a ray test every step.
+            if dist(ed.wx0, ed.wy0, wx, wy) > 0.02 {
+                let idx: i32 = env_add_wall(&s.env, ed.wx0, ed.wy0, wx, wy)
+                changed = idx >= 0
+            }
+        }
+        if ed.tool == TOOL_BOX {
+            let x0: f64 = min_f(ed.wx0, wx)
+            let y0: f64 = min_f(ed.wy0, wy)
+            let w: f64 = fabs(wx - ed.wx0)
+            let h: f64 = fabs(wy - ed.wy0)
+            if w > 0.02 and h > 0.02 {
+                env_add_box(&s.env, x0, y0, w, h)
+                changed = true
+            }
+        }
+    }
+    return changed
+}
+
+function min_f(a: f64, b: f64) -> f64 {
+    if a < b { return a }
+    return b
+}
+
+# Delete whatever is under the point, in the order the operator would expect:
+# the small things they aimed at first, the big block last.
+function erase_at(e: ptr<Env>, x: f64, y: f64, tol: f64) -> bool {
+    for i in 0 to e.n_cues {
+        if dist(x, y, e.cue_x[i], e.cue_y[i]) < tol + 0.02 {
+            return env_remove_cue(e, i)
+        }
+    }
+    let z: i32 = env_zone_at(e, x, y, ZONE_REWARD)
+    if z >= 0 { return env_remove_zone(e, z) }
+    let z2: i32 = env_zone_at(e, x, y, ZONE_START)
+    if z2 >= 0 { return env_remove_zone(e, z2) }
+    if env_in_solid(e, x, y) {
+        return env_remove_solid_at(e, x, y)
+    }
+    # Internal walls only. The boundary is protected by env_remove_wall.
+    let mut t: f64 = 0.0
+    let mut best: f64 = tol + 0.03
+    let mut best_i: i32 = -1
+    for i in e.n_boundary to e.n_walls {
+        let d: f64 = point_seg_dist(x, y, e.wx0[i], e.wy0[i],
+                                    e.wx1[i], e.wy1[i], &t)
+        if d < best {
+            best = d
+            best_i = i
+        }
+    }
+    if best_i >= 0 { return env_remove_wall(e, best_i) }
+    return false
+}

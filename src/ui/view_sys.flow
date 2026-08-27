@@ -1,0 +1,852 @@
+# The recurrent state view, the profiler, the control panel and the editor
+# panel.
+#
+# These four share a file because they are all readouts of the machine rather
+# than of the animal, and because they are the panels that change together
+# when a control is added.
+
+import "draw.flow"
+import "widgets.flow"
+import "layout.flow"
+
+extern {
+    function sin(x: f64) -> f64
+    function cos(x: f64) -> f64
+    function sqrt(x: f64) -> f64
+    function fabs(x: f64) -> f64
+    function atan2(y: f64, x: f64) -> f64
+}
+
+# --- recurrent state -------------------------------------------------------
+
+# The sheet as a heatmap, the ring as a polar trace, and the position the
+# sheet has path-integrated to next to where the rat actually is. The gap
+# between those two is the drift, and it is the number this panel exists to
+# show.
+export function view_can_draw(c: ptr<Canvas>, u: ptr<Ui>, s: ptr<Sim>,
+                              d: ptr<Defaults>, lay: ptr<Layout>) -> void {
+    ui_panel(c, lay.can_x, lay.can_y, lay.can_w, lay.can_h,
+             "recurrent attractors")
+    let x: i32 = lay.can_x + PAD
+    let w: i32 = lay.can_w - PAD * 2
+    let mut y: i32 = ui_panel_body_y(lay.can_y)
+
+    if !s.can_enabled {
+        dr_text_center(c, lay.can_x + lay.can_w / 2,
+                       lay.can_y + lay.can_h / 2, "recurrent networks off",
+                       1, C_DIM)
+        return
+    }
+
+    # Fixed-width columns rather than one stretched to the panel. Row two is
+    # full width now, and a key-value row spanning fourteen hundred pixels
+    # puts the label and its number a hand's width apart.
+    let COL: i32 = 250
+    let GAP: i32 = 18
+
+    # Sheet heatmap, square, on the left.
+    let mut size: i32 = lay.can_h - TITLE_H - PAD * 2 - 16
+    if size > 300 { size = 300 }
+    draw_sheet(c, x, y, size, &s.sheet)
+    let lt: i32 = dr_text(c, x, y + size + 4, "position sheet", 1, C_LABEL)
+    dr_int_right(c, x + size, y + size + 4, s.sheet.n, 1, C_DIM)
+
+    # Column one: what the sheet is doing.
+    let rx: i32 = x + size + GAP
+    let rw: i32 = COL
+    let mut ry: i32 = y
+
+    ui_kv_int(c, rx, ry, rw, "cells", s.sheet.n, C_TEXT)
+    ry = ry + 11
+    ui_kv_int(c, rx, ry, rw, "taps per cell", can_taps(&s.sheet), C_TEXT)
+    ry = ry + 11
+    ui_kv_fixed(c, rx, ry, rw, "lambda bump", s.sheet.lambda_bump, 3, C_TEXT)
+    ry = ry + 11
+    let mut l2c: i32 = C_GOOD
+    if s.sheet.lambda_second > 1.0 { l2c = C_WARN }
+    ui_kv_fixed(c, rx, ry, rw, "lambda 2nd", s.sheet.lambda_second, 3, l2c)
+    ry = ry + 11
+    let mut bsc: i32 = C_GOOD
+    if s.sheet.bump_strength < 0.3 { bsc = C_WARN }
+    if s.sheet.bump_strength < 0.1 { bsc = C_BAD }
+    ui_kv_fixed(c, rx, ry, rw, "bump strength", s.sheet.bump_strength, 3, bsc)
+    ry = ry + 11
+    ui_kv_fixed(c, rx, ry, rw, "peak rate", s.sheet.max_rate, 3, C_TEXT)
+    ry = ry + 11
+    let mut l2n: string = "one bump, position code"
+    if s.sheet.lambda_second > 1.0 { l2n = "lattice, grid regime" }
+    ui_kv_text(c, rx, ry, rw, "regime", l2n, C_DIM)
+    ry = ry + 18
+
+    # Path integration against ground truth.
+    let i: i32 = sim_selected(s)
+    let mut ix: f64 = 0.0
+    let mut iy: f64 = 0.0
+    sim_sheet_position(s, &ix, &iy)
+    let ht: i32 = dr_text(c, rx, ry, "path integration", 1, C_LABEL)
+    ry = ry + 12
+    ui_kv_fixed(c, rx, ry, rw, "sheet x m", ix, 3, C_TEXT)
+    ry = ry + 11
+    ui_kv_fixed(c, rx, ry, rw, "sheet y m", iy, 3, C_TEXT)
+    ry = ry + 11
+    ui_kv_fixed(c, rx, ry, rw, "true x m", s.agents.x[i], 3, C_DIM)
+    ry = ry + 11
+    ui_kv_fixed(c, rx, ry, rw, "true y m", s.agents.y[i], 3, C_DIM)
+    ry = ry + 11
+    let drift: f64 = dist(ix, iy, s.agents.x[i], s.agents.y[i])
+    let mut dc: i32 = C_GOOD
+    if drift > 0.15 { dc = C_WARN }
+    if drift > 0.4 { dc = C_BAD }
+    ui_kv_fixed(c, rx, ry, rw, "drift m", drift, 4, dc)
+    ry = ry + 11
+    let mut ac: i32 = C_DIM
+    if s.can_anchor { ac = C_GOOD }
+    ui_kv_text(c, rx, ry, rw, "anchored", bool_word(s.can_anchor), ac)
+    ry = ry + 18
+
+    # The same job, done twice.
+    #
+    # The sheet above and the home vector every rat carries are both
+    # integrating the same self-motion into an estimate of where the animal
+    # is. One is a recurrent network of a few thousand units that runs for
+    # this rat alone; the other is two doubles per rat that the whole batch
+    # can afford. Scoring them against the same truth is the honest way to
+    # say what the network buys, and it is a comparison neither number makes
+    # on its own.
+    let hh: i32 = dr_text(c, rx, ry, "the same job, done twice", 1, C_LABEL)
+    ry = ry + 13
+    if !s.memory.enabled {
+        ui_kv_text(c, rx, ry, rw, "reckoner", "memory is off", C_DIM)
+        return
+    }
+    let mut nx: f64 = 0.0
+    let mut ny: f64 = 0.0
+    if !sim_nest(s, &nx, &ny) {
+        ui_kv_text(c, rx, ry, rw, "reckoner", "no nest to reckon from", C_DIM)
+        return
+    }
+    # The home vector points from the rat to the nest, so the rat's own
+    # estimated position is the nest less that vector.
+    let px: f64 = nx - s.agents.home_dx[i]
+    let py: f64 = ny - s.agents.home_dy[i]
+    let rerr: f64 = dist(px, py, s.agents.x[i], s.agents.y[i])
+    let mut rc: i32 = C_GOOD
+    if rerr > 0.15 { rc = C_WARN }
+    if rerr > 0.4 { rc = C_BAD }
+    ui_kv_fixed(c, rx, ry, rw, "sheet drift m", drift, 4, dc)
+    ry = ry + 11
+    ui_kv_fixed(c, rx, ry, rw, "reckoner drift m", rerr, 4, rc)
+    ry = ry + 11
+    let mut verdict: string = "the sheet is closer"
+    if rerr < drift { verdict = "the two doubles are closer" }
+    if fabs(rerr - drift) < 0.005 { verdict = "the two agree" }
+    ui_kv_text(c, rx, ry, rw, "just now", verdict, C_DIM)
+    ry = ry + 11
+    ui_kv_int(c, rx, ry, rw, "sheet units", s.sheet.n, C_DIM)
+    ry = ry + 11
+    ui_kv_int(c, rx, ry, rw, "reckoner doubles per rat", 2, C_DIM)
+
+    # Column two: the ring, as a dial with two needles.
+    let dx: i32 = rx + COL + GAP
+    let dial: i32 = 132
+    dr_text(c, dx, y, "head direction ring", 1, C_LABEL)
+    draw_ring(c, dx, y + 14, dial, &s.ring, s.agents.heading[i])
+    let mut dy2: i32 = y + 14 + dial + 6
+    ui_kv_fixed(c, dx, dy2, COL, "ring error rad", sim_ring_error(s), 3,
+                C_TEXT)
+    dy2 = dy2 + 11
+    ui_kv_fixed(c, dx, dy2, COL, "bump strength", s.ring.bump_strength, 3,
+                C_TEXT)
+    dy2 = dy2 + 11
+    ui_kv_int(c, dx, dy2, COL, "cells", s.ring.n, C_DIM)
+    dy2 = dy2 + 11
+    ui_kv_text(c, dx, dy2, COL, "needles", "warm true, cool decoded", C_DIM)
+
+    # Column three: the controls for both networks.
+    let cx2: i32 = dx + COL + GAP
+    if cx2 + COL <= lay.can_x + lay.can_w - PAD {
+        view_can_controls(c, u, s, d, cx2, y, COL)
+    }
+}
+
+# Parameters of both networks, drawn beside their readouts.
+function view_can_controls(c: ptr<Canvas>, u: ptr<Ui>, s: ptr<Sim>,
+                           d: ptr<Defaults>, x: i32, y: i32,
+                           w: i32) -> void {
+    let mut ry: i32 = y
+    let h: i32 = dr_text(c, x, ry, "recurrent parameters", 1, C_LABEL)
+    ry = ry + 13
+    let hw: i32 = (w - 4) / 2
+    if ui_toggle(u, c, x, ry, hw, 15, "on", s.can_enabled) {
+        s.can_enabled = !s.can_enabled
+    }
+    if ui_toggle(u, c, x + hw + 4, ry, hw, 15, "anchor", s.can_anchor) {
+        s.can_anchor = !s.can_anchor
+    }
+    ry = ry + 19
+    let mut sw: f64 = s.sheet.sigma_excite
+    if ui_slider(u, c, x, ry, w, 14, "sheet width", &sw, 1.0, 10.0,
+                 d.sheet_sigma, 2) {
+        # Width sets the kernel radius, the kernel and the velocity gain, in
+        # that order. Narrow enough and the sheet leaves the single-bump
+        # regime and breaks into a lattice, which lambda 2nd above reports.
+        can_set_sigma(&s.sheet, sw, s.dt)
+        can_calibrate_sheet(&s.sheet, s.dt)
+        sim_reanchor(s)
+    }
+    ry = ry + 17
+    if ui_slider(u, c, x, ry, w, 14, "sheet gain", &s.sheet.gain_target,
+                 1.05, 3.0, d.sheet_gain, 2) {
+        can_build_kernel(&s.sheet)
+        can_calibrate_sheet(&s.sheet, s.dt)
+        sim_reanchor(s)
+    }
+    ry = ry + 17
+    if ui_slider(u, c, x, ry, w, 14, "tau s", &s.ring.tau, 0.005, 0.12,
+                 d.tau, 3) {
+        s.sheet.tau = s.ring.tau
+    }
+    ry = ry + 17
+    let mut sub: i32 = s.can_substeps
+    if ui_slider_int(u, c, x, ry, w, 14, "substeps", &sub, 1, 8,
+                     d.substeps) {
+        s.can_substeps = sub
+    }
+    ry = ry + 19
+    if ui_button(u, c, x, ry, w, 15, "re-anchor bumps to rat") {
+        sim_reanchor(s)
+    }
+}
+
+function bool_word(b: bool) -> string {
+    if b { return "yes" }
+    return "no"
+}
+
+function draw_sheet(c: ptr<Canvas>, x: i32, y: i32, size: i32,
+                    n: ptr<Can>) -> void {
+    dr_rect(c, x, y, size, size, rgb(10, 12, 20))
+    # Scale to the network's own peak. The absolute rate depends on the
+    # nonlinearity's saturation and carries no meaning on its own; the shape
+    # of the activity does.
+    let mut m: f64 = n.max_rate
+    if m < 0.000001 { m = 1.0 }
+    for py in 0 to size {
+        let row: i32 = (py * n.ny) / size
+        for px in 0 to size {
+            let colidx: i32 = (px * n.nx) / size
+            let v: f64 = n.r[row * n.nx + colidx] / m
+            dr_px(c, x + px, y + py, map_rate(v))
+        }
+    }
+    # Crosshair on the decoded bump.
+    let bx: i32 = x + ((n.bump_x / (n.nx as f64)) * (size as f64)) as i32
+    let by: i32 = y + ((n.bump_y / (n.ny as f64)) * (size as f64)) as i32
+    dr_hline(c, bx - 7, bx + 7, by, C_ACCENT)
+    dr_vline(c, bx, by - 7, by + 7, C_ACCENT)
+    dr_frame(c, x, y, size, size, C_EDGE)
+}
+
+function draw_ring(c: ptr<Canvas>, x: i32, y: i32, size: i32,
+                   n: ptr<Can>, true_heading: f64) -> void {
+    let cx: i32 = x + size / 2
+    let cy: i32 = y + size / 2
+    let rad: i32 = size / 2 - 10
+    dr_rect(c, x, y, size, size, rgb(10, 12, 20))
+    dr_frame(c, x, y, size, size, C_EDGE)
+
+    let mut m: f64 = n.max_rate
+    if m < 0.000001 { m = 1.0 }
+    # One wedge per cell, radius proportional to rate. Cell 0 is heading -pi
+    # and the ring runs anticlockwise, matching can_set_input_ring.
+    for i in 0 to n.n {
+        let ang: f64 = ((i as f64) / (n.n as f64)) * TAU - PI
+        let f: f64 = n.r[i] / m
+        let r0: i32 = rad / 3
+        let r1: i32 = r0 + ((f * ((rad - r0) as f64)) as i32)
+        let ca: f64 = cos(ang)
+        let sa: f64 = sin(ang)
+        dr_line(c, cx + ((ca * (r0 as f64)) as i32),
+                cy - ((sa * (r0 as f64)) as i32),
+                cx + ((ca * (r1 as f64)) as i32),
+                cy - ((sa * (r1 as f64)) as i32),
+                map_rate(f))
+    }
+    dr_circle(c, cx, cy, rad, C_EDGE)
+
+    # True heading in the accent colour, decoded heading dimmer: the angle
+    # between the two needles is the ring's error.
+    let th: f64 = true_heading
+    dr_line(c, cx, cy, cx + ((cos(th) * (rad as f64)) as i32),
+            cy - ((sin(th) * (rad as f64)) as i32), C_ACCENT)
+    let dh: f64 = wrap_pi(n.bump_x / (n.n as f64) * TAU - PI)
+    dr_line(c, cx, cy, cx + ((cos(dh) * ((rad - 4) as f64)) as i32),
+            cy - ((sin(dh) * ((rad - 4) as f64)) as i32), rgb(120, 220, 190))
+    dr_disc(c, cx, cy, 2, C_TEXT)
+}
+
+# --- profiler --------------------------------------------------------------
+
+# Where the frame went. Bars are scaled against the frame budget rather than
+# against the largest bar, so a stage taking a tenth of the budget looks like
+# a tenth of the budget and not like the biggest thing on screen.
+export function view_perf_draw(c: ptr<Canvas>, u: ptr<Ui>, s: ptr<Sim>,
+                               frame_ms: f64, lay: ptr<Layout>) -> void {
+    ui_panel(c, lay.prf_x, lay.prf_y, lay.prf_w, lay.prf_h, "performance")
+    let x0: i32 = lay.prf_x + PAD
+    let top: i32 = ui_panel_body_y(lay.prf_y)
+    let w: i32 = COLW
+
+    let budget: f64 = 1000.0 / 60.0
+    let mut fps: f64 = 0.0
+    if frame_ms > 0.001 { fps = 1000.0 / frame_ms }
+
+    # Column one: what the frame cost and what it is carrying.
+    let mut y: i32 = top
+    let mut fc: i32 = C_GOOD
+    if frame_ms > budget { fc = C_WARN }
+    if frame_ms > budget * 2.0 { fc = C_BAD }
+    ui_kv_fixed(c, x0, y, w, "frame ms", frame_ms, 2, fc)
+    y = y + 11
+    ui_kv_fixed(c, x0, y, w, "fps", fps, 1, fc)
+    y = y + 11
+    ui_kv_fixed(c, x0, y, w, "peak frame ms", prof_peak_ms(PROF_FRAME), 2,
+                C_DIM)
+    y = y + 11
+    ui_kv_fixed(c, x0, y, w, "sim hz", sim_hz(s) * (s.steps_per_frame as f64),
+                1, C_TEXT)
+    y = y + 16
+    ui_kv_int(c, x0, y, w, "rats", s.agents.n, C_TEXT)
+    y = y + 11
+    ui_kv_int(c, x0, y, w, "population cells", sim_total_cells(s), C_TEXT)
+    y = y + 11
+    ui_kv_int(c, x0, y, w, "recurrent cells", s.sheet.n + s.ring.n, C_TEXT)
+    y = y + 11
+    ui_kv_int(c, x0, y, w, "wall segments", s.env.n_walls, C_TEXT)
+    y = y + 11
+    ui_kv_int(c, x0, y, w, "rays per step", s.agents.n * RAY_COUNT, C_TEXT)
+    y = y + 16
+    ui_kv_fixed(c, x0, y, w, "memory MB", mem_live_mb(), 1, C_TEXT)
+    y = y + 11
+    ui_kv_fixed(c, x0, y, w, "peak MB", mem_peak_mb(), 1, C_DIM)
+    y = y + 11
+    ui_kv_int(c, x0, y, w, "live blocks", mem_block_count(), C_DIM)
+    y = y + 16
+    # Anything but zero means the run has stopped producing numbers, and
+    # nothing else on screen can be trusted until it does.
+    let health: i32 = sim_health(s)
+    if health == 0 {
+        ui_kv_text(c, x0, y, w, "state", "finite", C_GOOD)
+    } else {
+        ui_kv_int(c, x0, y, w, "NON-FINITE VALUES", health, C_BAD)
+    }
+
+    # Column two: where the frame went.
+    let x1: i32 = ui_col(x0, 1)
+    let mut sy: i32 = top
+    let hh: i32 = dr_text(c, x1, sy, "stage", 1, C_LABEL)
+    dr_text_right(c, x1 + w, sy, "ms", 1, C_LABEL)
+    sy = sy + 12
+    for slot in 1 to PROF_SLOTS {
+        if slot == PROF_RECORD and prof_calls_of(slot) == 0 { continue }
+        let ms: f64 = prof_avg_ms(slot)
+        let t: i32 = dr_text(c, x1, sy, prof_slot_name(slot), 1, C_TEXT)
+        dr_fixed_right(c, x1 + w, sy, ms, 3, 1, C_TEXT)
+        let mut col: i32 = C_ACCENT2
+        if slot == PROF_SIM { col = C_ACCENT }
+        if slot == PROF_RENDER { col = rgb(120, 160, 120) }
+        ui_bar(c, x1, sy + 9, w, 3, ms / budget, col)
+        sy = sy + 15
+    }
+    dr_text(c, x1, sy + 4, "bars are a share of a 16.7 ms frame", 1, C_DIM)
+
+    # Column three: the peaks, which is where an occasional stall shows.
+    let x2: i32 = ui_col(x0, 2)
+    if x2 + w <= lay.prf_x + lay.prf_w - PAD {
+        let mut py: i32 = top
+        let ph: i32 = dr_text(c, x2, py, "worst seen", 1, C_LABEL)
+        dr_text_right(c, x2 + w, py, "ms", 1, C_LABEL)
+        py = py + 12
+        for slot in 1 to PROF_SLOTS {
+            if slot == PROF_RECORD and prof_calls_of(slot) == 0 { continue }
+            let t: i32 = dr_text(c, x2, py, prof_slot_name(slot), 1, C_DIM)
+            dr_fixed_right(c, x2 + w, py, prof_peak_ms(slot), 3, 1, C_DIM)
+            py = py + 11
+        }
+        py = py + 8
+        if ui_button(u, c, x2, py, w, 15, "clear peaks") {
+            prof_clear_peaks()
+        }
+    }
+}
+
+# --- control panel ---------------------------------------------------------
+
+# Returns true when something changed that needs the populations rebuilt.
+export function view_control_draw(c: ptr<Canvas>, u: ptr<Ui>, s: ptr<Sim>,
+                                  ed: ptr<Editor>, v: ptr<View>,
+                                  d: ptr<Defaults>, lay: ptr<Layout>) -> bool {
+    ui_panel(c, lay.ctl_x, lay.ctl_y, lay.ctl_w, lay.ctl_h, "control")
+    let x: i32 = lay.ctl_x + PAD
+    let w: i32 = lay.ctl_w - PAD * 2
+    let mut y: i32 = ui_panel_body_y(lay.ctl_y)
+    let mut rebuild: bool = false
+
+    # Row pitches. The panel holds thirty controls in five hundred pixels, so
+    # the rhythm is set once here rather than as a literal on every line.
+    let sl: i32 = 14
+    let sp: i32 = 16
+    let tp: i32 = 18
+    let lp: i32 = 11
+
+    # Transport.
+    let bw: i32 = (w - 8) / 3
+    let mut run_label: string = "run"
+    if s.running { run_label = "pause" }
+    if ui_button(u, c, x, y, bw, 16, run_label) {
+        s.running = !s.running
+    }
+    if ui_button(u, c, x + bw + 4, y, bw, 16, "step") {
+        s.running = false
+        sim_single_step(s)
+    }
+    if ui_button(u, c, x + (bw + 4) * 2, y, bw, 16, "reset") {
+        sim_reset(s, s.agents.n)
+    }
+    y = y + 22
+
+    let mut spf: i32 = s.steps_per_frame
+    if ui_slider_int(u, c, x, y, w, sl, "steps/frame", &spf, 1, 20,
+                     d.steps_per_frame) {
+        s.steps_per_frame = spf
+    }
+    y = y + sp
+
+    # Timestep shown as a rate: a slider over seconds would spend all its
+    # travel in a range nobody wants.
+    let mut hz: f64 = 1.0 / s.dt
+    if ui_slider(u, c, x, y, w, sl, "sim hz", &hz, 20.0, 400.0,
+                 d.sim_hz, 0) {
+        s.dt = 1.0 / hz
+    }
+    y = y + sp
+
+    let mut seed: i32 = s.seed as i32
+    if ui_slider_int(u, c, x, y, w, sl, "seed", &seed, 1, 9999, d.seed) {
+        s.seed = seed as u32
+        rebuild = true
+    }
+    y = y + sp
+
+    let mut nrats: i32 = s.agents.n
+    if ui_slider_exp(u, c, x, y, w, sl, "rats", &nrats, 1, MAX_RATS,
+                     d.rats) {
+        sim_set_rat_count(s, nrats)
+    }
+    y = y + sp + 4
+
+    # Arena preset.
+    let ph: i32 = dr_text(c, x, y, "arena", 1, C_LABEL)
+    dr_text_right(c, x + w, y, env_preset_name(s.env.preset), 1, C_TEXT)
+    y = y + lp
+    let pw: i32 = (w - 12) / 4
+    for k in 0 to PRESET_COUNT {
+        let bx: i32 = x + (k % 4) * (pw + 4)
+        let by: i32 = y + (k / 4) * tp
+        if ui_button(u, c, bx, by, pw, 15, preset_short(k)) {
+            sim_set_preset(s, k)
+            view_fit(v, s.env.x0, s.env.y0, s.env.x1, s.env.y1)
+        }
+    }
+    y = y + tp * 2 + 4
+
+    # Motion.
+    let mh: i32 = dr_text(c, x, y, "motion", 1, C_LABEL)
+    dr_text_right(c, x + w, y, integrator_name(s.integrator), 1, C_TEXT)
+    y = y + lp
+    let hw: i32 = (w - 4) / 2
+    let mut model_label: string = "random walk"
+    if s.motion.model == MOTION_FORAGE { model_label = "forage" }
+    if ui_button(u, c, x, y, hw, 15, model_label) {
+        s.motion.model = (s.motion.model + 1) % MOTION_COUNT
+    }
+    if ui_button(u, c, x + hw + 4, y, hw, 15, int_short(s.integrator)) {
+        s.integrator = (s.integrator + 1) % INT_COUNT
+    }
+    y = y + tp
+
+    let mut ch: bool = ui_slider(u, c, x, y, w, sl, "speed m/s",
+                                 &s.motion.speed_mean, 0.0, 0.6,
+                                 d.motion.speed_mean, 2)
+    y = y + sp
+    ch = ui_slider(u, c, x, y, w, sl, "turn sigma",
+                   &s.motion.turn_sigma, 0.0, 8.0,
+                   d.motion.turn_sigma, 2)
+    y = y + sp
+    ch = ui_slider(u, c, x, y, w, sl, "wall avoid",
+                   &s.motion.wall_gain, 0.0, 20.0,
+                   d.motion.wall_gain, 1)
+    y = y + sp
+    ch = ui_slider(u, c, x, y, w, sl, "thigmotaxis",
+                   &s.motion.thigmotaxis, 0.0, 0.4,
+                   d.motion.thigmotaxis, 2)
+    y = y + sp
+    ch = ui_slider(u, c, x, y, w, sl, "cue pull",
+                   &s.motion.cue_gain, 0.0, 4.0,
+                   d.motion.cue_gain, 2)
+    y = y + sp + 4
+
+    # Foraging. Metabolism at zero switches the whole loop off and the rats
+    # go back to wandering with no reason to be anywhere.
+    let fh: i32 = dr_text(c, x, y, "drives", 1, C_LABEL)
+    dr_fixed_right(c, x + w, y, env_food_remaining(&s.env), 1, 1, C_TEXT)
+    y = y + lp
+    ch = ui_slider(u, c, x, y, w, sl, "metabolism /s",
+                   &s.motion.metabolism, 0.0, 0.15,
+                   d.motion.metabolism, 3)
+    y = y + sp
+    # Thirst at zero is the arena as it was before there was water, which
+    # makes this the control condition for the second drive.
+    ch = ui_slider(u, c, x, y, w, sl, "thirst /s",
+                   &s.motion.thirst_rate, 0.0, 0.15,
+                   d.motion.thirst_rate, 3)
+    y = y + sp
+    ch = ui_slider(u, c, x, y, w, sl, "drive margin",
+                   &s.behaviour.drive_hysteresis, 0.0, 0.4,
+                   d.behaviour.drive_hysteresis, 2)
+    y = y + sp
+    ch = ui_slider(u, c, x, y, w, sl, "food seeking",
+                   &s.motion.forage_gain, 0.0, 6.0,
+                   d.motion.forage_gain, 1)
+    y = y + sp
+    ch = ui_slider(u, c, x, y, w, sl, "eats a cache /s",
+                   &s.motion.eat_rate, 0.5, 20.0,
+                   d.motion.eat_rate, 1)
+    y = y + sp
+    # How long one mouthful takes, which is now the whole story of how fast
+    # a rat eats at a patch: one bite, one pellet.
+    ch = ui_slider(u, c, x, y, w, sl, "a bite takes s",
+                   &s.motion.bite_seconds, 0.05, 2.0,
+                   d.motion.bite_seconds, 2)
+    y = y + sp
+    if ui_toggle(u, c, x, y, hw, 15, "hoard", s.motion.hoard) {
+        s.motion.hoard = !s.motion.hoard
+    }
+    if ui_button(u, c, x + hw + 4, y, hw, 15, "refill all") {
+        env_refill_food(&s.env)
+    }
+    y = y + tp + 4
+
+    # Behaviour. Switching the machine off leaves every rat exploring, which
+    # is what FlowRat did before there were states at all.
+    let bh: i32 = dr_text(c, x, y, "behaviour", 1, C_LABEL)
+    dr_text_right(c, x + w, y, state_name(s.agents.state[sim_selected(s)]),
+                  1, C_TEXT)
+    y = y + lp
+    if ui_toggle(u, c, x, y, w, 15, "bouts and states",
+                 s.behaviour.enabled) {
+        s.behaviour.enabled = !s.behaviour.enabled
+    }
+    y = y + tp
+    ch = ui_slider(u, c, x, y, w, sl, "groom rate /s",
+                   &s.behaviour.groom_rate, 0.0, 0.3,
+                   d.behaviour.groom_rate, 3)
+    y = y + sp
+    ch = ui_slider(u, c, x, y, w, sl, "rear rate /s",
+                   &s.behaviour.rear_rate, 0.0, 0.5,
+                   d.behaviour.rear_rate, 3)
+    y = y + sp
+    ch = ui_slider(u, c, x, y, w, sl, "rest rate /s",
+                   &s.behaviour.rest_rate, 0.0, 0.2,
+                   d.behaviour.rest_rate, 3)
+    y = y + sp
+    if ui_toggle(u, c, x, y, hw, 15, "look at forks",
+                 s.behaviour.vte_enabled) {
+        s.behaviour.vte_enabled = !s.behaviour.vte_enabled
+    }
+    dr_int_right(c, x + w, y + 4, agents_total_scans(&s.agents), 1, C_DIM)
+    y = y + tp
+    ch = ui_slider(u, c, x, y, w, sl, "head wander",
+                   &s.motion.head_sigma, 0.0, 1.2,
+                   d.motion.head_sigma, 2)
+    y = y + sp + 4
+
+    # The social controls live in the ethogram tab, beside the behaviour
+    # they change, for the same reason the populations block moved to the
+    # connectome tab: this column is the run controls and it is full.
+    #
+    # That split is now the rule rather than an accident. The control panel
+    # holds what governs the run: the arena, the batch, the clock, the drives
+    # and the motion. A parameter that shapes one feature lives in the tab
+    # that draws that feature, where there is room for it and where its
+    # effect is visible while the slider is under the cursor.
+    # The populations block used to sit here and no longer fits: at 1440 by
+    # 900 the control column ran past its own bottom edge and the last four
+    # rows, the circuit toggle among them, could not be clicked at all. The
+    # connectome tab told the reader to turn on input-driven place cells in
+    # the control panel, and the control that did it was below the fold.
+    # Those controls now live in that tab, beside the wiring they change.
+
+    return rebuild
+}
+
+# A count against its ceiling, turning warm as it fills.
+function ui_capacity(c: ptr<Canvas>, x: i32, y: i32, w: i32,
+                     label: string, used: i32, cap: i32) -> void {
+    let mut col: i32 = C_TEXT
+    if used * 10 >= cap * 8 { col = C_WARN }
+    if used >= cap { col = C_BAD }
+    let t: i32 = dr_text(c, x, y, label, 1, C_LABEL)
+    dr_int_right(c, x + w, y, cap, 1, C_DIM)
+    let slash: i32 = dr_text_width("/", 1)
+    dr_text_right(c, x + w - dr_int_width(cap, 1) - 2, y, "/", 1, C_DIM)
+    dr_int_right(c, x + w - dr_int_width(cap, 1) - 2 - slash - 2, y, used,
+                 1, col)
+}
+
+function preset_short(k: i32) -> string {
+    if k == PRESET_CIRCLE { return "circle" }
+    if k == PRESET_TWO_ROOMS { return "2 room" }
+    if k == PRESET_FOUR_ROOMS { return "4 room" }
+    if k == PRESET_T_MAZE { return "t maze" }
+    if k == PRESET_LINEAR_TRACK { return "track" }
+    if k == PRESET_OBSTACLES { return "pillars" }
+    if k == PRESET_PLUS_MAZE { return "plus" }
+    return "open"
+}
+
+function int_short(k: i32) -> string {
+    if k == INT_SEMI { return "semi" }
+    if k == INT_RK4 { return "rk4" }
+    if k == INT_EXACT { return "exact" }
+    return "euler"
+}
+
+# --- editor and recording panel -------------------------------------------
+
+export function view_editor_draw(c: ptr<Canvas>, u: ptr<Ui>, s: ptr<Sim>,
+                                 ed: ptr<Editor>, rec: ptr<Recorder>,
+                                 v: ptr<View>, d: ptr<Defaults>,
+                                 lay: ptr<Layout>) -> bool {
+    ui_panel(c, lay.edt_x, lay.edt_y, lay.edt_w, lay.edt_h,
+             "editor and recording")
+    let x0: i32 = lay.edt_x + PAD
+    let top: i32 = ui_panel_body_y(lay.edt_y)
+    let w: i32 = COLW
+    let mut changed: bool = false
+
+    # Column one: the tools.
+    let mut y: i32 = top
+    let th: i32 = dr_text(c, x0, y, "tool", 1, C_LABEL)
+    dr_text_right(c, x0 + w, y, tool_hint(ed.tool), 1, C_DIM)
+    y = y + 12
+    let tw: i32 = (w - 8) / 3
+    for k in 0 to TOOL_COUNT {
+        let bx: i32 = x0 + (k % 3) * (tw + 4)
+        let by: i32 = y + (k / 3) * 19
+        if ui_toggle(u, c, bx, by, tw, 15, tool_name(k), ed.tool == k) {
+            ed.tool = k
+        }
+    }
+    y = y + 60
+    if ui_slider(u, c, x0, y, w, 14, "zone radius m", &ed.zone_radius,
+                 0.04, 0.4, d.zone_radius, 2) { }
+    y = y + 17
+    if ui_slider(u, c, x0, y, w, 14, "food in a new patch", &ed.food_amount,
+                 1.0, 60.0, DEFAULT_FOOD, 0) { }
+    y = y + 17
+    if ui_slider(u, c, x0, y, w, 14, "regrowth /s", &ed.food_regrow,
+                 0.0, 3.0, DEFAULT_REGROW, 2) { }
+    y = y + 20
+
+    let oh: i32 = dr_text(c, x0, y, "overlays", 1, C_LABEL)
+    y = y + 12
+    let hw: i32 = (w - 4) / 2
+    if ui_toggle(u, c, x0, y, hw, 15, "trails", ed.show_trails) {
+        ed.show_trails = !ed.show_trails
+    }
+    if ui_toggle(u, c, x0 + hw + 4, y, hw, 15, "rays", ed.show_rays) {
+        ed.show_rays = !ed.show_rays
+    }
+    y = y + 18
+    if ui_toggle(u, c, x0, y, hw, 15, "fields", ed.show_cells) {
+        ed.show_cells = !ed.show_cells
+    }
+    if ui_toggle(u, c, x0 + hw + 4, y, hw, 15, "decode", ed.show_decode) {
+        ed.show_decode = !ed.show_decode
+    }
+    y = y + 20
+    let mut tl: i32 = ed.trail_len
+    y = y + 19
+    if ui_toggle(u, c, x0, y, hw, 15, "known", ed.show_known) {
+        ed.show_known = !ed.show_known
+    }
+    y = y + 19
+    if ui_slider_int(u, c, x0, y, w, 14, "trail length", &tl, 20, TRAIL_LEN,
+                     d.trail_len) {
+        ed.trail_len = tl
+    }
+
+    # Column two: the arena, and what its tables hold.
+    let x1: i32 = ui_col(x0, 1)
+    let mut ay: i32 = top
+    let ah2: i32 = dr_text(c, x1, ay, "arena", 1, C_LABEL)
+    ay = ay + 12
+    if ui_button(u, c, x1, ay, hw, 15, "fit view") {
+        view_fit(v, s.env.x0, s.env.y0, s.env.x1, s.env.y1)
+    }
+    if ui_button(u, c, x1 + hw + 4, ay, hw, 15, "reset arena") {
+        # Rebuild the boundary and drop everything that was drawn inside it.
+        env_preset_apply(&s.env, s.env.preset)
+        changed = true
+    }
+    ay = ay + 20
+    # The editor silently refuses to add anything past these, so the counts
+    # have to be visible: a wall that did not appear otherwise looks like a
+    # broken tool.
+    ui_capacity(c, x1, ay, w, "wall segments", s.env.n_walls, MAX_WALLS)
+    ay = ay + 11
+    ui_capacity(c, x1, ay, w, "solid blocks", s.env.n_solids, MAX_SOLIDS)
+    ay = ay + 11
+    ui_capacity(c, x1, ay, w, "cues", s.env.n_cues, MAX_CUES)
+    ay = ay + 11
+    ui_capacity(c, x1, ay, w, "zones", s.env.n_zones, MAX_ZONES)
+    ay = ay + 11
+    ui_kv_int(c, x1, ay, w, "boundary segments", s.env.n_boundary, C_DIM)
+    ay = ay + 11
+    ui_kv_text(c, x1, ay, w, "shape", env_kind_name(&s.env), C_DIM)
+    ay = ay + 16
+    dr_text(c, x1, ay, "wheel zooms, right button pans", 1, C_DIM)
+    ay = ay + 10
+    dr_text(c, x1, ay, "double click a slider to restore it", 1, C_DIM)
+    ay = ay + 10
+    dr_text(c, x1, ay, "double click the floor to refit", 1, C_DIM)
+
+    # Column three: recording and configuration.
+    let x2: i32 = ui_col(x0, 2)
+    if x2 + w > lay.edt_x + lay.edt_w - PAD { return changed }
+    let mut ry: i32 = top
+    let rh: i32 = dr_text(c, x2, ry, "recording", 1, C_LABEL)
+    ry = ry + 12
+    let mut rec_label: string = "start recording"
+    if rec.active { rec_label = "stop recording" }
+    if ui_toggle(u, c, x2, ry, w, 16, rec_label, rec.active) {
+        if rec.active {
+            rec_stop(rec)
+        } else {
+            let ok: bool = rec_start(rec, s)
+        }
+    }
+    ry = ry + 20
+    let mut rc: i32 = C_DIM
+    if rec.active { rc = C_GOOD }
+    ui_kv_int(c, x2, ry, w, "rows written", rec.rows, rc)
+    ry = ry + 11
+    ui_kv_int(c, x2, ry, w, "every nth step", rec.stride, C_TEXT)
+    ry = ry + 11
+    ui_kv_int(c, x2, ry, w, "rats recorded", rec.max_rats, C_DIM)
+    ry = ry + 11
+    ui_kv_text(c, x2, ry, w, "written to", "data/out", C_DIM)
+    ry = ry + 18
+
+    let ch3: i32 = dr_text(c, x2, ry, "configuration", 1, C_LABEL)
+    ry = ry + 12
+    if ui_button(u, c, x2, ry, hw, 15, "save") {
+        let ok: bool = config_save(s, ed, "data/configs/current.flowrat")
+    }
+    if ui_button(u, c, x2 + hw + 4, ry, hw, 15, "load") {
+        if config_load(s, ed, "data/configs/current.flowrat") {
+            changed = true
+            view_fit(v, s.env.x0, s.env.y0, s.env.x1, s.env.y1)
+        }
+    }
+    ry = ry + 20
+    if ui_button(u, c, x2, ry, w, 15, "export rate map of the selected cell") {
+        let ok: bool = export_ratemap(s, ed.sel_pop, ed.sel_cell,
+                                      "data/out/ratemap.csv")
+    }
+    ry = ry + 19
+    if ui_button(u, c, x2, ry, w, 15, "export occupancy map") {
+        let ok: bool = export_occupancy(s, "data/out/occupancy.csv", 48)
+    }
+    ry = ry + 22
+    dr_text(c, x2, ry, "space run  s step  r reset  f fit", 1, C_DIM)
+    ry = ry + 10
+    dr_text(c, x2, ry, "1-8 arena  tab tool  n circuit", 1, C_DIM)
+    ry = ry + 10
+    dr_text(c, x2, ry, "c attractors  p anchor  o record  - = scale", 1, C_DIM)
+
+    return changed
+}
+
+# --- tab bar ---------------------------------------------------------------
+
+export const TAB_RAT: i32 = 0
+export const TAB_ETHO: i32 = 1
+export const TAB_CAN: i32 = 2
+export const TAB_NET: i32 = 3
+export const TAB_ANALYSIS: i32 = 4
+export const TAB_PERF: i32 = 5
+export const TAB_EDIT: i32 = 6
+export const TAB_COUNT: i32 = 7
+
+export function tab_name(i: i32) -> string {
+    if i == TAB_ETHO { return "ethogram" }
+    if i == TAB_CAN { return "attractors" }
+    if i == TAB_NET { return "connectome" }
+    if i == TAB_ANALYSIS { return "analysis" }
+    if i == TAB_PERF { return "performance" }
+    if i == TAB_EDIT { return "editor and recording" }
+    return "rat inspector"
+}
+
+export function view_tabs_draw(c: ptr<Canvas>, u: ptr<Ui>, ed: ptr<Editor>,
+                               lay: ptr<Layout>) -> void {
+    let tw: i32 = lay.tabbar_w / TAB_COUNT
+    for i in 0 to TAB_COUNT {
+        let x: i32 = lay.tabbar_x + i * tw
+        let mut w: i32 = tw
+        if i == TAB_COUNT - 1 { w = lay.tabbar_w - i * tw }
+        if ui_tab(u, c, x, lay.tabbar_y, w, lay.tabbar_h, tab_name(i),
+                  ed.tab == i) {
+            ed.tab = i
+        }
+    }
+}
+
+# --- header ----------------------------------------------------------------
+
+export function view_header_draw(c: ptr<Canvas>, s: ptr<Sim>,
+                                 ed: ptr<Editor>, frame_ms: f64,
+                                 lay: ptr<Layout>) -> void {
+    let win_w: i32 = lay.w
+    dr_rect(c, 0, 0, win_w, HEADER_H, C_PANEL)
+    dr_rect(c, 0, HEADER_H - 1, win_w, 1, C_EDGE)
+    let t: i32 = dr_text(c, M, 6, "FLOWRAT", 2, C_ACCENT)
+    let st: i32 = dr_text(c, M + 92, 9, "rat navigation and neural dynamics",
+                          1, C_DIM)
+
+    let mut x: i32 = 520
+    let a: i32 = dr_text(c, x, 9, "t", 1, C_LABEL)
+    let b: i32 = dr_fixed(c, x + 12, 9, s.time, 2, 1, C_TEXT)
+    x = x + 78
+    let d: i32 = dr_text(c, x, 9, "step", 1, C_LABEL)
+    let e: i32 = dr_int(c, x + 30, 9, s.step_index, 1, C_TEXT)
+    x = x + 108
+    let f: i32 = dr_text(c, x, 9, "arena", 1, C_LABEL)
+    let g: i32 = dr_text(c, x + 36, 9, env_preset_name(s.env.preset), 1,
+                         C_TEXT)
+    x = x + 130
+    let h: i32 = dr_text(c, x, 9, "tool", 1, C_LABEL)
+    let i2: i32 = dr_text(c, x + 30, 9, tool_name(ed.tool), 1, C_ACCENT)
+
+    let mut state: string = "paused"
+    let mut sc: i32 = C_WARN
+    if s.running {
+        state = "running"
+        sc = C_GOOD
+    }
+    dr_text_right(c, win_w - M, 9, state, 1, sc)
+    dr_text_right(c, win_w - M - 56, 9, "ms", 1, C_DIM)
+    dr_fixed_right(c, win_w - M - 70, 9, frame_ms, 2, 1, C_DIM)
+}

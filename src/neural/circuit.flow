@@ -1,0 +1,311 @@
+# Place fields built from their inputs.
+#
+# WHY THIS EXISTS
+#   Until now every population read the rat's state directly and fed nothing
+#   else. Five encoders in parallel is not a circuit, and a diagram of it
+#   would have been a diagram of connections that do not exist.
+#
+#   Here a place cell has no direct access to position at all. It sees only
+#   the boundary and grid populations, through a fixed set of weighted
+#   connections, and its field is whatever those inputs add up to:
+#
+#     drive_c = sum over its inputs of w * r_source
+#     rate_c  = gain_c * max(0, drive_c - theta_c)
+#
+#   That is the Barry and Burgess account of a place field as a thresholded
+#   sum of boundary-vector inputs, with grid cells added to the input pool.
+#
+# WHY IT IS WORTH THE TROUBLE
+#   The analytic place cell is a Gaussian pinned to a point in the room. Move
+#   a wall and it does not care. This one is pinned to a set of boundary
+#   relationships, so moving a wall moves the field, and removing the wall a
+#   cell depended on weakens or kills it. That is a real prediction of the
+#   model and the thing worth being able to watch.
+#
+#   It also makes the network view honest: the edges it draws are the ones
+#   the update actually reads.
+#
+# WIRING
+#   Each place cell is connected to the fan_in input cells that respond most
+#   strongly at its own centre, with weights proportional to those responses
+#   and normalised to sum to one. Threshold and gain are then solved per cell
+#   so the drive at the centre lands on the configured peak rate, which keeps
+#   cells comparable when their input pools differ in size.
+#
+# LAYOUT
+#   Connections are three flat arrays indexed cell * fan_in + k, so a cell's
+#   inputs are contiguous and the update reads them in order. Same reasoning
+#   as everywhere else in the simulation.
+
+extern {
+    function fabs(x: f64) -> f64
+}
+
+export const SRC_BOUNDARY: i32 = 0
+export const SRC_GRID: i32 = 1
+
+export struct Circuit {
+    enabled: bool,
+    n_place: i32,
+    fan_in: i32,
+
+    src_pop: ptr<i32>,
+    src_cell: ptr<i32>,
+    weight: ptr<f64>,
+
+    theta: ptr<f64>,
+    cgain: ptr<f64>,
+
+    # Fraction of the centre drive a cell must exceed before it fires. Higher
+    # makes fields smaller and sparser.
+    threshold_frac: f64,
+    # Share of the input pool taken from grid cells rather than boundary
+    # cells. Zero is the pure boundary-vector model.
+    grid_share: f64,
+
+    # Drive of every place cell on the last update, for the network panel.
+    last_drive: ptr<f64>,
+    revision: i32,
+}
+
+export function circuit_create(n_place: i32, fan_in: i32) -> Circuit {
+    let n: i64 = (n_place as i64) * (fan_in as i64)
+    let mut c: Circuit = Circuit {
+        enabled: false, n_place: n_place, fan_in: fan_in,
+        src_pop: null, src_cell: null, weight: null,
+        theta: null, cgain: null,
+        threshold_frac: 0.55, grid_share: 0.35,
+        last_drive: null, revision: 0
+    }
+    c.src_pop = mem_alloc(n * 4, "circuit wiring") as ptr<i32>
+    c.src_cell = mem_alloc(n * 4, "circuit wiring") as ptr<i32>
+    c.weight = mem_alloc(n * 8, "circuit wiring") as ptr<f64>
+    c.theta = mem_alloc((n_place as i64) * 8, "circuit wiring") as ptr<f64>
+    c.cgain = mem_alloc((n_place as i64) * 8, "circuit wiring") as ptr<f64>
+    c.last_drive = mem_alloc((n_place as i64) * 8, "circuit wiring") as ptr<f64>
+    for i in 0 to n_place {
+        c.theta[i] = 0.0
+        c.cgain[i] = 0.0
+        c.last_drive[i] = 0.0
+    }
+    for i in 0 to n_place * fan_in {
+        c.src_pop[i] = SRC_BOUNDARY
+        c.src_cell[i] = 0
+        c.weight[i] = 0.0
+    }
+    return c
+}
+
+export function circuit_destroy(c: ptr<Circuit>) -> void {
+    mem_release(c.src_pop as ptr<void>)
+    mem_release(c.src_cell as ptr<void>)
+    mem_release(c.weight as ptr<void>)
+    mem_release(c.theta as ptr<void>)
+    mem_release(c.cgain as ptr<void>)
+    mem_release(c.last_drive as ptr<void>)
+}
+
+# Pick the `want` strongest entries of `resp` and write them into a cell's
+# connection slots. Selection sort over the response array, stopping after
+# `want` picks: fan_in is small and the array is a few hundred long, so this
+# is cheaper and clearer than sorting the whole thing.
+function take_strongest(cir: ptr<Circuit>, slot0: i32, want: i32,
+                        resp: ptr<f64>, n: i32, pop_id: i32,
+                        taken: ptr<i32>) -> i32 {
+    let mut placed: i32 = 0
+    for pick in 0 to want {
+        let mut best: f64 = 0.0
+        let mut best_i: i32 = -1
+        for i in 0 to n {
+            if taken[i] == 0 and resp[i] > best {
+                best = resp[i]
+                best_i = i
+            }
+        }
+        # Nothing left that responds at all: a cell in a corner of the arena
+        # may simply have fewer usable inputs than the fan-in asks for.
+        if best_i < 0 { return placed }
+        taken[best_i] = 1
+        cir.src_pop[slot0 + placed] = pop_id
+        cir.src_cell[slot0 + placed] = best_i
+        cir.weight[slot0 + placed] = best
+        placed = placed + 1
+    }
+    return placed
+}
+
+# Build the connectivity from the arena and the current input tuning.
+#
+# Called whenever the arena changes or either input population is
+# reconfigured. The place population's p0/p1 still hold the centres, which is
+# what a cell is wired around; nothing downstream reads them as a field.
+export function circuit_wire(cir: ptr<Circuit>, place: ptr<Pop>,
+                             bvc: ptr<Pop>, grid: ptr<Pop>,
+                             e: ptr<Env>, gp: ptr<GridParams>,
+                             bp: ptr<BoundaryParams>,
+                             scratch: ptr<f64>) -> void {
+    let n_grid_want: i32 = (cir.fan_in as f64 * cir.grid_share) as i32
+    let n_bvc_want: i32 = cir.fan_in - n_grid_want
+
+    let bresp: ptr<f64> = mem_alloc((bvc.n as i64) * 8, "circuit wiring") as ptr<f64>
+    let gresp: ptr<f64> = mem_alloc((grid.n as i64) * 8, "circuit wiring") as ptr<f64>
+    let btaken: ptr<i32> = mem_alloc((bvc.n as i64) * 4, "circuit wiring") as ptr<i32>
+    let gtaken: ptr<i32> = mem_alloc((grid.n as i64) * 4, "circuit wiring") as ptr<i32>
+
+    for c in 0 to cir.n_place {
+        let x: f64 = place.p0[c]
+        let y: f64 = place.p1[c]
+        let slot0: i32 = c * cir.fan_in
+
+        # An allocentric boundary cell's response does not depend on which
+        # way the rat is facing, so one heading is enough to characterise it.
+        for i in 0 to bvc.n {
+            bresp[i] = boundary_rate_at(bvc, i, e, x, y, 0.0,
+                                        bp.allocentric, scratch)
+            btaken[i] = 0
+        }
+        for i in 0 to grid.n {
+            gresp[i] = grid_rate_at(grid, i, gp, x, y)
+            gtaken[i] = 0
+        }
+
+        let nb: i32 = take_strongest(cir, slot0, n_bvc_want, bresp, bvc.n,
+                                     SRC_BOUNDARY, btaken)
+        let ng: i32 = take_strongest(cir, slot0 + nb, n_grid_want, gresp,
+                                     grid.n, SRC_GRID, gtaken)
+        let used: i32 = nb + ng
+        for k in used to cir.fan_in {
+            cir.weight[slot0 + k] = 0.0
+            cir.src_pop[slot0 + k] = SRC_BOUNDARY
+            cir.src_cell[slot0 + k] = 0
+        }
+
+        # Normalise the weights to sum to one, then work out what drive that
+        # produces at the cell's own centre.
+        let mut total: f64 = 0.0
+        for k in 0 to used {
+            total = total + cir.weight[slot0 + k]
+        }
+        if total < 0.000001 {
+            cir.theta[c] = 1.0
+            cir.cgain[c] = 0.0
+            continue
+        }
+        let mut drive: f64 = 0.0
+        for k in 0 to used {
+            let w: f64 = cir.weight[slot0 + k] / total
+            cir.weight[slot0 + k] = w
+            let mut r: f64 = 0.0
+            if cir.src_pop[slot0 + k] == SRC_BOUNDARY {
+                r = bresp[cir.src_cell[slot0 + k]]
+            } else {
+                r = gresp[cir.src_cell[slot0 + k]]
+            }
+            drive = drive + w * r
+        }
+
+        # Threshold a fixed fraction below the centre drive, and gain set so
+        # the cell reaches its configured peak there. Solving per cell keeps
+        # a cell in a corner, whose inputs are weaker, as loud as one in the
+        # middle, instead of silent.
+        let theta: f64 = drive * cir.threshold_frac
+        cir.theta[c] = theta
+        let head: f64 = drive - theta
+        if head < 0.000001 {
+            cir.cgain[c] = 0.0
+        } else {
+            cir.cgain[c] = place.p3[c] / head
+        }
+    }
+
+    mem_release(bresp as ptr<void>)
+    mem_release(gresp as ptr<void>)
+    mem_release(btaken as ptr<void>)
+    mem_release(gtaken as ptr<void>)
+    cir.revision = cir.revision + 1
+}
+
+# Drive the place population from its inputs.
+#
+# Must run after the boundary and grid updates: it reads their rates for this
+# step. Parallel over rats, each writing only its own slice of the place
+# population, like every other population update here.
+export function circuit_update(cir: ptr<Circuit>, place: ptr<Pop>,
+                               bvc: ptr<Pop>, grid: ptr<Pop>,
+                               n_rats: i32, selected: i32) -> void {
+    if !cir.enabled or !place.enabled { return }
+    let fan: i32 = cir.fan_in
+    parallel for r in 0 to n_rats {
+        let obase: i32 = r * place.n
+        let bbase: i32 = r * bvc.n
+        let gbase: i32 = r * grid.n
+        for c in 0 to cir.n_place {
+            let slot0: i32 = c * fan
+            let mut drive: f64 = 0.0
+            for k in 0 to fan {
+                let w: f64 = cir.weight[slot0 + k]
+                if w > 0.0 {
+                    if cir.src_pop[slot0 + k] == SRC_BOUNDARY {
+                        drive = drive + w * bvc.rates[bbase + cir.src_cell[slot0 + k]]
+                    } else {
+                        drive = drive + w * grid.rates[gbase + cir.src_cell[slot0 + k]]
+                    }
+                }
+            }
+            let mut v: f64 = cir.cgain[c] * (drive - cir.theta[c])
+            if v < 0.0 { v = 0.0 }
+            place.rates[obase + c] = v
+        }
+    }
+
+    # Keep the selected rat's drives for the network panel, which wants the
+    # value before the threshold as well as the rate after it.
+    let bbase: i32 = selected * bvc.n
+    let gbase: i32 = selected * grid.n
+    for c in 0 to cir.n_place {
+        let slot0: i32 = c * fan
+        let mut drive: f64 = 0.0
+        for k in 0 to fan {
+            let w: f64 = cir.weight[slot0 + k]
+            if w > 0.0 {
+                if cir.src_pop[slot0 + k] == SRC_BOUNDARY {
+                    drive = drive + w * bvc.rates[bbase + cir.src_cell[slot0 + k]]
+                } else {
+                    drive = drive + w * grid.rates[gbase + cir.src_cell[slot0 + k]]
+                }
+            }
+        }
+        cir.last_drive[c] = drive
+    }
+}
+
+# How much one connection is contributing right now: its weight times the
+# source's current rate. This is what the network view draws its edges by,
+# and what answers "why is this cell firing".
+export function circuit_contribution(cir: ptr<Circuit>, bvc: ptr<Pop>,
+                                     grid: ptr<Pop>, rat: i32,
+                                     cell: i32, k: i32) -> f64 {
+    let slot: i32 = cell * cir.fan_in + k
+    let w: f64 = cir.weight[slot]
+    if w <= 0.0 { return 0.0 }
+    if cir.src_pop[slot] == SRC_BOUNDARY {
+        return w * bvc.rates[rat * bvc.n + cir.src_cell[slot]]
+    }
+    return w * grid.rates[rat * grid.n + cir.src_cell[slot]]
+}
+
+export function circuit_src_name(pop_id: i32) -> string {
+    if pop_id == SRC_GRID { return "grid" }
+    return "bvc"
+}
+
+# Number of connections a cell actually got. A cell wired in a tight corner
+# may have fewer inputs available than the fan-in asked for.
+export function circuit_live_inputs(cir: ptr<Circuit>, cell: i32) -> i32 {
+    let slot0: i32 = cell * cir.fan_in
+    let mut n: i32 = 0
+    for k in 0 to cir.fan_in {
+        if cir.weight[slot0 + k] > 0.0 { n = n + 1 }
+    }
+    return n
+}

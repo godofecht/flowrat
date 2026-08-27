@@ -1,0 +1,132 @@
+# Build the demo configurations shipped in data/configs.
+#
+# Run:  ./tools/mkconfig.sh
+#
+# Each one is a starting point that shows a different part of the model. They
+# are written by the same config_save the interface uses, so a hand-edited
+# arena saves into exactly this format.
+
+import "src/core/mem.flow"
+import "src/core/rng.flow"
+import "src/core/clock.flow"
+import "src/core/profile.flow"
+import "src/env/geometry.flow"
+import "src/env/environment.flow"
+import "src/env/queries.flow"
+import "src/env/presets.flow"
+import "src/sim/agents.flow"
+import "src/sim/integrate.flow"
+import "src/sim/behaviour.flow"
+import "src/sim/memory.flow"
+import "src/sim/spatial.flow"
+import "src/sim/novelty.flow"
+import "src/sim/motion.flow"
+import "src/neural/population.flow"
+import "src/neural/place.flow"
+import "src/neural/head_direction.flow"
+import "src/neural/velocity.flow"
+import "src/neural/grid.flow"
+import "src/neural/boundary.flow"
+import "src/neural/attractor.flow"
+import "src/neural/circuit.flow"
+import "src/sim/simulation.flow"
+import "src/analysis/ratemap.flow"
+import "src/analysis/scores.flow"
+import "src/analysis/session.flow"
+import "src/ui/draw.flow"
+import "src/ui/widgets.flow"
+import "src/ui/layout.flow"
+import "src/ui/view_env.flow"
+import "src/ui/view_pop.flow"
+import "src/ui/view_sys.flow"
+import "src/io/record.flow"
+import "src/io/config.flow"
+
+function save(s: ptr<Sim>, ed: ptr<Editor>, path: string,
+              what: string) -> void {
+    if config_save(s, ed, path) {
+        printf("  wrote %-42s  %s\n", path, what)
+    } else {
+        printf("  FAILED %s\n", path)
+    }
+}
+
+function main() -> i32 {
+    printf("FlowRat demo configurations\n")
+    rec_ensure_dirs()
+    let mut ed: Editor = editor_new()
+
+    # Thigmotaxis: rats hug the wall instead of crossing the middle, which is
+    # what a real rat does in a bare open arena.
+    let mut a: Sim = sim_create(64, PRESET_OPEN_FIELD, 4242)
+    a.motion.thigmotaxis = 0.14
+    a.motion.speed_mean = 0.20
+    ed.trail_len = 512
+    ed.show_rays = false
+    save(&a, &ed, "data/configs/edge-hugging.flowrat",
+         "64 rats hugging the wall of an open field")
+    sim_destroy(&a)
+
+    # Two rooms with place fields gated by line of sight, so a field on one
+    # side of the divider does not bleed through it.
+    let mut b: Sim = sim_create(8, PRESET_TWO_ROOMS, 1717)
+    b.place_p.los_gate = true
+    b.place_p.sigma = 0.13
+    ed.show_rays = true
+    ed.show_cells = true
+    ed.trail_len = 400
+    save(&b, &ed, "data/configs/two-rooms-gated.flowrat",
+         "place fields that respect the divider")
+    sim_destroy(&b)
+
+    # The recurrent sheet pushed into the lattice regime: a narrow kernel
+    # makes several bumps instead of one, which is the grid-cell setting.
+    let mut c: Sim = sim_create(4, PRESET_OPEN_FIELD, 909)
+    can_set_sigma(&c.sheet, (c.sheet.nx as f64) / 16.0, c.dt)
+    can_calibrate_sheet(&c.sheet, c.dt)
+    c.can_anchor = true
+    ed.show_cells = false
+    save(&c, &ed, "data/configs/sheet-lattice.flowrat",
+         "the recurrent sheet in its multi-bump grid regime")
+    sim_destroy(&c)
+
+    # A cluttered arena with cue-seeking behaviour turned on.
+    let mut d: Sim = sim_create(32, PRESET_OBSTACLES, 5150)
+    d.motion.cue_gain = 1.1
+    d.motion.speed_mean = 0.22
+    d.require_sight = true
+    ed.show_rays = true
+    ed.trail_len = 300
+    save(&d, &ed, "data/configs/cue-seeking.flowrat",
+         "32 rats steering toward visible landmarks")
+    sim_destroy(&d)
+
+    # A colony living off one patch that comes back too slowly for all of
+    # them. Watch the hunger readouts rather than the trajectories.
+    let mut e2: Sim = sim_create(24, PRESET_OPEN_FIELD, 2468)
+    e2.motion.metabolism = 0.05
+    e2.motion.forage_gain = 3.2
+    for z in 0 to e2.env.n_zones {
+        if e2.env.zone_kind[z] == ZONE_REWARD {
+            e2.env.zone_capacity[z] = 20.0
+            e2.env.zone_regrow[z] = 0.6
+        }
+    }
+    env_refill_food(&e2.env)
+    ed.trail_len = 200
+    save(&e2, &ed, "data/configs/scarcity.flowrat",
+         "24 rats on one patch that regrows too slowly")
+    sim_destroy(&e2)
+
+    # Hoarding: food is carried back to the nest before it is eaten.
+    let mut f2: Sim = sim_create(6, PRESET_FOUR_ROOMS, 1357)
+    f2.motion.hoard = true
+    f2.motion.metabolism = 0.04
+    f2.motion.forage_gain = 3.0
+    save(&f2, &ed, "data/configs/hoarding.flowrat",
+         "six rats carrying food back to the nest before eating it")
+    sim_destroy(&f2)
+
+    printf("done\n")
+    return 0
+}

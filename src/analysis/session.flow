@@ -1,0 +1,316 @@
+# A recording session: run the simulation, count spikes, produce the maps.
+#
+# This is the piece that makes the rest of the analysis usable. It owns a rate
+# map for one cell, a head-direction histogram for it, and a transition matrix
+# over the behavioural states, and it fills all three from the same run so the
+# numbers describe one animal in one arena over one stretch of time.
+#
+# WHICH RAT
+#   One. A rate map is a statement about a cell in an animal, and averaging
+#   over a colony would produce the map of a rat that does not exist. The
+#   selected rat is the one recorded, which is also the one the interface is
+#   already showing.
+#
+# WHY IT NEEDS SPIKES
+#   Binning a rate and dividing by occupancy gives back a smoothed copy of the
+#   rate, which proves nothing: the model would be checking its own formula
+#   against itself. Counting spikes puts a sampling process in between, so the
+#   measurement can disagree with the model and usually does, by a little.
+
+import "ratemap.flow"
+import "scores.flow"
+
+extern {
+    function sqrt(x: f64) -> f64
+    function fabs(x: f64) -> f64
+}
+
+export const HD_BINS: i32 = 36
+
+export struct Session {
+    map: RateMap,
+    # Head-direction histogram for the same cell.
+    hd_spikes: ptr<f64>,
+    hd_occ: ptr<f64>,
+    # Behavioural transitions: from state to state, ST_COUNT squared.
+    trans: ptr<i32>,
+    last_state: i32,
+    # Scratch for the field flood fill and the autocorrelogram.
+    scratch: ptr<i32>,
+    queue: ptr<i32>,
+    corr: ptr<f64>,
+    corr_side: i32,
+    pop_kind: i32,
+    cell: i32,
+    rat: i32,
+    seconds: f64,
+    steps: i32,
+    running: bool,
+}
+
+export function session_create(nx: i32, ny: i32) -> Session {
+    let m: RateMap = ratemap_create(nx, ny)
+    # The correlogram is one lag either way for every bin, so it is odd and
+    # a little under twice the map's side.
+    let side: i32 = m.nx * 2 - 1
+    let s: Session = Session {
+        map: m,
+        hd_spikes: mem_alloc_f64(HD_BINS as i64, "session hd spikes"),
+        hd_occ: mem_alloc_f64(HD_BINS as i64, "session hd occupancy"),
+        trans: mem_alloc_i32((ST_COUNT * ST_COUNT) as i64,
+                             "session transitions"),
+        last_state: -1,
+        scratch: mem_alloc_i32(m.n_bins as i64, "session scratch"),
+        queue: mem_alloc_i32(m.n_bins as i64, "session queue"),
+        corr: mem_alloc_f64((side * side) as i64, "session correlogram"),
+        corr_side: side,
+        pop_kind: -1,
+        cell: -1,
+        rat: 0,
+        seconds: 0.0,
+        steps: 0,
+        running: false
+    }
+    return s
+}
+
+export function session_destroy(s: ptr<Session>) -> void {
+    ratemap_destroy(&s.map)
+    mem_release(s.hd_spikes as ptr<void>)
+    mem_release(s.hd_occ as ptr<void>)
+    mem_release(s.trans as ptr<void>)
+    mem_release(s.scratch as ptr<void>)
+    mem_release(s.queue as ptr<void>)
+    mem_release(s.corr as ptr<void>)
+    s.hd_spikes = null
+    s.hd_occ = null
+    s.trans = null
+    s.scratch = null
+    s.queue = null
+    s.corr = null
+}
+
+export function session_ready(s: ptr<Session>) -> bool {
+    if s.hd_spikes == null or s.hd_occ == null or s.trans == null {
+        return false
+    }
+    if s.scratch == null or s.queue == null or s.corr == null { return false }
+    return ratemap_ready(&s.map)
+}
+
+# Start recording one cell of one population, in the arena as it stands.
+export function session_begin(s: ptr<Session>, sim: ptr<Sim>, pop_kind: i32,
+                              cell: i32, rat: i32) -> void {
+    if !session_ready(s) { return }
+    ratemap_begin(&s.map, &sim.env, pop_kind, cell)
+    for b in 0 to HD_BINS {
+        s.hd_spikes[b] = 0.0
+        s.hd_occ[b] = 0.0
+    }
+    for k in 0 to ST_COUNT * ST_COUNT {
+        s.trans[k] = 0
+    }
+    s.last_state = -1
+    s.pop_kind = pop_kind
+    s.cell = cell
+    s.rat = rat
+    s.seconds = 0.0
+    s.steps = 0
+    s.running = true
+}
+
+# One step's worth of sample. Must be called after sim_step, so the spikes it
+# reads are the ones fired at the position it reads.
+export function session_sample(s: ptr<Session>, sim: ptr<Sim>) -> void {
+    if !s.running or !session_ready(s) { return }
+    let a: ptr<Agents> = &sim.agents
+    let i: i32 = s.rat
+    if i < 0 or i >= a.n { return }
+    let dt: f64 = sim.dt
+
+    let p: ptr<Pop> = sim_pop(sim, s.pop_kind)
+    let mut fired: f64 = 0.0
+    if p.n > 0 and s.cell >= 0 and s.cell < p.n {
+        fired = (p.spikes[pop_base(p, i) + s.cell] as f64)
+    }
+
+    ratemap_sample(&s.map, a.x[i], a.y[i], dt, fired)
+
+    # Head direction, binned on where the head points rather than where the
+    # body is going, for the same reason the cells are driven by it.
+    let h: f64 = wrap_tau(agents_head_dir(a, i))
+    let mut b: i32 = ((h / 6.283185307179586) * (HD_BINS as f64)) as i32
+    if b < 0 { b = 0 }
+    if b >= HD_BINS { b = HD_BINS - 1 }
+    s.hd_occ[b] = s.hd_occ[b] + dt
+    s.hd_spikes[b] = s.hd_spikes[b] + fired
+
+    # Behavioural transitions, counted on the change rather than every step,
+    # so the matrix is a count of transitions and not of time.
+    let st: i32 = a.state[i]
+    if s.last_state >= 0 and st != s.last_state {
+        s.trans[s.last_state * ST_COUNT + st] =
+            s.trans[s.last_state * ST_COUNT + st] + 1
+    }
+    s.last_state = st
+
+    s.seconds = s.seconds + dt
+    s.steps = s.steps + 1
+}
+
+# Stop and divide through.
+export function session_end(s: ptr<Session>, min_time: f64) -> void {
+    if !session_ready(s) { return }
+    ratemap_finish(&s.map, min_time)
+    s.running = false
+}
+
+export function session_transitions(s: ptr<Session>, from: i32,
+                                    to: i32) -> i32 {
+    if from < 0 or from >= ST_COUNT or to < 0 or to >= ST_COUNT { return 0 }
+    return s.trans[from * ST_COUNT + to]
+}
+
+# --- the scores, computed on demand -----------------------------------------
+
+export function session_information(s: ptr<Session>) -> f64 {
+    return spatial_information(&s.map)
+}
+
+export function session_sparsity(s: ptr<Session>) -> f64 {
+    return spatial_sparsity(&s.map)
+}
+
+export function session_coverage(s: ptr<Session>) -> f64 {
+    return ratemap_coverage(&s.map)
+}
+
+export function session_fields(s: ptr<Session>, frac: f64,
+                               min_bins: i32) -> FieldStats {
+    return detect_fields(&s.map, frac, min_bins, s.scratch, s.queue)
+}
+
+export function session_tuning(s: ptr<Session>) -> TuningStats {
+    return tuning_stats(s.hd_spikes, s.hd_occ, HD_BINS)
+}
+
+# Gridness, over an annulus that excludes the central peak and reaches out to
+# most of the correlogram. The inner radius has to clear the central blob or
+# it correlates with itself at every rotation and swamps the answer.
+export function session_gridness(s: ptr<Session>) -> f64 {
+    autocorrelogram(&s.map, s.corr, s.corr_side)
+    return gridness_auto(s.corr, s.corr_side)
+}
+
+# Where the first ring of correlogram peaks sits, in metres. For a grid cell
+# this is the lattice spacing, measured, and it can be held against the
+# spacing the population was configured with.
+export function session_grid_spacing(s: ptr<Session>) -> f64 {
+    autocorrelogram(&s.map, s.corr, s.corr_side)
+    return first_ring(s.corr, s.corr_side) * s.map.bin_w
+}
+
+export function session_corr_at(s: ptr<Session>, x: i32, y: i32) -> f64 {
+    if x < 0 or x >= s.corr_side or y < 0 or y >= s.corr_side { return 0.0 }
+    return s.corr[y * s.corr_side + x]
+}
+
+# --- running one from start to finish ---------------------------------------
+
+# Record one cell over `steps` steps and leave the session finished. The
+# common case, and the one the checks use.
+export function session_run(s: ptr<Session>, sim: ptr<Sim>, pop_kind: i32,
+                            cell: i32, rat: i32, steps: i32,
+                            min_time: f64) -> void {
+    session_begin(s, sim, pop_kind, cell, rat)
+    for k in 0 to steps {
+        sim_step(sim)
+        session_sample(s, sim)
+    }
+    session_end(s, min_time)
+}
+
+# --- export -----------------------------------------------------------------
+
+extern {
+    function fopen(path: string, mode: string) -> ptr<void>
+    function fclose(f: ptr<void>) -> i32
+    function fprintf(f: ptr<void>, fmt: string, ...) -> i32
+}
+
+# Every score, and then the map bin by bin, as one CSV.
+#
+# Four shapes in one file, marked by a leading column, because the scores are
+# a handful of numbers and the map is hundreds of rows, and splitting them
+# into separate files means several things to keep in step. A reader that
+# wants the map filters on the row kind.
+#
+# Section headers start with a hash, so a reader can drop them with one test
+# rather than knowing where each section begins.
+export function analysis_export(s: ptr<Session>, sim: ptr<Sim>,
+                                path: string) -> bool {
+    if !session_ready(s) or !s.map.finished { return false }
+    let f: ptr<void> = fopen(path, "w")
+    if f == null { return false }
+
+    let hd: TuningStats = session_tuning(s)
+    let fs: FieldStats = session_fields(s, 0.4, 3)
+    let mut w: i32 = fprintf(f, "#kind,a,b,c,d\n")
+    w = fprintf(f, "score,population,%d,,\n", s.pop_kind)
+    w = fprintf(f, "score,cell,%d,,\n", s.cell)
+    w = fprintf(f, "score,rat,%d,,\n", s.rat)
+    w = fprintf(f, "score,seconds,%.4f,,\n", s.seconds)
+    w = fprintf(f, "score,spikes,%.0f,,\n", s.map.total_spikes)
+    w = fprintf(f, "score,coverage,%.5f,,\n", ratemap_coverage(&s.map))
+    w = fprintf(f, "score,peak_hz,%.5f,,\n", ratemap_peak(&s.map))
+    w = fprintf(f, "score,mean_hz,%.5f,,\n", ratemap_mean(&s.map))
+    w = fprintf(f, "score,bits_per_spike,%.5f,,\n", session_information(s))
+    w = fprintf(f, "score,sparsity,%.5f,,\n", session_sparsity(s))
+    w = fprintf(f, "score,gridness,%.5f,,\n", session_gridness(s))
+    w = fprintf(f, "score,lattice_spacing_m,%.5f,,\n",
+                session_grid_spacing(s))
+    w = fprintf(f, "score,fields,%d,,\n", fs.count)
+    w = fprintf(f, "score,largest_field_m2,%.6f,,\n", fs.largest_area)
+    w = fprintf(f, "score,field_centre_x,%.5f,,\n", fs.peak_x)
+    w = fprintf(f, "score,field_centre_y,%.5f,,\n", fs.peak_y)
+    w = fprintf(f, "score,hd_preferred_rad,%.5f,,\n", hd.preferred)
+    w = fprintf(f, "score,hd_vector_length,%.5f,,\n", hd.vector_length)
+    w = fprintf(f, "score,hd_rayleigh_z,%.5f,,\n", hd.rayleigh_z)
+    w = fprintf(f, "score,hd_rayleigh_p,%.8f,,\n", hd.rayleigh_p)
+
+    # The map. Unvisited bins are written with an occupancy of zero and no
+    # rate, so a reader can tell a silent bin from one the rat never saw.
+    w = fprintf(f, "#bin,x,y,occupancy_s,rate_hz\n")
+    for k in 0 to s.map.n_bins {
+        let mut cx: f64 = 0.0
+        let mut cy: f64 = 0.0
+        ratemap_center(&s.map, k, &cx, &cy)
+        if ratemap_visited(&s.map, k) {
+            w = fprintf(f, "bin,%.5f,%.5f,%.5f,%.5f\n", cx, cy,
+                        s.map.occupancy[k], s.map.rate[k])
+        } else {
+            w = fprintf(f, "bin,%.5f,%.5f,0,\n", cx, cy)
+        }
+    }
+
+    w = fprintf(f, "#hd,bin_rad,occupancy_s,spikes,\n")
+    let step: f64 = 6.283185307179586 / (HD_BINS as f64)
+    for b in 0 to HD_BINS {
+        w = fprintf(f, "hd,%.5f,%.5f,%.0f,\n", ((b as f64) + 0.5) * step,
+                    s.hd_occ[b], s.hd_spikes[b])
+    }
+
+    w = fprintf(f, "#transition,from,to,count,\n")
+    for from in 0 to ST_COUNT {
+        for to in 0 to ST_COUNT {
+            let n: i32 = session_transitions(s, from, to)
+            if n > 0 {
+                w = fprintf(f, "transition,%s,%s,%d,\n", state_name(from),
+                            state_name(to), n)
+            }
+        }
+    }
+
+    let c: i32 = fclose(f)
+    return true
+}

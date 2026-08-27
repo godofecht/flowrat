@@ -1,0 +1,169 @@
+# Integrators for the kinematic subsystem.
+#
+# The rat's state splits cleanly in two. Speed and angular velocity are set
+# by the behavioural model, which is stochastic and has no meaningful
+# derivative to refine. Position and heading follow from them by ordinary
+# kinematics, which does.
+#
+#   dx/dt = v cos(theta)
+#   dy/dt = v sin(theta)
+#   dtheta/dt = omega
+#
+# So the control inputs (v, omega) are held constant across a step and only
+# the kinematics are integrated. That is the standard zero-order hold, and it
+# is what makes comparing integrators meaningful here: they all see the same
+# inputs and differ only in how they follow the arc.
+#
+# The derivative is a separate function from the update. Nothing in kin_deriv
+# reads or writes state, so a new integrator is written against it without
+# touching the model, and a new motion model does not touch the integrators.
+
+extern {
+    function sin(x: f64) -> f64
+    function cos(x: f64) -> f64
+    function fabs(x: f64) -> f64
+    function sqrt(x: f64) -> f64
+}
+
+export const INT_EULER: i32 = 0
+export const INT_SEMI: i32 = 1
+export const INT_RK4: i32 = 2
+export const INT_EXACT: i32 = 3
+export const INT_COUNT: i32 = 4
+
+export function integrator_name(kind: i32) -> string {
+    if kind == INT_SEMI { return "semi-implicit" }
+    if kind == INT_RK4 { return "rk4" }
+    if kind == INT_EXACT { return "exact arc" }
+    return "euler"
+}
+
+# The state derivative. Pure: inputs in, three rates out.
+export function kin_deriv(speed: f64, heading: f64, ang_vel: f64,
+                          dx_out: ptr<f64>, dy_out: ptr<f64>,
+                          dh_out: ptr<f64>) -> void {
+    dx_out[0] = speed * cos(heading)
+    dy_out[0] = speed * sin(heading)
+    dh_out[0] = ang_vel
+}
+
+# Forward Euler. Evaluates the derivative at the start of the step, so a
+# turning rat cuts the corner of its own arc. Cheapest and least accurate;
+# kept as the baseline the others are measured against.
+function step_euler(x: ptr<f64>, y: ptr<f64>, h: ptr<f64>,
+                    speed: f64, ang_vel: f64, dt: f64) -> void {
+    let mut dx: f64 = 0.0
+    let mut dy: f64 = 0.0
+    let mut dh: f64 = 0.0
+    kin_deriv(speed, h[0], ang_vel, &dx, &dy, &dh)
+    x[0] = x[0] + dx * dt
+    y[0] = y[0] + dy * dt
+    h[0] = h[0] + dh * dt
+}
+
+# Semi-implicit Euler. Advances heading first, then moves along the new
+# heading. One extra add over Euler and noticeably better on a turn, which is
+# why it is the default.
+function step_semi(x: ptr<f64>, y: ptr<f64>, h: ptr<f64>,
+                   speed: f64, ang_vel: f64, dt: f64) -> void {
+    let nh: f64 = h[0] + ang_vel * dt
+    x[0] = x[0] + speed * cos(nh) * dt
+    y[0] = y[0] + speed * sin(nh) * dt
+    h[0] = nh
+}
+
+# Classical RK4 over the same three equations. With (v, omega) held constant
+# the heading part is linear and RK4 reproduces it exactly; the work goes
+# into the position, where the error drops to fourth order in dt.
+function step_rk4(x: ptr<f64>, y: ptr<f64>, h: ptr<f64>,
+                  speed: f64, ang_vel: f64, dt: f64) -> void {
+    let h0: f64 = h[0]
+    let half: f64 = dt * 0.5
+
+    let mut k1x: f64 = 0.0
+    let mut k1y: f64 = 0.0
+    let mut k1h: f64 = 0.0
+    kin_deriv(speed, h0, ang_vel, &k1x, &k1y, &k1h)
+
+    let mut k2x: f64 = 0.0
+    let mut k2y: f64 = 0.0
+    let mut k2h: f64 = 0.0
+    kin_deriv(speed, h0 + k1h * half, ang_vel, &k2x, &k2y, &k2h)
+
+    let mut k3x: f64 = 0.0
+    let mut k3y: f64 = 0.0
+    let mut k3h: f64 = 0.0
+    kin_deriv(speed, h0 + k2h * half, ang_vel, &k3x, &k3y, &k3h)
+
+    let mut k4x: f64 = 0.0
+    let mut k4y: f64 = 0.0
+    let mut k4h: f64 = 0.0
+    kin_deriv(speed, h0 + k3h * dt, ang_vel, &k4x, &k4y, &k4h)
+
+    let sixth: f64 = dt / 6.0
+    x[0] = x[0] + sixth * (k1x + 2.0 * k2x + 2.0 * k3x + k4x)
+    y[0] = y[0] + sixth * (k1y + 2.0 * k2y + 2.0 * k3y + k4y)
+    h[0] = h0 + sixth * (k1h + 2.0 * k2h + 2.0 * k3h + k4h)
+}
+
+# Closed form. Constant speed and constant turn rate trace a circular arc,
+# and that arc has an elementary solution. Included because it turns the
+# integrator comparison into a real measurement: RK4's error against this is
+# the honest truncation error, not a guess from a finer step.
+#
+# As omega goes to zero the arc becomes a straight line and the 1/omega terms
+# lose all their precision, so below the threshold the straight-line form is
+# used instead.
+function step_exact(x: ptr<f64>, y: ptr<f64>, h: ptr<f64>,
+                    speed: f64, ang_vel: f64, dt: f64) -> void {
+    let h0: f64 = h[0]
+    let h1: f64 = h0 + ang_vel * dt
+    if fabs(ang_vel) < 0.000001 {
+        x[0] = x[0] + speed * cos(h0) * dt
+        y[0] = y[0] + speed * sin(h0) * dt
+        h[0] = h1
+        return
+    }
+    let r: f64 = speed / ang_vel
+    x[0] = x[0] + r * (sin(h1) - sin(h0))
+    y[0] = y[0] - r * (cos(h1) - cos(h0))
+    h[0] = h1
+}
+
+# Advance one rat's kinematics by dt under the chosen integrator.
+export function kin_step(kind: i32, x: ptr<f64>, y: ptr<f64>, h: ptr<f64>,
+                         speed: f64, ang_vel: f64, dt: f64) -> void {
+    if kind == INT_SEMI {
+        step_semi(x, y, h, speed, ang_vel, dt)
+        return
+    }
+    if kind == INT_RK4 {
+        step_rk4(x, y, h, speed, ang_vel, dt)
+        return
+    }
+    if kind == INT_EXACT {
+        step_exact(x, y, h, speed, ang_vel, dt)
+        return
+    }
+    step_euler(x, y, h, speed, ang_vel, dt)
+}
+
+# Position error of one integrator against the closed-form arc over a single
+# step. Used by the validation entry point to show the expected ordering
+# rather than assert it from theory.
+export function kin_step_error(kind: i32, speed: f64, heading: f64,
+                               ang_vel: f64, dt: f64) -> f64 {
+    let mut ax: f64 = 0.0
+    let mut ay: f64 = 0.0
+    let mut ah: f64 = heading
+    step_exact(&ax, &ay, &ah, speed, ang_vel, dt)
+
+    let mut bx: f64 = 0.0
+    let mut by: f64 = 0.0
+    let mut bh: f64 = heading
+    kin_step(kind, &bx, &by, &bh, speed, ang_vel, dt)
+
+    let dx: f64 = bx - ax
+    let dy: f64 = by - ay
+    return sqrt(dx * dx + dy * dy)
+}

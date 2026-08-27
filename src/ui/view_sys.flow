@@ -17,6 +17,11 @@ extern {
     function atan2(y: f64, x: f64) -> f64
 }
 
+# The control column is intentionally denser than the other panels. Keep its
+# scroll offset here so the immediate-mode controls remain simple and every
+# frame uses the same hit-test coordinate transform as its drawing pass.
+let mut control_scroll: i32 = 0
+
 # --- recurrent state -------------------------------------------------------
 
 # The sheet as a heatmap, the ring as a polar trace, and the position the
@@ -389,7 +394,25 @@ export function view_control_draw(c: ptr<Canvas>, u: ptr<Ui>, s: ptr<Sim>,
     ui_panel(c, lay.ctl_x, lay.ctl_y, lay.ctl_w, lay.ctl_h, "control")
     let x: i32 = lay.ctl_x + PAD
     let w: i32 = lay.ctl_w - PAD * 2
-    let mut y: i32 = ui_panel_body_y(lay.ctl_y)
+    let body_y: i32 = ui_panel_body_y(lay.ctl_y)
+    let body_h: i32 = lay.ctl_h - TITLE_H - 2
+    # This is the measured height of the control stack. It leaves a small
+    # tail below the last row and produces a useful scrollbar at every window
+    # size, including fullscreen.
+    let content_h: i32 = 540
+    let mut max_scroll: i32 = content_h - body_h
+    if max_scroll < 0 { max_scroll = 0 }
+    if ui_hit(u, lay.ctl_x, lay.ctl_y, lay.ctl_w, lay.ctl_h) and u.wheel != 0 {
+        control_scroll = control_scroll - u.wheel * 24
+        if control_scroll < 0 { control_scroll = 0 }
+        if control_scroll > max_scroll { control_scroll = max_scroll }
+    }
+    # Draw and hit-test the stack in the same virtual coordinate space. The
+    # clip keeps scrolled controls from painting into the arena or header.
+    let saved_my: i32 = u.my
+    u.my = u.my + control_scroll
+    canvas_clip(c, lay.ctl_x + 1, body_y, lay.ctl_w - 2, body_h)
+    let mut y: i32 = body_y - control_scroll
     let mut rebuild: bool = false
 
     # Row pitches. The panel holds thirty controls in five hundred pixels, so
@@ -587,6 +610,18 @@ export function view_control_draw(c: ptr<Canvas>, u: ptr<Ui>, s: ptr<Sim>,
     # the control panel, and the control that did it was below the fold.
     # Those controls now live in that tab, beside the wiring they change.
 
+    canvas_clip_reset(c)
+    u.my = saved_my
+    # A slim, always-visible thumb makes the panel's scroll affordance clear.
+    if max_scroll > 0 {
+        let track_x: i32 = lay.ctl_x + lay.ctl_w - 5
+        let track_y: i32 = body_y + 2
+        let track_h: i32 = body_h - 4
+        let thumb_h: i32 = (track_h * body_h) / content_h
+        let thumb_y: i32 = track_y + ((track_h - thumb_h) * control_scroll) / max_scroll
+        dr_rect(c, track_x, track_y, 2, track_h, C_EDGE)
+        dr_rect(c, track_x, thumb_y, 2, thumb_h, C_ACCENT2)
+    }
     return rebuild
 }
 

@@ -60,6 +60,11 @@ button:disabled { color:#68738a; background:#202531; cursor:default; transform:n
 .transport .spacer { flex:1; }
 #status { color:var(--muted); font-size:12px; }
 .keys, footer { color:var(--muted); font-size:12px; text-align:center; }
+.experiment-bar { width:min(1280px,100%); display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+  padding:10px 12px; background:#111622cc; border:1px solid var(--line); border-radius:8px; }
+.experiment-bar label { color:var(--muted); font-size:12px; letter-spacing:.04em; }
+.experiment-bar select { color:var(--text); background:#202a3e; border:1px solid #35435e; border-radius:5px; padding:7px 10px; font:inherit; }
+.experiment-note { color:var(--muted); font-size:12px; margin-left:auto; }
 footer { padding:12px; border-top:1px solid #202839; }
 pre#out { width:min(880px,100%); margin:0; max-height:22vh; overflow:auto; color:#9ece6a;
   background:#07090d; border:1px solid #202839; border-radius:6px; padding:10px; font:12px/1.5 ui-monospace,monospace; }
@@ -104,6 +109,13 @@ pre#out:empty { display:none; } .err { color:#f7768e; }
     <button id="reset" class="secondary" disabled>Reset</button>
     <button id="fullscreen" class="secondary">Fullscreen</button><span class="spacer"></span><span id="status">idle</span>
   </div>
+  <div class="experiment-bar" aria-label="experiment launcher">
+    <label for="experiment">Experiment</label>
+    <select id="experiment"><option value="1">Open-field baseline</option><option value="5">T-maze choice</option><option value="7">Obstacle navigation</option><option value="1">Homing protocol</option><option value="1">Cue-remapping protocol</option></select>
+    <button id="run-experiment">Run experiment</button>
+    <button id="download-trajectory" class="secondary" disabled>Download trajectory</button>
+    <span class="experiment-note">One click launches the live simulator and recorder.</span>
+  </div>
   <div class="keys">Space run/pause · S step · R reset · Arrows/WASD move · P pause · F fit view</div>
   <pre id="out"></pre>
   <section class="wiki" aria-label="FlowRat wiki">
@@ -128,7 +140,7 @@ pre#out:empty { display:none; } .err { color:#f7768e; }
   const params={};
   function emit(name,data) {(listeners[name]||[]).forEach(fn=>fn(data));}
   function log(text,err) { const line=document.createElement('span'); if(err) line.className='err'; line.textContent=text+'\n'; out.appendChild(line); out.scrollTop=out.scrollHeight; }
-  function key(k) { window.dispatchEvent(new KeyboardEvent('keydown',{key:k,bubbles:true})); window.dispatchEvent(new KeyboardEvent('keyup',{key:k,bubbles:true})); }
+  function key(k, hold) { const down={key:k,bubbles:true}; document.dispatchEvent(new KeyboardEvent('keydown',down)); window.dispatchEvent(new KeyboardEvent('keydown',down)); setTimeout(function(){ const up={key:k,bubbles:true}; document.dispatchEvent(new KeyboardEvent('keyup',up)); window.dispatchEvent(new KeyboardEvent('keyup',up)); }, hold||120); }
   // Capture before the generated runtime listener. Some browsers let the
   // page's scroll handling win over the canvas listener; forwarding directly
   // to Flow's cumulative mouse counter keeps the in-canvas control scroll
@@ -138,8 +150,8 @@ pre#out:empty { display:none; } .err { color:#f7768e; }
     if (flow && flow.mouse) { flow.mouse.wheel += ev.deltaY > 0 ? 1 : -1; }
     ev.preventDefault(); ev.stopImmediatePropagation();
   }, {capture:true, passive:false});
-  function boot() { if(started)return; started=true; overlay.classList.add('hidden'); start.disabled=true; status.textContent='loading module…'; window.focus();
-    createFlowModule({print:t=>log(t,false),printErr:t=>log(t,true),canvas}).then(mod=>{ module=mod; run.disabled=step.disabled=reset.disabled=false; status.textContent='running'; emit('start',{module:mod}); try{mod.callMain([]);}catch(e){if(!(e&&e.name==='ExitStatus'))log(''+e,true);}}).catch(e=>{status.textContent='failed to load';log(''+e,true);}); }
+  function boot(after) { if(started){if(after)setTimeout(after,120);return;} started=true; overlay.classList.add('hidden'); start.disabled=true; status.textContent='loading module…'; window.focus();
+    createFlowModule({print:t=>log(t,false),printErr:t=>log(t,true),canvas}).then(mod=>{ module=mod; run.disabled=step.disabled=reset.disabled=false; $('download-trajectory').disabled=false; status.textContent='running'; emit('start',{module:mod}); try{mod.callMain([]);}catch(e){if(!(e&&e.name==='ExitStatus'))log(''+e,true);} if(after)setTimeout(after,250);}).catch(e=>{status.textContent='failed to load';log(''+e,true);}); }
   function toggleRun(){if(!started)return; key(' '); paused=!paused; run.textContent=paused?'Resume':'Pause'; status.textContent=paused?'paused':'running'; emit(paused?'pause':'resume',{});}
   window.FlowRat={version:'1.0',start:boot,pause:()=>{if(!paused)toggleRun()},resume:()=>{if(paused)toggleRun()},step:()=>{if(started){key('s');emit('step',{})}},reset:()=>{if(started){key('r');emit('reset',{})}},stop:()=>window.flowGfxStop&&window.flowGfxStop(),
     registerParameter(def){if(!def||!def.name)throw Error('parameter needs a name');params[def.name]={...def,value:def.value};emit('parameter:registered',params[def.name]);return params[def.name]},
@@ -147,6 +159,8 @@ pre#out:empty { display:none; } .err { color:#f7768e; }
     getParameters(){return JSON.parse(JSON.stringify(params))},on(name,fn){(listeners[name]||(listeners[name]=[])).push(fn);return()=>listeners[name]=listeners[name].filter(x=>x!==fn)}};
   overlay.onclick=boot; start.onclick=e=>{e.stopPropagation();boot()}; run.onclick=toggleRun; step.onclick=()=>FlowRat.step(); reset.onclick=()=>FlowRat.reset();
   full.onclick=()=>{const target=document.querySelector('.stage'); if(!document.fullscreenElement)target.requestFullscreen?.();else document.exitFullscreen?.()};
+  $('run-experiment').onclick=()=>{const preset=$('experiment').value; boot(()=>{key(preset,220); setTimeout(()=>key('o',220),420);});};
+  $('download-trajectory').onclick=()=>{try{const fs=module&&module.FS; if(!fs)throw Error('simulation filesystem is not ready'); const data=fs.readFile('/data/out/trajectory.csv',{encoding:'utf8'}); const blob=new Blob([data],{type:'text/csv'}); const link=document.createElement('a'); link.href=URL.createObjectURL(blob); link.download='flowrat-trajectory.csv'; link.click(); setTimeout(()=>URL.revokeObjectURL(link.href),1000);}catch(e){log('download: '+e,true);}};
   window.flowGfxOnStart=(title,w,h)=>{status.textContent='running '+w+'×'+h}; window.flowGfxOnExit=frames=>{status.textContent='finished after '+frames+' frames';run.disabled=step.disabled=reset.disabled=true;emit('exit',{frames})};
   if(location.search.includes('autostart=1'))setTimeout(boot,300);
 })();

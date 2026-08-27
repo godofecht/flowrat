@@ -13,15 +13,21 @@ import argparse
 import csv
 import json
 import math
+import os
 import random
+import shutil
 import statistics
+import subprocess
 import sys
+import tempfile
 import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PRESET_DIR = ROOT / "experiments" / "presets"
 DEFAULT_OUT = ROOT / "data" / "out" / "experiments"
+PRESET_IDS = {"open_field": 0, "circle": 1, "two_rooms": 2, "four_rooms": 3,
+              "t_maze": 4, "linear_track": 5, "obstacles": 6, "plus_maze": 7}
 
 PRESET_DEFAULTS = {
     "open_field": {"arena": {"width": 2.0, "height": 2.0, "goal_x": 1.0, "goal_y": 1.0}, "policy": "explore"},
@@ -178,6 +184,161 @@ def import_tracking(input_path: Path, output: Path, pixels_per_unit: float = 1.0
     return {"rows": len(rows), "rats": len({r["rat"] for r in rows}), "source": "tracked_csv", "output": str(output)}
 
 
+def track_video(input_path: Path, output: Path, frame_rate: float = 30.0,
+                min_area: int = 80, max_area: int = 10000) -> dict:
+    """Extract foreground centroids from a fixed-camera video.
+
+    This is a transparent baseline for quick inspection, not a replacement
+    for pose estimation. For serious data use DeepLabCut or SLEAP and feed
+    their CSV export to import_tracking.
+    """
+    try:
+        import cv2
+    except ImportError as exc:
+        raise RuntimeError("track-video needs OpenCV; use import-tracking for tracker CSV exports") from exc
+    capture = cv2.VideoCapture(str(input_path))
+    if not capture.isOpened():
+        raise ValueError(f"could not open video: {input_path}")
+    subtractor = cv2.createBackgroundSubtractorMOG2(history=300, varThreshold=32, detectShadows=False)
+    rows, frame = [], 0
+    while True:
+        ok, image = capture.read()
+        if not ok:
+            break
+        mask = subtractor.apply(image)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+        mask = cv2.dilate(mask, None, iterations=1)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        candidates = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if min_area <= area <= max_area:
+                moments = cv2.moments(contour)
+                if moments["m00"]:
+                    candidates.append((moments["m10"] / moments["m00"], moments["m01"] / moments["m00"], area))
+        # The baseline emits each visible component as a track with a frame
+        # local id. Identity-preserving multi-animal tracking belongs in the
+        # dedicated tracker, where crossings can be handled explicitly.
+        for rat, (x, y, area) in enumerate(sorted(candidates, key=lambda c: c[0])):
+            rows.append({"step": frame, "time": f"{frame / frame_rate:.6f}", "rat": rat,
+                         "x": f"{x:.6f}", "y": f"{y:.6f}", "confidence": f"{min(1.0, area / max_area):.6f}"})
+        frame += 1
+    capture.release()
+    if not rows:
+        raise ValueError("no foreground components detected; adjust min/max area or use a tracker export")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
+    return {"frames": frame, "rows": len(rows), "source": "opencv_foreground_centroids", "output": str(output)}
+
+
+FLOW_IMPORTS = '''import "src/core/mem.flow"
+import "src/core/rng.flow"
+import "src/core/clock.flow"
+import "src/core/profile.flow"
+import "src/env/geometry.flow"
+import "src/env/environment.flow"
+import "src/env/queries.flow"
+import "src/env/presets.flow"
+import "src/sim/agents.flow"
+import "src/sim/integrate.flow"
+import "src/sim/behaviour.flow"
+import "src/sim/memory.flow"
+import "src/sim/spatial.flow"
+import "src/sim/novelty.flow"
+import "src/sim/motion.flow"
+import "src/neural/population.flow"
+import "src/neural/place.flow"
+import "src/neural/head_direction.flow"
+import "src/neural/velocity.flow"
+import "src/neural/grid.flow"
+import "src/neural/boundary.flow"
+import "src/neural/attractor.flow"
+import "src/neural/circuit.flow"
+import "src/sim/simulation.flow"
+import "src/analysis/ratemap.flow"
+import "src/analysis/scores.flow"
+import "src/analysis/session.flow"
+import "src/io/record.flow"
+'''
+
+
+def flow_literal(value):
+    if isinstance(value, bool): return "true" if value else "false"
+    if isinstance(value, int): return str(value)
+    return f"{float(value):.12g}"
+
+
+def flow_batch_source(plan: dict) -> str:
+    exp, sim = plan["experiment"], plan.get("simulation", {})
+    motion, behaviour, memory = plan.get("motion", {}), plan.get("behaviour", plan.get("behavior", {})), plan.get("memory", {})
+    neural = plan.get("neural", {})
+    assignments = [f"s.dt = {flow_literal(sim.get('dt', 1.0 / exp['sample_hz']))}",
+                   f"s.steps_per_frame = {flow_literal(sim.get('steps_per_frame', 1))}",
+                   f"s.require_sight = {flow_literal(sim.get('require_sight', True))}",
+                   f"s.spiking = {flow_literal(sim.get('spiking', False))}",
+                   f"s.can_enabled = {flow_literal(sim.get('continuous_attractors', sim.get('can_enabled', True)))}"]
+    for section, prefix, allowed in ((motion, "s.motion", ("speed_mean", "speed_sigma", "speed_tau", "speed_max", "turn_sigma", "turn_tau", "turn_max", "wall_range", "wall_gain", "thigmotaxis", "cue_gain", "rest_rate", "margin", "metabolism", "thirst_rate", "eat_rate", "sate_per_unit", "slake_per_unit", "social_range", "social_push", "follow_gain", "crowd_share", "eat_reach", "bite_seconds", "forage_gain", "eat_threshold", "hoard", "carry_capacity", "head_tau", "head_sigma", "head_max")),
+                                  (behaviour, "s.behaviour", ("enabled", "groom_rate", "rear_rate", "rest_rate", "groom_min", "groom_max", "rear_min", "rear_max", "rest_min", "rest_max", "nest_rest_min", "nest_rest_max", "drive_hysteresis", "move_min", "vte_enabled", "junction_open", "scan_min", "scan_max", "scan_cooldown", "scan_hz", "scan_extent")),
+                                  (memory, "s.memory", ("enabled", "decay", "disappointment", "usable", "home_drift", "home_sense"))):
+        for key in allowed:
+            if key in section: assignments.append(f"{prefix}.{key} = {flow_literal(section[key])}")
+    neural_fields = (("grid_modules", "s.grid_p.n_modules"), ("grid_spacing", "s.grid_p.base_spacing"),
+                     ("grid_spacing_ratio", "s.grid_p.spacing_ratio"), ("grid_orientation", "s.grid_p.base_orientation"),
+                     ("grid_peak_rate", "s.grid_p.peak_rate"), ("grid_sharpness", "s.grid_p.sharpness"),
+                     ("place_sigma", "s.place_p.sigma"), ("place_peak_rate", "s.place_p.peak_rate"),
+                     ("hd_kappa", "s.hd_p.kappa"), ("hd_peak_rate", "s.hd_p.peak_rate"),
+                     ("bvc_max_distance", "s.bvc_p.max_distance"), ("bvc_sigma", "s.bvc_p.sigma0"),
+                     ("bvc_peak_rate", "s.bvc_p.peak_rate"))
+    for key, target in neural_fields:
+        if key in neural: assignments.append(f"{target} = {flow_literal(neural[key])}")
+    if "can_substeps" in neural: assignments.append(f"s.can_substeps = {flow_literal(neural['can_substeps'])}")
+    if "anchor_attractors" in neural: assignments.append(f"s.can_anchor = {flow_literal(neural['anchor_attractors'])}")
+    dt = float(sim.get("dt", 1.0 / exp["sample_hz"]))
+    steps = max(1, int(round(float(exp["duration_s"]) / dt)))
+    preset_id = PRESET_IDS.get(exp.get("flow_preset", exp.get("preset", "open_field")), 0)
+    return FLOW_IMPORTS + f'''\nfunction main() -> i32 {{
+    let mut s: Sim = sim_create({int(exp["rats"])}, {preset_id}, {int(exp["seed"])} as u32)
+    let mut r: Recorder = rec_new()
+    {chr(10).join("    " + line for line in assignments)}
+    sim_configure_populations(&s)
+    sim_reset(&s, {int(exp["rats"])})
+    r.stride = {int(plan.get("recording", {}).get("stride", 1))}
+    r.max_rats = {int(plan.get("recording", {}).get("max_rats", min(int(exp["rats"]), 16)))}
+    r.cell_stride = {int(plan.get("recording", {}).get("cell_stride", 1))}
+    if !rec_start(&r, &s) {{ return 2 }}
+    for i in 0 to {steps} {{
+        sim_step(&s)
+        rec_step(&r, &s)
+    }}
+    rec_stop(&r)
+    export_occupancy(&s, "data/out/occupancy.csv", 32)
+    export_ratemap(&s, 0, 0, "data/out/ratemap.csv")
+    sim_destroy(&s)
+    return 0
+}}
+'''
+
+
+def run_flow(plan: dict, output_dir: Path) -> dict:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    source = ROOT / f".flowrat_batch_{os.getpid()}.flow"
+    source.write_text(flow_batch_source(plan))
+    try:
+        env = dict(os.environ); env.setdefault("FLOW_HOST", "python")
+        result = subprocess.run([str(Path(env.get("FLOW_HOME", Path.home() / "flow")) / "flow"), "run", str(source)], cwd=ROOT, env=env, text=True, capture_output=True)
+        if result.returncode:
+            raise RuntimeError(result.stdout + result.stderr)
+        copied = []
+        for name in ("trajectory.csv", "neural.csv", "recurrent.csv", "occupancy.csv", "ratemap.csv"):
+            candidate = ROOT / "data" / "out" / name
+            if candidate.exists():
+                target = output_dir / name; shutil.copy2(candidate, target); copied.append(name)
+        return {"returncode": result.returncode, "outputs": copied, "stdout_tail": result.stdout[-1000:]}
+    finally:
+        source.unlink(missing_ok=True)
+
+
 def movement_metrics(path: Path) -> dict[str, float]:
     by_rat: dict[int, list[dict]] = {}
     with path.open(newline="") as handle:
@@ -187,6 +348,13 @@ def movement_metrics(path: Path) -> dict[str, float]:
             except (TypeError, ValueError):
                 continue
     distances, speeds, turns, durations = [], [], [], []
+    occupancy: dict[tuple[int, int], int] = {}
+    wall_samples, pause_samples, persistence = 0, 0, []
+    all_x = [float(row["x"]) for rows in by_rat.values() for row in rows]
+    all_y = [float(row["y"]) for rows in by_rat.values() for row in rows]
+    x0, x1 = (min(all_x), max(all_x)) if all_x else (0.0, 1.0)
+    y0, y1 = (min(all_y), max(all_y)) if all_y else (0.0, 1.0)
+    x_span, y_span = max(x1 - x0, 1e-9), max(y1 - y0, 1e-9)
     for rows in by_rat.values():
         rows.sort(key=lambda r: float(r.get("time", r.get("step", 0))))
         total, local_speeds, local_turns = 0.0, [], []
@@ -194,20 +362,32 @@ def movement_metrics(path: Path) -> dict[str, float]:
         for a, b in zip(rows, rows[1:]):
             dx, dy = float(b["x"]) - float(a["x"]), float(b["y"]) - float(a["y"])
             dt = max(1e-9, float(b.get("time", 0)) - float(a.get("time", 0)))
-            dist = math.hypot(dx, dy); total += dist; local_speeds.append(dist / dt)
+            ax, ay = float(a["x"]), float(a["y"])
+            nx, ny = (ax - x0) / x_span, (ay - y0) / y_span
+            bin_key = (min(15, int(nx * 16)), min(15, int(ny * 16))); occupancy[bin_key] = occupancy.get(bin_key, 0) + 1
+            dist = math.hypot(dx, dy); velocity = dist / dt; total += dist; local_speeds.append(velocity)
+            pause_samples += velocity < 0.03
+            wall_samples += min(nx, ny, 1.0 - nx, 1.0 - ny) < 0.05
             heading = math.atan2(dy, dx)
             if prev_heading is not None:
-                local_turns.append(abs((heading - prev_heading + math.pi) % (2 * math.pi) - math.pi) / dt)
+                angle = (heading - prev_heading + math.pi) % (2 * math.pi) - math.pi
+                local_turns.append(abs(angle) / dt); persistence.append(math.cos(angle))
             prev_heading = heading
         if rows:
             durations.append(float(rows[-1].get("time", 0)) - float(rows[0].get("time", 0)))
         distances += [total]; speeds += local_speeds; turns += local_turns
+    total_samples = sum(occupancy.values()) or 1
+    occupancy_entropy = -sum((count / total_samples) * math.log(count / total_samples) for count in occupancy.values())
     return {"rats": float(len(by_rat)), "path_length_mean": statistics.fmean(distances) if distances else 0.0,
             "path_length_sd": statistics.pstdev(distances) if len(distances) > 1 else 0.0,
             "speed_mean": statistics.fmean(speeds) if speeds else 0.0,
             "speed_p95": sorted(speeds)[int(.95 * (len(speeds) - 1))] if speeds else 0.0,
             "turn_rate_mean": statistics.fmean(turns) if turns else 0.0,
-            "duration_mean": statistics.fmean(durations) if durations else 0.0}
+            "duration_mean": statistics.fmean(durations) if durations else 0.0,
+            "occupancy_entropy_16x16": occupancy_entropy,
+            "wall_fraction": wall_samples / total_samples,
+            "pause_fraction": pause_samples / total_samples,
+            "directional_persistence": statistics.fmean(persistence) if persistence else 0.0}
 
 
 def write_json(data: dict, path: Path) -> None:
@@ -229,6 +409,14 @@ def command_generate(args: argparse.Namespace) -> int:
     out = Path(args.output); summary = synthetic(plan, out); write_json({"plan": plan, "summary": summary}, out.with_suffix(".manifest.json")); print(json.dumps(summary, indent=2)); return 0
 
 
+def command_run(args: argparse.Namespace) -> int:
+    plan = load_plan(Path(args.plan)); errors = validate(plan)
+    if errors: return command_validate(args)
+    result = run_flow(plan, Path(args.output_dir))
+    write_json({"plan": plan, "run": result}, Path(args.output_dir) / "flowrat-run.manifest.json")
+    print(json.dumps(result, indent=2)); return 0
+
+
 def command_import(args: argparse.Namespace) -> int:
     summary = import_tracking(Path(args.input), Path(args.output), args.pixels_per_unit, args.frame_rate); print(json.dumps(summary, indent=2)); return 0
 
@@ -243,14 +431,26 @@ def command_compare(args: argparse.Namespace) -> int:
     write_json(result, Path(args.output)); print(json.dumps(result, indent=2)); return 0
 
 
+def command_report(args: argparse.Namespace) -> int:
+    metrics = json.loads(Path(args.input).read_text())
+    lines = [f"# FlowRat movement report\n", f"Source: `{args.input}`\n", "| Feature | Value |", "|---|---:|"]
+    for key, value in metrics.items():
+        if isinstance(value, (int, float)): lines.append(f"| `{key}` | {value:.6g} |")
+    lines += ["", "## Interpretation", "", "These are movement descriptors, not biological validation. Compare them across protocols or against a tracked animal recorded under the same arena and sampling conditions."]
+    Path(args.output).write_text("\n".join(lines) + "\n"); print(args.output); return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(required=True)
     p = sub.add_parser("validate"); p.add_argument("plan"); p.set_defaults(func=command_validate)
     p = sub.add_parser("generate"); p.add_argument("plan"); p.add_argument("-o", "--output", required=True); p.set_defaults(func=command_generate)
+    p = sub.add_parser("run"); p.add_argument("plan"); p.add_argument("--output-dir", required=True); p.set_defaults(func=command_run)
     p = sub.add_parser("import-tracking"); p.add_argument("input"); p.add_argument("-o", "--output", required=True); p.add_argument("--pixels-per-unit", type=float, default=1.0); p.add_argument("--frame-rate", type=float, default=30.0); p.set_defaults(func=command_import)
+    p = sub.add_parser("track-video"); p.add_argument("input"); p.add_argument("-o", "--output", required=True); p.add_argument("--frame-rate", type=float, default=30.0); p.add_argument("--min-area", type=int, default=80); p.add_argument("--max-area", type=int, default=10000); p.set_defaults(func=lambda a: (print(json.dumps(track_video(Path(a.input), Path(a.output), a.frame_rate, a.min_area, a.max_area), indent=2)) or 0))
     p = sub.add_parser("analyze"); p.add_argument("input"); p.add_argument("-o", "--output", required=True); p.set_defaults(func=command_analyze)
     p = sub.add_parser("compare"); p.add_argument("--real", required=True); p.add_argument("--synthetic", required=True); p.add_argument("-o", "--output", required=True); p.set_defaults(func=command_compare)
+    p = sub.add_parser("report"); p.add_argument("input"); p.add_argument("-o", "--output", required=True); p.set_defaults(func=command_report)
     args = parser.parse_args(); return args.func(args)
 
 

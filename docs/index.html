@@ -53,6 +53,11 @@ main { flex:1; display:flex; flex-direction:column; align-items:center; justify-
 .app-shell-head { width:min(960px,100%); margin:0 auto 10px; display:flex; align-items:center;
   justify-content:space-between; gap:12px; color:var(--muted); font-size:11px; letter-spacing:.09em; text-transform:uppercase; }
 .app-shell-head strong { color:var(--text); font-size:12px; font-weight:600; letter-spacing:.12em; }
+.state-chip { display:inline-flex; align-items:center; gap:7px; color:var(--muted); text-transform:none; letter-spacing:0; }
+.state-dot { width:7px; height:7px; border-radius:50%; background:#68738a; box-shadow:0 0 0 3px #68738a22; }
+.state-dot.live { background:#9ece6a; box-shadow:0 0 0 3px #9ece6a22; }
+.state-dot.warn { background:#e0af68; box-shadow:0 0 0 3px #e0af6822; }
+.state-dot.bad { background:#f7768e; box-shadow:0 0 0 3px #f7768e22; }
 .stage,.transport,.experiment-bar { margin-left:auto; margin-right:auto; }
 canvas { display:block; width:100%; height:100%; aspect-ratio:8/5; object-fit:contain;
   background:#000; border:1px solid #293246; border-radius:8px; image-rendering:pixelated; }
@@ -113,7 +118,7 @@ pre#out:empty { display:none; } .err { color:#f7768e; }
 <header><h1><span class="brand-mark">flowrat</span></h1><span class="meta">Flow → C → WebAssembly · neural navigation lab</span><span class="build-tag">live build · ui-shell</span>
   <span class="meta"><a href="https://github.com/godofecht/flowrat/blob/main/flowrat.flow">source</a></span></header>
 <main>
-  <section class="app-shell" aria-label="FlowRat interactive application"><div class="app-shell-head"><strong>Interactive rat view</strong><span>WASM canvas · 8:5 native frame</span></div>
+  <section class="app-shell" aria-label="FlowRat interactive application"><div class="app-shell-head"><strong>Interactive rat view</strong><span class="state-chip"><i id="state-dot" class="state-dot"></i><span id="app-state">Idle</span></span><span>WASM canvas · 8:5 native frame</span></div>
   <div class="stage"><canvas id="canvas" width="800" height="600"></canvas>
     <div class="overlay" id="overlay"><strong>Ready to explore</strong>
       <span>Launch the simulation when you're ready. Keyboard shortcuts remain active after launch.</span>
@@ -129,7 +134,7 @@ pre#out:empty { display:none; } .err { color:#f7768e; }
     <select id="experiment"><option value="1">Open-field baseline</option><option value="2">Circular arena</option><option value="3">Two-room gated</option><option value="4">Four-room maze</option><option value="5">T-maze choice</option><option value="6">Linear track</option><option value="7">Obstacle navigation</option><option value="8">Plus maze</option><option value="9">Large colony field</option></select>
     <button id="run-experiment">Run experiment</button>
     <button id="download-trajectory" class="secondary" disabled>Download trajectory</button>
-    <span class="experiment-note">Choose an arena, then launch it. Status updates appear here.</span>
+    <span id="experiment-description" class="experiment-note">Choose an arena, then launch it. Status updates appear here.</span>
   </div></section>
   <div class="keys">Space run/pause · S step · R reset · Arrows/WASD move · P pause · F fit view</div>
   <pre id="out"></pre>
@@ -150,9 +155,10 @@ pre#out:empty { display:none; } .err { color:#f7768e; }
 <script>
 (function () {
   const $ = id => document.getElementById(id), overlay=$('overlay'), canvas=$('canvas');
-  const start=$('start'), run=$('run'), step=$('step'), reset=$('reset'), full=$('fullscreen'), status=$('status'), out=$('out'), experiment=$('experiment'), runExperiment=$('run-experiment');
+  const start=$('start'), run=$('run'), step=$('step'), reset=$('reset'), full=$('fullscreen'), status=$('status'), out=$('out'), experiment=$('experiment'), runExperiment=$('run-experiment'), appState=$('app-state'), stateDot=$('state-dot'), experimentDescription=$('experiment-description');
   let started=false, paused=false, module=null, listeners={};
   const params={};
+  function setStatus(text, kind) { status.textContent=text; appState.textContent=text; stateDot.className='state-dot '+(kind||''); }
   function emit(name,data) {(listeners[name]||[]).forEach(fn=>fn(data));}
   function log(text,err) { const line=document.createElement('span'); if(err) line.className='err'; line.textContent=text+'\n'; out.appendChild(line); out.scrollTop=out.scrollHeight; }
   function key(k, hold) { const down={key:k,bubbles:true}; document.dispatchEvent(new KeyboardEvent('keydown',down)); window.dispatchEvent(new KeyboardEvent('keydown',down)); setTimeout(function(){ const up={key:k,bubbles:true}; document.dispatchEvent(new KeyboardEvent('keyup',up)); window.dispatchEvent(new KeyboardEvent('keyup',up)); }, hold||120); }
@@ -165,22 +171,25 @@ pre#out:empty { display:none; } .err { color:#f7768e; }
     if (flow && flow.mouse) { flow.mouse.wheel += ev.deltaY > 0 ? 1 : -1; }
     ev.preventDefault(); ev.stopImmediatePropagation();
   }, {capture:true, passive:false});
-  function boot(after) { if(started){if(after)setTimeout(after,120);return;} started=true; overlay.classList.add('hidden'); start.disabled=true; status.textContent='loading module…'; window.focus();
-    createFlowModule({print:t=>log(t,false),printErr:t=>log(t,true),canvas}).then(mod=>{ module=mod; run.disabled=step.disabled=reset.disabled=false; $('download-trajectory').disabled=false; status.textContent='running'; emit('start',{module:mod}); try{mod.callMain([]);}catch(e){if(!(e&&e.name==='ExitStatus')){started=false;start.disabled=false;overlay.classList.remove('hidden');status.textContent='runtime error';log(''+e,true);}} if(after)setTimeout(after,250);}).catch(e=>{started=false;start.disabled=false;overlay.classList.remove('hidden');status.textContent='failed to load';log(''+e,true);}); }
-  function toggleRun(){if(!started)return; key(' '); paused=!paused; run.textContent=paused?'Resume':'Pause'; status.textContent=paused?'paused':'running'; emit(paused?'pause':'resume',{});}
+  function boot(after) { if(started){if(after)setTimeout(after,120);return;} started=true; overlay.classList.add('hidden'); start.disabled=true; setStatus('loading module…','warn'); window.focus();
+    createFlowModule({print:t=>log(t,false),printErr:t=>log(t,true),canvas}).then(mod=>{ module=mod; run.disabled=step.disabled=reset.disabled=false; $('download-trajectory').disabled=false; setStatus('running','live'); emit('start',{module:mod}); try{mod.callMain([]);}catch(e){if(!(e&&e.name==='ExitStatus')){started=false;start.disabled=false;overlay.classList.remove('hidden');setStatus('runtime error','bad');log(''+e,true);}} if(after)setTimeout(after,250);}).catch(e=>{started=false;start.disabled=false;overlay.classList.remove('hidden');setStatus('failed to load','bad');log(''+e,true);}); }
+  function toggleRun(){if(!started)return; key(' '); paused=!paused; run.textContent=paused?'Resume':'Pause'; setStatus(paused?'paused':'running',paused?'warn':'live'); emit(paused?'pause':'resume',{});}
   window.FlowRat={version:'1.0',start:boot,pause:()=>{if(!paused)toggleRun()},resume:()=>{if(paused)toggleRun()},step:()=>{if(started){key('s');emit('step',{})}},reset:()=>{if(started){key('r');emit('reset',{})}},stop:()=>window.flowGfxStop&&window.flowGfxStop(),
     registerParameter(def){if(!def||!def.name)throw Error('parameter needs a name');params[def.name]={...def,value:def.value};emit('parameter:registered',params[def.name]);return params[def.name]},
     setParameter(name,value){if(!params[name])throw Error('unknown parameter: '+name);params[name].value=value;emit('parameter',params[name]);window.dispatchEvent(new CustomEvent('flowrat:parameter',{detail:params[name]}));return params[name]},
     getParameters(){return JSON.parse(JSON.stringify(params))},on(name,fn){(listeners[name]||(listeners[name]=[])).push(fn);return()=>listeners[name]=listeners[name].filter(x=>x!==fn)}};
   overlay.onclick=boot; start.onclick=e=>{e.stopPropagation();boot()}; run.onclick=toggleRun; step.onclick=()=>FlowRat.step(); reset.onclick=()=>FlowRat.reset();
-  full.onclick=async()=>{const target=document.querySelector('.stage'); try { if(!document.fullscreenElement){await target.requestFullscreen?.();}else{await document.exitFullscreen?.();} } catch(e){status.textContent='fullscreen unavailable';log('fullscreen: '+e,true);}};
+  full.onclick=async()=>{const target=document.querySelector('.stage'); try { if(!document.fullscreenElement){await target.requestFullscreen?.();}else{await document.exitFullscreen?.();} } catch(e){setStatus('fullscreen unavailable','bad');log('fullscreen: '+e,true);}};
   document.addEventListener('fullscreenchange',()=>{full.textContent=document.fullscreenElement?'Exit rat view':'Rat view fullscreen';});
   const experimentNames=Object.fromEntries([...experiment.options].map(o=>[o.value,o.textContent]));
-  experiment.onchange=()=>{status.textContent='ready: '+experimentNames[experiment.value];};
-  function launchExperiment(){const preset=experiment.value; runExperiment.disabled=true; runExperiment.textContent='Loading experiment…'; status.textContent='loading: '+experimentNames[preset]; boot(()=>{key(preset,220); setTimeout(()=>key('o',220),420); setTimeout(()=>{runExperiment.disabled=false;runExperiment.textContent='Run experiment';status.textContent='running: '+experimentNames[preset];},900);});}
+  const experimentDescriptions={1:'Control condition: observe unconstrained exploration and occupancy.',2:'Rotational symmetry: test navigation against a circular boundary.',3:'Gated rooms: test memory when walls hide the next resource.',4:'Four-room maze: follow routes through multiple doorways.',5:'T-maze: compare behavior under asymmetric reward.',6:'Linear track: watch directional shuttling and remapping.',7:'Obstacle field: measure route structure around internal solids.',8:'Plus maze: observe shared routes, food, water, and hesitation.',9:'Large colony: watch rank, reproduction, juveniles, and distributed resources.'};
+  function describeExperiment(){experimentDescription.textContent=experimentDescriptions[experiment.value]||'Choose an arena, then launch it.'; if(!started)setStatus('ready: '+experimentNames[experiment.value],'');}
+  experiment.onchange=describeExperiment;
+  function launchExperiment(){const preset=experiment.value; runExperiment.disabled=true; runExperiment.textContent='Loading experiment…'; setStatus('loading: '+experimentNames[preset],'warn'); boot(()=>{key(preset,220); setTimeout(()=>key('o',220),420); setTimeout(()=>{runExperiment.disabled=false;runExperiment.textContent='Run experiment';setStatus('running: '+experimentNames[preset],'live');},900);});}
   runExperiment.onclick=launchExperiment;
   $('download-trajectory').onclick=()=>{try{const fs=module&&module.FS; if(!fs)throw Error('simulation filesystem is not ready'); const data=fs.readFile('/data/out/trajectory.csv',{encoding:'utf8'}); const blob=new Blob([data],{type:'text/csv'}); const link=document.createElement('a'); link.href=URL.createObjectURL(blob); link.download='flowrat-trajectory.csv'; link.click(); setTimeout(()=>URL.revokeObjectURL(link.href),1000);}catch(e){log('download: '+e,true);}};
-  window.flowGfxOnStart=(title,w,h)=>{status.textContent='running '+w+'×'+h}; window.flowGfxOnExit=frames=>{status.textContent='finished after '+frames+' frames';run.disabled=step.disabled=reset.disabled=true;emit('exit',{frames})};
+  window.flowGfxOnStart=(title,w,h)=>{setStatus('running '+w+'×'+h,'live')}; window.flowGfxOnExit=frames=>{setStatus('finished after '+frames+' frames','warn');run.disabled=step.disabled=reset.disabled=true;emit('exit',{frames})};
+  describeExperiment();
   if(location.search.includes('autostart=1'))setTimeout(boot,300);
 })();
 </script>

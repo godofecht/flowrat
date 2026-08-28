@@ -9,7 +9,7 @@ await openOrReuseTab(target, {wait:true, timeout:30});
 await gotoAndWait(target, {timeout:30, settle:1});
 const fail = (m) => { throw new Error(m); };
 const summary = await js(`(() => {
-  const ids=['canvas','run','step','reset','fullscreen','experiment','run-experiment','download-trajectory'];
+  const ids=['canvas','run','step','reset','fullscreen','experiment','run-experiment','download-trajectory','app-state','state-dot','experiment-description'];
   const missing=ids.filter(id=>!document.getElementById(id));
   const s=document.querySelector('.stage'), r=s&&s.getBoundingClientRect();
   const ratio=r ? r.width/r.height : 0;
@@ -20,6 +20,8 @@ const summary = await js(`(() => {
 if (summary.missing.length) fail('missing controls: '+summary.missing.join(','));
 if (summary.options !== 9) fail('expected 9 experiment presets, found '+summary.options);
 if (Math.abs(summary.ratio-1.6) > .03) fail('stage aspect ratio is '+summary.ratio);
+const initialDescription = await js(`document.querySelector('#experiment-description').textContent`);
+if (!initialDescription || initialDescription.length < 20) fail('experiment description is missing');
 await js(`document.querySelector('#run-experiment').click()`);
 await wait(4);
 let state = await js(`document.querySelector('#status').textContent`);

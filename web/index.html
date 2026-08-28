@@ -50,7 +50,7 @@ main { flex:1; display:flex; flex-direction:column; align-items:center; justify-
 .stage:fullscreen canvas { width:100vw; height:100vh; max-width:100vw; max-height:100vh; object-fit:contain; border:0; border-radius:0; }
 .app-shell { width:min(1180px,100%); padding:14px; background:linear-gradient(145deg,#111827e8,#0d111bd9);
   border:1px solid #33405a; border-radius:14px; box-shadow:0 24px 70px #0007; }
-.app-shell-head { width:min(960px,100%); margin:0 auto 10px; display:flex; align-items:center;
+.app-shell-head { width:min(960px,100%); margin:0 auto 10px; display:flex; align-items:center; flex-wrap:wrap;
   justify-content:space-between; gap:12px; color:var(--muted); font-size:11px; letter-spacing:.09em; text-transform:uppercase; }
 .app-shell-head strong { color:var(--text); font-size:12px; font-weight:600; letter-spacing:.12em; }
 .state-chip { display:inline-flex; align-items:center; gap:7px; color:var(--muted); text-transform:none; letter-spacing:0; }
@@ -60,7 +60,7 @@ main { flex:1; display:flex; flex-direction:column; align-items:center; justify-
 .state-dot.bad { background:#f7768e; box-shadow:0 0 0 3px #f7768e22; }
 .stage,.transport,.experiment-bar { margin-left:auto; margin-right:auto; }
 canvas { display:block; width:100%; height:100%; aspect-ratio:8/5; object-fit:contain;
-  background:#000; border:1px solid #293246; border-radius:8px; image-rendering:pixelated; }
+  background:#000; border:1px solid #293246; border-radius:8px; image-rendering:auto; }
 .overlay { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center;
   justify-content:center; gap:11px; background:linear-gradient(135deg,#0c101add,#121a29e8);
   border-radius:8px; line-height:1.5; transition:opacity .35s, transform .35s; }
@@ -73,6 +73,7 @@ button:hover { background:#a5c5ff; transform:translateY(-1px); }
 button.secondary { color:var(--text); background:#202a3e; }
 button.secondary:hover { background:#2d3a54; }
 button:disabled { color:#68738a; background:#202531; cursor:default; transform:none; }
+button:focus-visible, select:focus-visible, a:focus-visible { outline:2px solid var(--blue); outline-offset:3px; }
 .transport { position:sticky; bottom:12px; z-index:3; width:min(960px,100%); display:flex; align-items:center; gap:8px; flex-wrap:wrap;
   padding:10px 12px; background:#111622ed; border:1px solid var(--line); border-radius:10px; box-shadow:0 12px 32px #0008; }
 .transport .spacer { flex:1; }
@@ -82,6 +83,7 @@ button:disabled { color:#68738a; background:#202531; cursor:default; transform:n
   padding:10px 12px; background:#111622cc; border:1px solid var(--line); border-radius:8px; }
 .experiment-bar label { color:var(--muted); font-size:12px; letter-spacing:.04em; }
 .experiment-bar select { color:var(--text); background:#202a3e; border:1px solid #35435e; border-radius:5px; padding:7px 10px; font:inherit; }
+.experiment-bar select { min-width:0; flex:1 1 220px; }
 .experiment-note { color:var(--muted); font-size:12px; margin-left:auto; max-width:34ch; }
 footer { padding:12px; border-top:1px solid #202839; }
 pre#out { width:min(880px,100%); margin:0; max-height:22vh; overflow:auto; color:#9ece6a;
@@ -119,7 +121,7 @@ pre#out:empty { display:none; } .err { color:#f7768e; }
   <span class="meta"><a href="https://github.com/godofecht/flowrat/blob/main/flowrat.flow">source</a></span></header>
 <main>
   <section class="app-shell" aria-label="FlowRat interactive application"><div class="app-shell-head"><strong>Interactive rat view</strong><span class="state-chip"><i id="state-dot" class="state-dot"></i><span id="app-state">Idle</span></span><span>WASM canvas · 8:5 native frame</span></div>
-  <div class="stage"><canvas id="canvas" width="800" height="600"></canvas>
+  <div class="stage"><canvas id="canvas" width="1440" height="900"></canvas>
     <div class="overlay" id="overlay"><strong>Ready to explore</strong>
       <span>Launch the simulation when you're ready. Keyboard shortcuts remain active after launch.</span>
       <button id="start">Launch simulation</button></div></div>

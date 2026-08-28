@@ -316,6 +316,11 @@ slower version of the same thing.
 
 ## Reproducible experiments
 
+For browser UI regression checks, start the local WASM page and run
+`./tools/ui-smoke.sh`. It exercises launch, pause, resume, step, reset,
+fullscreen/layout invariants, scrolling-related controls, and all nine arena
+presets.
+
 The TOML experiment layer cues an entire protocol: seed, arena, timing,
 movement, behaviour, neural populations, recording, and analysis targets live
 in one file. Included protocols cover open-field exploration, T-maze choice,

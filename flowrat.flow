@@ -179,21 +179,21 @@ function main() -> i32 {
                 view_fit(&v, s.env.x0, s.env.y0, s.env.x1, s.env.y1)
             }
         }
-        if key_edge(g, 13) { ed.show_trails = !ed.show_trails }
-        if key_edge(g, 14) { ed.show_rays = !ed.show_rays }
-        if key_edge(g, 15) { ed.show_cells = !ed.show_cells }
-        if key_edge(g, 16) { ed.show_decode = !ed.show_decode }
-        if key_edge(g, 22) { ed.show_known = !ed.show_known }
-        if key_edge(g, 17) { s.can_enabled = !s.can_enabled }
-        if key_edge(g, 18) { s.can_anchor = !s.can_anchor }
-        if key_edge(g, 19) {
+        if key_edge(g, 14) { ed.show_trails = !ed.show_trails }
+        if key_edge(g, 15) { ed.show_rays = !ed.show_rays }
+        if key_edge(g, 16) { ed.show_cells = !ed.show_cells }
+        if key_edge(g, 17) { ed.show_decode = !ed.show_decode }
+        if key_edge(g, 23) { ed.show_known = !ed.show_known }
+        if key_edge(g, 18) { s.can_enabled = !s.can_enabled }
+        if key_edge(g, 19) { s.can_anchor = !s.can_anchor }
+        if key_edge(g, 20) {
             if rec.active { rec_stop(&rec) } else {
                 let ok: bool = rec_start(&rec, &s)
             }
         }
-        if key_edge(g, 20) and ui_scale > 1 { ui_scale = ui_scale - 1 }
-        if key_edge(g, 21) and ui_scale < 3 { ui_scale = ui_scale + 1 }
-        if key_edge(g, 22) { sim_set_circuit(&s, !s.circuit.enabled) }
+        if key_edge(g, 21) and ui_scale > 1 { ui_scale = ui_scale - 1 }
+        if key_edge(g, 22) and ui_scale < 3 { ui_scale = ui_scale + 1 }
+        if key_edge(g, 23) { sim_set_circuit(&s, !s.circuit.enabled) }
 
         # --- simulate ------------------------------------------------------
         if s.running {

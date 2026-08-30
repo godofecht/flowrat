@@ -9,7 +9,7 @@ await openOrReuseTab(target, {wait:true, timeout:30});
 await gotoAndWait(target, {timeout:30, settle:1});
 const fail = (m) => { throw new Error(m); };
 const summary = await js(`(() => {
-  const ids=['canvas','run','step','reset','fullscreen','experiment','run-experiment','download-trajectory','app-state','state-dot','experiment-description'];
+  const ids=['canvas','canvas3d','run','step','reset','fullscreen','experiment','run-experiment','download-trajectory','app-state','state-dot','experiment-description','setup3d','setup3d-note'];
   const missing=ids.filter(id=>!document.getElementById(id));
   const s=document.querySelector('.stage'), r=s&&s.getBoundingClientRect();
   const ratio=r ? r.width/r.height : 0;
@@ -19,6 +19,11 @@ const summary = await js(`(() => {
 })()`);
 if (summary.missing.length) fail('missing controls: '+summary.missing.join(','));
 if (summary.options !== 9) fail('expected 9 experiment presets, found '+summary.options);
+const setups = await js(`document.querySelectorAll('#setup3d option').length`);
+if (setups !== 4) fail('expected 4 3D setups, found '+setups);
+await js(`document.querySelector('#setup3d').value='maze'; document.querySelector('#setup3d').dispatchEvent(new Event('change',{bubbles:true}))`);
+const setupNote = await js(`document.querySelector('#setup3d-note').textContent`);
+if (!String(setupNote).includes('maze')) fail('3D setup did not update description: '+setupNote);
 if (Math.abs(summary.ratio-1.6) > .03) fail('stage aspect ratio is '+summary.ratio);
 const initialDescription = await js(`document.querySelector('#experiment-description').textContent`);
 if (!initialDescription || initialDescription.length < 20) fail('experiment description is missing');

@@ -69,6 +69,10 @@ main { flex:1; display:flex; flex-direction:column; align-items:center; justify-
 #canvas3d { display:block; width:100%; height:100%; background:#07101b; cursor:grab; }
 #canvas3d:active { cursor:grabbing; }
 .view-caption { position:absolute; left:12px; bottom:10px; color:#b9c5d8; font:11px ui-monospace,monospace; padding:5px 8px; background:#08101bcc; border:1px solid #33435d; border-radius:5px; }
+.setup3d { width:min(960px,100%); margin:0 auto 10px; display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:9px 12px; background:#111a28; border:1px solid #293a53; border-radius:8px; }
+.setup3d label { color:var(--muted); font:11px ui-monospace,monospace; letter-spacing:.08em; text-transform:uppercase; }
+.setup3d select { min-width:190px; flex:0 1 240px; color:var(--text); background:#202a3e; border:1px solid #35435e; border-radius:5px; padding:7px 10px; font:inherit; }
+.setup3d-note { margin-left:auto; color:var(--muted); font-size:12px; max-width:38ch; }
 canvas { display:block; width:100%; height:100%; aspect-ratio:8/5; object-fit:contain;
   background:#000; border:1px solid #293246; border-radius:8px; image-rendering:auto; }
 .overlay { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center;
@@ -136,7 +140,7 @@ pre#out:empty { display:none; } .err { color:#f7768e; }
     <div class="overlay" id="overlay"><strong>Ready to explore</strong>
       <span>Launch the simulation when you're ready. Keyboard shortcuts remain active after launch.</span>
       <button id="start">Launch simulation</button></div></div></div>
-  <div id="view-3d" class="view-panel"><div class="stage3d"><canvas id="canvas3d" width="1440" height="900" aria-label="3D navigation preview"></canvas><span class="view-caption">drag orbit · wheel zoom · WASD move</span></div></div>
+  <div id="view-3d" class="view-panel"><div class="setup3d"><label for="setup3d">3D setup</label><select id="setup3d"><option value="atrium">Open atrium</option><option value="maze">Stacked maze</option><option value="bridge">Bridge network</option><option value="tower">Vertical tower</option></select><span id="setup3d-note" class="setup3d-note">Baseline arena with distributed landmarks.</span></div><div class="stage3d"><canvas id="canvas3d" width="1440" height="900" aria-label="3D navigation preview"></canvas><span class="view-caption">drag orbit · wheel zoom · WASD move</span></div></div>
   <div class="transport" aria-label="simulation transport">
     <button id="run" class="secondary" disabled>Pause</button>
     <button id="step" class="secondary" disabled>Step</button>
@@ -172,22 +176,26 @@ pre#out:empty { display:none; } .err { color:#f7768e; }
   const start=$('start'), run=$('run'), step=$('step'), reset=$('reset'), full=$('fullscreen'), status=$('status'), out=$('out'), experiment=$('experiment'), runExperiment=$('run-experiment'), appState=$('app-state'), stateDot=$('state-dot'), experimentDescription=$('experiment-description');
   let started=false, paused=false, module=null, listeners={};
   const params={};
-  let view3d=false, orbit={yaw:.65,pitch:.62,distance:18}, drag=null, agent={x:-3,z:2,heading:.3}, last3d=performance.now();
+  const setups={atrium:{note:'Baseline arena with distributed landmarks.',walls:[],platforms:[],landmarks:[[-4,-2,0],[3,-4,0],[5,3,0],[-2,5,0]]},maze:{note:'Two-level maze with occluding walls and a raised goal.',walls:[[-4,-4,5,.35,1.5],[-1,-1,.35,6,1.2],[3,2,5,.35,1.8],[5,-3,.35,5,1]],platforms:[[2,2,3,2,1.8]],landmarks:[[-5,-5,0],[4,4,1.8]]},bridge:{note:'Disconnected platforms linked by a narrow elevated bridge.',walls:[[-6,0,4,.35,.9],[4,0,4,.35,.9]],platforms:[[-6,0,4,4,1.2],[6,0,4,4,1.2]],bridges:[[-2,0,4,.55,1.2]],landmarks:[[-6,0,1.2],[6,0,1.2]]},tower:{note:'Vertical foraging tower with three reachable elevations.',walls:[[0,-3,5,.35,1.1],[0,3,5,.35,2.3]],platforms:[[0,0,5,2,1.1],[0,6,4,3,2.3]],bridges:[[0,3,1,.7,1.1]],landmarks:[[-5,-5,0],[0,0,1.1],[0,6,2.3]]}};
+  let setupKey='atrium', view3d=false, orbit={yaw:.65,pitch:.62,distance:18}, drag=null, agent={x:-3,z:2,heading:.3,y:0}, last3d=performance.now();
   function draw3d(now){
-    const ctx=canvas3d.getContext('2d'), dpr=window.devicePixelRatio||1, w=canvas3d.clientWidth, h=canvas3d.clientHeight;
+    const ctx=canvas3d.getContext('2d'), dpr=window.devicePixelRatio||1, w=canvas3d.clientWidth, h=canvas3d.clientHeight, setup=setups[setupKey];
     if(canvas3d.width!==Math.round(w*dpr)||canvas3d.height!==Math.round(h*dpr)){canvas3d.width=Math.round(w*dpr);canvas3d.height=Math.round(h*dpr);}
-    ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,w,h);
-    const cx=w/2, cy=h*.55, scale=Math.min(w,h)*.055*18/orbit.distance, sy=Math.sin(orbit.yaw), cyaw=Math.cos(orbit.yaw), sp=Math.sin(orbit.pitch), cp=Math.cos(orbit.pitch);
-    function p(x,y,z){let X=x*cyaw-z*sy, Z=x*sy+z*cyaw, Y=y*cp-Z*sp; return [cx+X*scale*1.45,cy-Y*scale*.95-Z*.08*scale];}
+    ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);
+    const cx=w/2,cy=h*.55,scale=Math.min(w,h)*.055*18/orbit.distance,sy=Math.sin(orbit.yaw),cyaw=Math.cos(orbit.yaw),sp=Math.sin(orbit.pitch),cp=Math.cos(orbit.pitch);
+    function p(x,y,z){let X=x*cyaw-z*sy,Z=x*sy+z*cyaw,Y=y*cp-Z*sp;return[cx+X*scale*1.45,cy-Y*scale*.95-Z*.08*scale];}
     function line(a,b,color,width=1){ctx.beginPath();ctx.moveTo(...p(...a));ctx.lineTo(...p(...b));ctx.strokeStyle=color;ctx.lineWidth=width;ctx.stroke();}
-    const horizon=p(0,0,0)[1]; ctx.fillStyle='#091522';ctx.fillRect(0,0,w,h); const grad=ctx.createLinearGradient(0,0,0,h);grad.addColorStop(0,'#142b43');grad.addColorStop(1,'#07101a');ctx.fillStyle=grad;ctx.fillRect(0,0,w,h);
+    function box(x,z,ww,dd,hh,color){const a=p(x-ww/2,0,z-dd/2),b=p(x+ww/2,0,z-dd/2),c=p(x+ww/2,0,z+dd/2),d=p(x-ww/2,0,z+dd/2),e=p(x-ww/2,hh,z-dd/2),f=p(x+ww/2,hh,z-dd/2),g=p(x+ww/2,hh,z+dd/2),j=p(x-ww/2,hh,z+dd/2);ctx.fillStyle=color+'99';ctx.strokeStyle=color;ctx.lineWidth=1;[[a,b,c,d],[a,b,f,e],[b,c,g,f],[c,d,j,g],[d,a,e,j]].forEach(face=>{ctx.beginPath();ctx.moveTo(...face[0]);face.slice(1).forEach(v=>ctx.lineTo(...v));ctx.closePath();ctx.fill();ctx.stroke();});}
+    const grad=ctx.createLinearGradient(0,0,0,h);grad.addColorStop(0,'#142b43');grad.addColorStop(1,'#07101a');ctx.fillStyle=grad;ctx.fillRect(0,0,w,h);
     for(let i=-10;i<=10;i++){line([i,0,-10],[i,0,10],i%5===0?'#315575':'#1b3a55',i%5===0?1.2:.7);line([-10,0,i],[10,0,i],i%5===0?'#315575':'#1b3a55',i%5===0?1.2:.7);}
     [[-7,-6,7,-5],[7,-5,7,6],[-7,6,7,6],[-7,-6,-7,6]].forEach(a=>line([a[0],0,a[1]],[a[2],0,a[3]],'#7f9bb3',2));
-    [[-4,-2],[3,-4],[5,3],[-2,5]].forEach(([x,z],i)=>{const q=p(x,.1,z);ctx.beginPath();ctx.arc(q[0],q[1],7,0,Math.PI*2);ctx.fillStyle=i===0?'#f0a855':'#83adff';ctx.fill();line([x,0,z],[x,.6,z],i===0?'#f0a855':'#83adff',1);});
-    const q=p(agent.x,.28,agent.z), nose=p(agent.x+Math.cos(agent.heading)*.55,.28,agent.z+Math.sin(agent.heading)*.55);ctx.beginPath();ctx.arc(q[0],q[1],10,0,Math.PI*2);ctx.fillStyle='#f3f5f8';ctx.fill();line([agent.x,.28,agent.z],[agent.x+Math.cos(agent.heading)*.65,.28,agent.z+Math.sin(agent.heading)*.65],'#f0a855',3);ctx.fillStyle='#b9c5d8';ctx.font='11px ui-monospace,monospace';ctx.fillText('rat / egocentric agent',q[0]+14,q[1]-9);
+    setup.platforms.forEach(v=>box(v[0],v[1],v[2],v[3],v[4],'#496d8e'));setup.walls.forEach(v=>box(v[0],v[1],v[2],v[3],v[4],'#a86e5b'));setup.bridges?.forEach(v=>box(v[0],v[1],v[2],v[3],v[4],'#c69b46'));
+    setup.landmarks.forEach(([x,z,y],i)=>{const q=p(x,y+.12,z);ctx.beginPath();ctx.arc(q[0],q[1],7,0,Math.PI*2);ctx.fillStyle=i===0?'#f0a855':'#83adff';ctx.fill();line([x,y,z],[x,y+.65,z],i===0?'#f0a855':'#83adff',1);});
+    const q=p(agent.x,agent.y+.28,agent.z);ctx.beginPath();ctx.arc(q[0],q[1],10,0,Math.PI*2);ctx.fillStyle='#f3f5f8';ctx.fill();line([agent.x,agent.y+.28,agent.z],[agent.x+Math.cos(agent.heading)*.65,agent.y+.28,agent.z+Math.sin(agent.heading)*.65],'#f0a855',3);ctx.fillStyle='#b9c5d8';ctx.font='11px ui-monospace,monospace';ctx.fillText('rat / egocentric agent',q[0]+14,q[1]-9);
     if(view3d&&!document.hidden){const dt=Math.min(.04,(now-last3d)/1000);last3d=now;agent.heading+=Math.sin(now*.0007)*dt*.18;agent.x+=Math.cos(agent.heading)*dt*.55;agent.z+=Math.sin(agent.heading)*dt*.55;if(Math.abs(agent.x)>6.2||Math.abs(agent.z)>5.2)agent.heading+=Math.PI*.82;requestAnimationFrame(draw3d);}
   }
   function setView(is3d){view3d=is3d;$('view-2d').classList.toggle('active',!is3d);$('view-3d').classList.toggle('active',is3d);$('tab-2d').classList.toggle('active',!is3d);$('tab-3d').classList.toggle('active',is3d);$('tab-2d').setAttribute('aria-selected',!is3d);$('tab-3d').setAttribute('aria-selected',is3d);if(is3d){last3d=performance.now();requestAnimationFrame(draw3d);setStatus('3D preview','live');}}
+  $('setup3d').onchange=()=>{setupKey=$('setup3d').value;agent={x:-3,z:2,heading:.3,y:0};$('setup3d-note').textContent=setups[setupKey].note;requestAnimationFrame(draw3d);};
   $('tab-2d').onclick=()=>setView(false); $('tab-3d').onclick=()=>setView(true);
   canvas3d.addEventListener('pointerdown',e=>{drag={x:e.clientX,y:e.clientY};canvas3d.setPointerCapture(e.pointerId);});
   canvas3d.addEventListener('pointermove',e=>{if(!drag)return;orbit.yaw+=(e.clientX-drag.x)*.01;orbit.pitch=Math.max(.25,Math.min(1.25,orbit.pitch+(e.clientY-drag.y)*.008));drag={x:e.clientX,y:e.clientY};});

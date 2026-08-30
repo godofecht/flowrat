@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#090b12">
-<title>flowrat - Flow on WebAssembly</title>
+<title>flowrat2d · Flow on WebAssembly</title>
 <style>
 :root { color-scheme: dark; --bg:#080b11; --panel:#111722; --line:#273246;
   --text:#f3f5f8; --muted:#8d98ab; --accent:#f0a855; --blue:#83adff; --mint:#9ece6a; }
@@ -59,6 +59,16 @@ main { flex:1; display:flex; flex-direction:column; align-items:center; justify-
 .state-dot.warn { background:#e0af68; box-shadow:0 0 0 3px #e0af6822; }
 .state-dot.bad { background:#f7768e; box-shadow:0 0 0 3px #f7768e22; }
 .stage,.transport,.experiment-bar { margin-left:auto; margin-right:auto; }
+.view-tabs { width:min(960px,100%); margin:0 auto 10px; display:flex; gap:4px; padding:4px; background:#0a0e16; border:1px solid #29364d; border-radius:8px; }
+.view-tab { flex:1; padding:7px 10px; color:var(--muted); background:transparent; border:0; border-radius:5px; font:600 11px ui-monospace,monospace; letter-spacing:.08em; text-transform:uppercase; }
+.view-tab:hover { color:var(--text); background:#182236; transform:none; }
+.view-tab.active { color:#0b0d13; background:var(--blue); }
+.view-panel { display:none; }
+.view-panel.active { display:block; }
+.stage3d { position:relative; line-height:0; width:min(100%,1100px,calc(max(320px,(100dvh - 230px)*8/5))); aspect-ratio:8/5; margin:0 auto; background:#07101b; border:1px solid #293246; border-radius:8px; overflow:hidden; }
+#canvas3d { display:block; width:100%; height:100%; background:#07101b; cursor:grab; }
+#canvas3d:active { cursor:grabbing; }
+.view-caption { position:absolute; left:12px; bottom:10px; color:#b9c5d8; font:11px ui-monospace,monospace; padding:5px 8px; background:#08101bcc; border:1px solid #33435d; border-radius:5px; }
 canvas { display:block; width:100%; height:100%; aspect-ratio:8/5; object-fit:contain;
   background:#000; border:1px solid #293246; border-radius:8px; image-rendering:auto; }
 .overlay { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center;
@@ -117,14 +127,16 @@ pre#out:empty { display:none; } .err { color:#f7768e; }
 </head>
 <body>
 <div class="intro" aria-label="flowrat intro"><div class="intro-word"><span class="letter">f</span><span class="letter">l</span><span class="letter">o</span><span class="letter">w</span><span class="letter">r</span><span class="letter">a</span><span class="letter">t</span></div></div>
-<header><h1><span class="brand-mark">flowrat</span></h1><span class="meta">Flow → C → WebAssembly · neural navigation lab</span><span class="build-tag">live build · ui-shell</span>
+<header><h1><span class="brand-mark">flowrat2d</span></h1><span class="meta">Flow → C → WebAssembly · neural navigation lab</span><span class="build-tag">2d baseline · 3d preview</span>
   <span class="meta"><a href="https://github.com/godofecht/flowrat/blob/main/flowrat.flow">source</a></span></header>
 <main>
-  <section id="app" class="app-shell" aria-label="FlowRat interactive application"><div class="app-shell-head"><strong>Interactive rat view</strong><span class="state-chip"><i id="state-dot" class="state-dot"></i><span id="app-state">Idle</span></span><span>WASM canvas · 8:5 native frame</span></div>
-  <div class="stage"><canvas id="canvas" width="1440" height="900"></canvas>
+  <section id="app" class="app-shell" aria-label="flowrat2d interactive application"><div class="app-shell-head"><strong>Navigation lab</strong><span class="state-chip"><i id="state-dot" class="state-dot"></i><span id="app-state">Idle</span></span><span>flowrat2d · 8:5 native frame</span></div>
+  <div class="view-tabs" role="tablist" aria-label="navigation view"><button class="view-tab active" id="tab-2d" role="tab" aria-selected="true">2D simulator</button><button class="view-tab" id="tab-3d" role="tab" aria-selected="false">3D navigation preview</button></div>
+  <div id="view-2d" class="view-panel active"><div class="stage"><canvas id="canvas" width="1440" height="900"></canvas>
     <div class="overlay" id="overlay"><strong>Ready to explore</strong>
       <span>Launch the simulation when you're ready. Keyboard shortcuts remain active after launch.</span>
-      <button id="start">Launch simulation</button></div></div>
+      <button id="start">Launch simulation</button></div></div></div>
+  <div id="view-3d" class="view-panel"><div class="stage3d"><canvas id="canvas3d" width="1440" height="900" aria-label="3D navigation preview"></canvas><span class="view-caption">drag orbit · wheel zoom · WASD move</span></div></div>
   <div class="transport" aria-label="simulation transport">
     <button id="run" class="secondary" disabled>Pause</button>
     <button id="step" class="secondary" disabled>Step</button>
@@ -152,14 +164,35 @@ pre#out:empty { display:none; } .err { color:#f7768e; }
     </div>
   </section>
 </main>
-<footer>FlowRat · crafted with Codex · <span id="credit">extensible simulation canvas</span></footer>
+<footer>flowrat2d · crafted with Codex · <span id="credit">flowrat3d preview layer</span></footer>
 <script src="flowrat.js?v=ui-shell-20260828"></script>
 <script>
 (function () {
-  const $ = id => document.getElementById(id), overlay=$('overlay'), canvas=$('canvas');
+  const $ = id => document.getElementById(id), overlay=$('overlay'), canvas=$('canvas'), canvas3d=$('canvas3d');
   const start=$('start'), run=$('run'), step=$('step'), reset=$('reset'), full=$('fullscreen'), status=$('status'), out=$('out'), experiment=$('experiment'), runExperiment=$('run-experiment'), appState=$('app-state'), stateDot=$('state-dot'), experimentDescription=$('experiment-description');
   let started=false, paused=false, module=null, listeners={};
   const params={};
+  let view3d=false, orbit={yaw:.65,pitch:.62,distance:18}, drag=null, agent={x:-3,z:2,heading:.3}, last3d=performance.now();
+  function draw3d(now){
+    const ctx=canvas3d.getContext('2d'), dpr=window.devicePixelRatio||1, w=canvas3d.clientWidth, h=canvas3d.clientHeight;
+    if(canvas3d.width!==Math.round(w*dpr)||canvas3d.height!==Math.round(h*dpr)){canvas3d.width=Math.round(w*dpr);canvas3d.height=Math.round(h*dpr);}
+    ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,w,h);
+    const cx=w/2, cy=h*.55, scale=Math.min(w,h)*.055*18/orbit.distance, sy=Math.sin(orbit.yaw), cyaw=Math.cos(orbit.yaw), sp=Math.sin(orbit.pitch), cp=Math.cos(orbit.pitch);
+    function p(x,y,z){let X=x*cyaw-z*sy, Z=x*sy+z*cyaw, Y=y*cp-Z*sp; return [cx+X*scale*1.45,cy-Y*scale*.95-Z*.08*scale];}
+    function line(a,b,color,width=1){ctx.beginPath();ctx.moveTo(...p(...a));ctx.lineTo(...p(...b));ctx.strokeStyle=color;ctx.lineWidth=width;ctx.stroke();}
+    const horizon=p(0,0,0)[1]; ctx.fillStyle='#091522';ctx.fillRect(0,0,w,h); const grad=ctx.createLinearGradient(0,0,0,h);grad.addColorStop(0,'#142b43');grad.addColorStop(1,'#07101a');ctx.fillStyle=grad;ctx.fillRect(0,0,w,h);
+    for(let i=-10;i<=10;i++){line([i,0,-10],[i,0,10],i%5===0?'#315575':'#1b3a55',i%5===0?1.2:.7);line([-10,0,i],[10,0,i],i%5===0?'#315575':'#1b3a55',i%5===0?1.2:.7);}
+    [[-7,-6,7,-5],[7,-5,7,6],[-7,6,7,6],[-7,-6,-7,6]].forEach(a=>line([a[0],0,a[1]],[a[2],0,a[3]],'#7f9bb3',2));
+    [[-4,-2],[3,-4],[5,3],[-2,5]].forEach(([x,z],i)=>{const q=p(x,.1,z);ctx.beginPath();ctx.arc(q[0],q[1],7,0,Math.PI*2);ctx.fillStyle=i===0?'#f0a855':'#83adff';ctx.fill();line([x,0,z],[x,.6,z],i===0?'#f0a855':'#83adff',1);});
+    const q=p(agent.x,.28,agent.z), nose=p(agent.x+Math.cos(agent.heading)*.55,.28,agent.z+Math.sin(agent.heading)*.55);ctx.beginPath();ctx.arc(q[0],q[1],10,0,Math.PI*2);ctx.fillStyle='#f3f5f8';ctx.fill();line([agent.x,.28,agent.z],[agent.x+Math.cos(agent.heading)*.65,.28,agent.z+Math.sin(agent.heading)*.65],'#f0a855',3);ctx.fillStyle='#b9c5d8';ctx.font='11px ui-monospace,monospace';ctx.fillText('rat / egocentric agent',q[0]+14,q[1]-9);
+    if(view3d&&!document.hidden){const dt=Math.min(.04,(now-last3d)/1000);last3d=now;agent.heading+=Math.sin(now*.0007)*dt*.18;agent.x+=Math.cos(agent.heading)*dt*.55;agent.z+=Math.sin(agent.heading)*dt*.55;if(Math.abs(agent.x)>6.2||Math.abs(agent.z)>5.2)agent.heading+=Math.PI*.82;requestAnimationFrame(draw3d);}
+  }
+  function setView(is3d){view3d=is3d;$('view-2d').classList.toggle('active',!is3d);$('view-3d').classList.toggle('active',is3d);$('tab-2d').classList.toggle('active',!is3d);$('tab-3d').classList.toggle('active',is3d);$('tab-2d').setAttribute('aria-selected',!is3d);$('tab-3d').setAttribute('aria-selected',is3d);if(is3d){last3d=performance.now();requestAnimationFrame(draw3d);setStatus('3D preview','live');}}
+  $('tab-2d').onclick=()=>setView(false); $('tab-3d').onclick=()=>setView(true);
+  canvas3d.addEventListener('pointerdown',e=>{drag={x:e.clientX,y:e.clientY};canvas3d.setPointerCapture(e.pointerId);});
+  canvas3d.addEventListener('pointermove',e=>{if(!drag)return;orbit.yaw+=(e.clientX-drag.x)*.01;orbit.pitch=Math.max(.25,Math.min(1.25,orbit.pitch+(e.clientY-drag.y)*.008));drag={x:e.clientX,y:e.clientY};});
+  canvas3d.addEventListener('pointerup',()=>drag=null); canvas3d.addEventListener('wheel',e=>{e.preventDefault();orbit.distance=Math.max(8,Math.min(28,orbit.distance+e.deltaY*.01));},{passive:false});
+  requestAnimationFrame(draw3d);
   function setStatus(text, kind) { status.textContent=text; appState.textContent=text; stateDot.className='state-dot '+(kind||''); }
   function emit(name,data) {(listeners[name]||[]).forEach(fn=>fn(data));}
   function log(text,err) { const line=document.createElement('span'); if(err) line.className='err'; line.textContent=text+'\n'; out.appendChild(line); out.scrollTop=out.scrollHeight; }

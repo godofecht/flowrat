@@ -28,6 +28,38 @@ if ! command -v clang >/dev/null 2>&1; then
     exit 1
 fi
 
+LLVM_BIN="${LLVM_PATH:-}"
+
+if [ -z "$LLVM_BIN" ] && command -v mlir-opt >/dev/null 2>&1; then
+    LLVM_BIN="$(dirname "$(command -v mlir-opt)")"
+fi
+
+if [ -z "$LLVM_BIN" ] && command -v brew >/dev/null 2>&1; then
+    llvm_prefix="$(brew --prefix llvm 2>/dev/null || true)"
+    if [ -n "$llvm_prefix" ]; then
+        LLVM_BIN="$llvm_prefix/bin"
+    fi
+fi
+
+if [ -z "$LLVM_BIN" ]; then
+    for candidate in /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin; do
+        if [ -x "$candidate/mlir-opt" ]; then
+            LLVM_BIN="$candidate"
+            break
+        fi
+    done
+fi
+
+if [ -z "$LLVM_BIN" ] ||
+   [ ! -x "$LLVM_BIN/mlir-opt" ] ||
+   [ ! -x "$LLVM_BIN/mlir-translate" ]; then
+    echo "flowrat: MLIR tools not found; install LLVM or set LLVM_PATH" >&2
+    exit 1
+fi
+
+export LLVM_PATH="$LLVM_BIN"
+export PATH="$LLVM_BIN:$PATH"
+
 python3 -m flow.transpiler \
     "$RATVILLE_ROOT/flowrat.flow" \
     --mlir --llvm --lenient \

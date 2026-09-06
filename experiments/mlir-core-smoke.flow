@@ -1,0 +1,88 @@
+# FlowRat MLIR core smoke.
+#
+# Exercises the language/runtime envelope used by FlowRat's simulation hot path:
+# pointer-backed structure-of-arrays, f64 arithmetic, mutation, and parallel for.
+# The MLIR backend currently serializes parallel-for while preserving semantics.
+
+extern {
+    function printf(fmt: string, ...) -> i32
+}
+
+const RATS: i32 = 8
+const STEPS: i32 = 1000
+
+struct RatBatch {
+    x: ptr<f64>,
+    y: ptr<f64>,
+    vx: ptr<f64>,
+    vy: ptr<f64>,
+    n: i32
+}
+
+function step(batch: ptr<RatBatch>) -> void {
+    parallel for i in 0 to batch.n {
+        batch.x[i] = batch.x[i] + batch.vx[i]
+        batch.y[i] = batch.y[i] + batch.vy[i]
+    }
+}
+
+function checksum(batch: ptr<RatBatch>) -> f64 {
+    let mut total: f64 = 0.0
+
+    for i in 0 to batch.n {
+        total = total + 3.0 * batch.x[i] + 5.0 * batch.y[i]
+    }
+
+    return total
+}
+
+function main() -> i32 {
+    let mut xs: array<f64, 8> = [
+        0.0, 0.25, 0.5, 0.75,
+        1.0, 1.25, 1.5, 1.75
+    ]
+
+    let mut ys: array<f64, 8> = [
+        1.0, 1.125, 1.25, 1.375,
+        1.5, 1.625, 1.75, 1.875
+    ]
+
+    let mut vxs: array<f64, 8> = [
+        0.001, 0.002, 0.003, 0.004,
+        0.005, 0.006, 0.007, 0.008
+    ]
+
+    let mut vys: array<f64, 8> = [
+        -0.0005, -0.001, -0.0015, -0.002,
+        -0.0025, -0.003, -0.0035, -0.004
+    ]
+
+    let mut batch: RatBatch = RatBatch {
+        x: xs,
+        y: ys,
+        vx: vxs,
+        vy: vys,
+        n: RATS
+    }
+
+    for iteration in 0 to STEPS {
+        step(&batch)
+    }
+
+    let got: f64 = checksum(&batch)
+    let expected: f64 = 96.5
+    let mut error: f64 = got - expected
+
+    if error < 0.0 {
+        error = -error
+    }
+
+    printf("flowrat_mlir_core_checksum=%.12f\n", got)
+
+    if error > 0.000000001 {
+        return 1
+    }
+
+    println("flowrat_mlir_core_smoke=PASS")
+    return 0
+}

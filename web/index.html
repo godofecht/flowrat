@@ -140,7 +140,7 @@ pre#out:empty { display:none; } .err { color:#f7768e; }
     <div class="overlay" id="overlay"><strong>Ready to explore</strong>
       <span>Launch the simulation when you're ready. Keyboard shortcuts remain active after launch.</span>
       <button id="start">Launch simulation</button></div></div></div>
-  <div id="view-3d" class="view-panel"><div class="setup3d"><label for="setup3d">3D setup</label><select id="setup3d"><option value="atrium">Open atrium</option><option value="maze">Stacked maze</option><option value="bridge">Bridge network</option><option value="tower">Vertical tower</option></select><span id="setup3d-note" class="setup3d-note">Baseline arena with distributed landmarks.</span></div><div class="stage3d"><canvas id="canvas3d" width="1440" height="900" aria-label="3D navigation preview"></canvas><span class="view-caption">drag orbit · wheel zoom · WASD move</span></div></div>
+  <div id="view-3d" class="view-panel"><div class="setup3d"><label for="setup3d">3D setup</label><select id="setup3d"><option value="atrium">Open atrium</option><option value="maze">Stacked maze</option><option value="bridge">Bridge network</option><option value="tower">Vertical tower</option></select><span id="setup3d-note" class="setup3d-note">Baseline arena with distributed landmarks.</span></div><div class="stage3d"><canvas id="canvas3d" width="1440" height="900" aria-label="3D navigation preview"></canvas><span class="view-caption">drag orbit · wheel zoom</span></div></div>
   <div class="transport" aria-label="simulation transport">
     <button id="run" class="secondary" disabled>Pause</button>
     <button id="step" class="secondary" disabled>Step</button>
@@ -154,7 +154,7 @@ pre#out:empty { display:none; } .err { color:#f7768e; }
     <button id="download-trajectory" class="secondary" disabled>Download trajectory</button>
     <span id="experiment-description" class="experiment-note">Choose an arena, then launch it. Status updates appear here.</span>
   </div></section>
-  <div class="keys">Space run/pause · S step · R reset · Arrows/WASD move · P pause · F fit view</div>
+  <div class="keys">Space run/pause · S step · R reset · 1-9 arena · Tab tool · F fit view · T trails · Y rays · U place fields · I decoded position · K what the rat knows · C networks · P anchor networks · O record · - and = interface size</div>
   <pre id="out"></pre>
   <section id="wiki" class="wiki" aria-label="FlowRat wiki">
     <nav class="wiki-nav"><div class="wiki-kicker">FlowRat / wiki</div>

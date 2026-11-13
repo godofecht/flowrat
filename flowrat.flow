@@ -70,9 +70,9 @@ import "src/io/config.flow"
 # Keys tracked for edge detection. A key that fires on the level rather than
 # the edge toggles many times while it is held, which is unusable for
 # anything that flips a state.
-const NKEYS: i32 = 24
+const NKEYS: i32 = 25
 
-let mut key_prev: array<i32, 24> = [0]
+let mut key_prev: array<i32, 25> = [0]
 
 function key_code(slot: i32) -> i32 {
     if slot == 0 { return KEY_SPACE }
@@ -193,7 +193,7 @@ function main() -> i32 {
         }
         if key_edge(g, 21) and ui_scale > 1 { ui_scale = ui_scale - 1 }
         if key_edge(g, 22) and ui_scale < 3 { ui_scale = ui_scale + 1 }
-        if key_edge(g, 23) { sim_set_circuit(&s, !s.circuit.enabled) }
+        if key_edge(g, 24) { sim_set_circuit(&s, !s.circuit.enabled) }
 
         # --- simulate ------------------------------------------------------
         if s.running {

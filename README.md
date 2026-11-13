@@ -53,6 +53,7 @@ The **3D navigation preview** tab is a separate sketch. Drag to orbit the camera
 | `u` | Place fields on or off |
 | `i` | Decoded position on or off |
 | `k` | What the selected rat knows of the room |
+| `n` | Input-driven place cells (the circuit) on or off. Desktop only for now: the live demo was built before this key worked |
 | `c` | Recurrent networks on or off |
 | `p` | Anchor the networks to the rat's true position |
 | `o` | Start or stop recording |
@@ -88,6 +89,8 @@ These work with any tool:
 - [Git](https://git-scm.com/downloads).
 - A source checkout of [Flow](https://github.com/flooooooooooow/flow).
 - Optional: [Homebrew](https://brew.sh/)'s `libomp`, so the simulation can use every processor core.
+
+The current version of Flow cannot build FlowRat, so these steps fail at step 4. See "Project status".
 
 Steps:
 
@@ -477,7 +480,8 @@ The author reports that everything described above is implemented and runs, and 
 
 Known problems in the code:
 
-- The `n` key, which the old README listed as the switch for input-driven place cells, is never read by `flowrat.flow`. The `k` key is meant to switch the circuit as well as the "what the rat knows" overlay, but only the overlay changes. Use the toggle in the connectome tab instead.
+- The current Flow cannot build FlowRat. Tested on 2026-11-13 with Flow's `main` branch: `tools/env.sh` sets `FLOW_HOST=python`, and Flow stops with "FLOW_HOST=python is retired". With that variable unset, Flow rejects `to` as a variable name, which `src/analysis/session.flow`, `src/ui/view_analysis.flow` and `src/env/geometry.flow` use. Renaming those gets further, but the C that Flow generates then fails to compile (`unknown type name 'Editor'`). The Flow version this was built with is not recorded.
+- The `n` key now switches the circuit in the source. The live demo was built before that fix and could not be rebuilt (see above), so in the browser `n` does nothing. Use the toggle in the connectome tab there.
 - The screenshot in `docs/flowrat.png` shows an older layout with eight arena buttons. The current version has nine arenas and a tabbed bottom row.
 
 ### Limitations
